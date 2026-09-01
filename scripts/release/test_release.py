@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -60,6 +61,163 @@ def make_zip(path, entries=(), info=None):
             entry.create_system = 3
             entry.external_attr = mode << 16
             archive.writestr(entry, value)
+
+
+class SigningIdentityTests(unittest.TestCase):
+    team = "ABCDE12345"
+    name = "Developer ID Application: Fixture Publisher (ABCDE12345)"
+    fingerprint = "ab" * 20
+
+    @staticmethod
+    def listing(*identities):
+        entries = "".join(f'  {index}) {fingerprint} "{name}"\n'
+                          for index, (fingerprint, name) in enumerate(identities, 1))
+        return entries + f"     {len(identities)} valid identities found\n"
+
+    def resolve(self, output):
+        return release.resolve_signing_identity(output, self.name, self.team)
+
+    def test_exact_valid_identity_resolves_and_identical_fingerprints_deduplicate(self):
+        output = self.listing(
+            ("c" * 40, self.name.replace("Fixture", "Other")),
+            (self.fingerprint, self.name),
+            (self.fingerprint.upper(), self.name))
+        self.assertEqual(self.resolve(output), self.fingerprint.upper())
+
+    def test_missing_team_and_label_mismatch_have_distinct_redacted_errors(self):
+        other_name = self.name.replace("Fixture", "Private Other")
+        cases = (
+            (self.listing(), "valid identities: 0"),
+            (self.listing((self.fingerprint, other_name)), "same-team identities: 1"),
+            (self.listing((self.fingerprint, self.name.replace(self.team, "ZYXWV98765"))),
+             "No valid Developer ID identity for the configured team"),
+            (self.listing((self.fingerprint, self.name.replace("Fixture", "fixture"))),
+             "same-team identities: 1"),
+        )
+        for output, category in cases:
+            with self.subTest(category=category), self.assertRaises(release.ReleaseError) as caught:
+                self.resolve(output)
+            self.assertIn(category, str(caught.exception))
+            for private in (self.name, other_name, self.team, self.fingerprint,
+                            self.fingerprint.upper(), "ZYXWV98765"):
+                self.assertNotIn(private, str(caught.exception))
+
+    def test_distinct_matching_fingerprints_are_ambiguous(self):
+        output = self.listing((self.fingerprint, self.name), ("c" * 40, self.name))
+        with self.assertRaisesRegex(release.ReleaseError, "ambiguous .*2 valid matching fingerprints"):
+            self.resolve(output)
+
+    def test_malformed_invalid_and_inconsistent_listings_fail_without_echoing_output(self):
+        valid = self.listing((self.fingerprint, self.name))
+        cases = [valid.replace(self.fingerprint, fingerprint)
+                 for fingerprint in ("x" * 40, "a" * 39, "a" * 41)]
+        cases.extend([
+            valid.replace(f'"{self.name}"', f'"{self.name}" (CSSMERR_TP_CERT_EXPIRED)'),
+            valid.replace("1 valid identities", "2 valid identities"),
+            valid.replace("     1 valid identities found\n", ""),
+            valid + "     1 valid identities found\n",
+            "private unexpected response without an identity count",
+        ])
+        for output in cases:
+            with self.subTest(output=output), self.assertRaises(release.ReleaseError) as caught:
+                self.resolve(output)
+            self.assertNotIn(self.name, str(caught.exception))
+            self.assertNotIn(self.fingerprint, str(caught.exception))
+            self.assertNotIn("private unexpected", str(caught.exception))
+
+    def test_configuration_requires_developer_id_and_exact_valid_team(self):
+        for name, team in (
+                ("", self.team), ("-", self.team),
+                (self.name.replace("Application", "Installer"), self.team),
+                (self.name, "ZYXWV98765"), (self.name, "private-invalid-team"),
+                (self.name + "\n", self.team),
+                (self.name.replace("Fixture", "Fixture\nPrivate"), self.team),
+                (self.name.replace("Fixture", "Fixture\x00Private"), self.team)):
+            with self.subTest(name=name, team=team), self.assertRaises(release.ReleaseError) as caught:
+                release.resolve_signing_identity(self.listing(), name, team)
+            self.assertIn("configuration", str(caught.exception))
+            self.assertNotIn(self.name, str(caught.exception))
+            self.assertNotIn(team, str(caught.exception))
+
+    def test_query_is_keychain_scoped_bounded_and_does_not_print_raw_output(self):
+        environment = {"APPLE_SIGNING_IDENTITY": self.name, "APPLE_TEAM_ID": self.team,
+                       "LC_ALL": "other-locale", "PRIVATE_SENTINEL": "private credential"}
+        result = subprocess.CompletedProcess([], 0, self.listing((self.fingerprint, self.name)), "")
+        with patch.object(release.subprocess, "run", return_value=result) as invoke, \
+                patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(release.query_signing_identity(Path("/isolated/signing.keychain-db"),
+                                                           environment), self.fingerprint.upper())
+        invoke.assert_called_once_with(
+            ["security", "find-identity", "-v", "-p", "codesigning", "/isolated/signing.keychain-db"],
+            capture_output=True, text=True, timeout=30, env={**environment, "LC_ALL": "C"})
+        self.assertEqual(environment["LC_ALL"], "other-locale")
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+
+    def test_query_errors_and_zero_identity_exit_success_are_redacted(self):
+        private = "private output, identity, keychain path, or credential"
+        environment = {"APPLE_SIGNING_IDENTITY": self.name, "APPLE_TEAM_ID": self.team}
+        cases = (
+            subprocess.CompletedProcess([], 0, self.listing(), private),
+            subprocess.CompletedProcess([], 1, self.name, private),
+            OSError(private), subprocess.TimeoutExpired([private], 30, output=private),
+            UnicodeDecodeError("utf-8", private.encode(), 0, 1, private),
+        )
+        for result in cases:
+            options = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with self.subTest(result=result), patch.object(release.subprocess, "run", **options), \
+                    self.assertRaises(release.ReleaseError) as caught:
+                release.query_signing_identity(Path("/isolated/signing.keychain-db"), environment)
+            for value in (private, self.name, self.team):
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_cli_outputs_only_the_resolved_fingerprint(self):
+        result = subprocess.CompletedProcess([], 0, self.listing((self.fingerprint, self.name)), "")
+        with patch.dict(release.os.environ, {"APPLE_SIGNING_IDENTITY": self.name,
+                                             "APPLE_TEAM_ID": self.team}), \
+                patch.object(release.subprocess, "run", return_value=result), \
+                patch("sys.argv", ["release.py", "signing-identity", "--keychain", "/isolated/keychain"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            release.main()
+        self.assertEqual(stdout.getvalue(), self.fingerprint.upper() + "\n")
+
+
+class SigningProbeTests(unittest.TestCase):
+    def test_known_failures_emit_only_fixed_categories_and_never_private_details(self):
+        private = '/private/secret-path: signer "Private Publisher" credential=private-sentinel'
+        cases = (
+            ("The specified item could not be found in the keychain.", "KEYCHAIN_ITEM_NOT_FOUND"),
+            ("errSecItemNotFound", "KEYCHAIN_ITEM_NOT_FOUND"),
+            ("errSecInternalComponent", "ERR_SEC_INTERNAL_COMPONENT"),
+            ("unable to build chain to self-signed root for signer", "UNTRUSTED_CERTIFICATE_CHAIN"),
+            ("CSSMERR_TP_NOT_TRUSTED", "UNTRUSTED_CERTIFICATE_CHAIN"),
+            ("errSecNotTrusted", "UNTRUSTED_CERTIFICATE_CHAIN"),
+            ("The timestamp service is not available.", "TIMESTAMP_SERVICE"),
+            ("A timestamp was expected but was not found.", "TIMESTAMP_SERVICE"),
+            ("unable to build chain to self-signed root\nerrSecInternalComponent",
+             "UNTRUSTED_CERTIFICATE_CHAIN"),
+            ("unrecognized failure", "UNKNOWN"),
+        )
+        for message, category in cases:
+            with self.subTest(category=category), \
+                    patch.object(Path, "read_text", return_value=f"{private}\n{message}\n{private}"), \
+                    patch("sys.argv", ["release.py", "signing-probe-error", "--log", "/private/log"]), \
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                release.main()
+            self.assertEqual(stdout.getvalue(), category + "\n")
+            self.assertEqual(stderr.getvalue(), "")
+
+    def test_unreadable_private_logs_emit_unknown_without_paths_or_contents(self):
+        for error in (OSError("private log path and credentials"),
+                      UnicodeDecodeError("utf-8", b"private-sentinel", 0, 1, "private contents")):
+            with self.subTest(error=error), patch.object(Path, "read_text", side_effect=error), \
+                    patch("sys.argv", ["release.py", "signing-probe-error", "--log", "/private/log"]), \
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                release.main()
+            self.assertEqual(stdout.getvalue(), "UNKNOWN\n")
+            self.assertEqual(stderr.getvalue(), "")
 
 
 class VersionTests(unittest.TestCase):

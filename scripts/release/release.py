@@ -63,6 +63,82 @@ def run(arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
     return result
 
 
+def resolve_signing_identity(output: str, expected_name: str, team: str) -> str:
+    """Resolve captured `security find-identity -v` output without exposing it."""
+    require(isinstance(team, str) and re.fullmatch(r"[A-Z0-9]{10}", team) is not None,
+            "Signing identity configuration has an invalid Apple team ID.")
+    require(isinstance(expected_name, str) and re.fullmatch(
+        r"Developer ID Application: [^\r\n\x00]+ \(" + re.escape(team) + r"\)",
+        expected_name) is not None,
+        "Signing identity configuration must name a Developer ID Application for the configured team.")
+    identities = []
+    counts = []
+    for line in output.splitlines():
+        if re.match(r"\s*\d+\)", line):
+            entry = re.fullmatch(r'\s*\d+\)\s+([A-Fa-f0-9]{40})\s+"([^\r\n\x00]+)"\s*', line)
+            require(entry is not None,
+                    "Code-signing identity query returned a malformed or invalid identity entry.")
+            identities.append((entry[1].upper(), entry[2]))
+        else:
+            count = re.fullmatch(r"\s*(\d+) valid identities found\s*", line)
+            if count:
+                counts.append(int(count[1]))
+    require(counts == [len(identities)],
+            "Code-signing identity query returned an inconsistent valid-identity list.")
+    matches = {fingerprint for fingerprint, name in identities if name == expected_name}
+    require(len(matches) <= 1,
+            f"Signing identity is ambiguous ({len(matches)} valid matching fingerprints).")
+    if matches:
+        return next(iter(matches))
+    same_team = {fingerprint for fingerprint, name in identities
+                 if name.startswith("Developer ID Application: ") and name.endswith(f" ({team})")}
+    if same_team:
+        raise ReleaseError("Configured Developer ID label does not match imported valid identities "
+                           f"(same-team identities: {len(same_team)}).")
+    if identities:
+        raise ReleaseError("No valid Developer ID identity for the configured team "
+                           f"(valid identities: {len(set(identities))}).")
+    raise ReleaseError("No valid code-signing identities in the isolated keychain "
+                       "(valid identities: 0). Check the certificate/private-key pair and validity.")
+
+
+def query_signing_identity(keychain: Path, environment: dict[str, str]) -> str:
+    # Raw output may contain names/configuration stored as secrets. Never log it,
+    # including when the process fails before an identity can be resolved.
+    try:
+        result = subprocess.run(
+            ["security", "find-identity", "-v", "-p", "codesigning", str(keychain)],
+            capture_output=True, text=True, timeout=30,
+            env={**environment, "LC_ALL": "C"})
+    except subprocess.TimeoutExpired:
+        raise ReleaseError("Code-signing identity query timed out.") from None
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise ReleaseError("Code-signing identity query could not run.") from None
+    require(result.returncode == 0,
+            f"Code-signing identity query failed (exit {result.returncode}).")
+    return resolve_signing_identity(result.stdout, environment.get("APPLE_SIGNING_IDENTITY", ""),
+                                    environment.get("APPLE_TEAM_ID", ""))
+
+
+def classify_signing_probe_error(output: str) -> str:
+    # Only fixed category labels may escape the private log. Prefer a specific
+    # reported failure over errSecInternalComponent when both appear.
+    known = (
+        ("KEYCHAIN_ITEM_NOT_FOUND", ("the specified item could not be found in the keychain",
+                                     "errsecitemnotfound")),
+        ("UNTRUSTED_CERTIFICATE_CHAIN", ("unable to build chain to self-signed root",
+                                         "cssmerr_tp_not_trusted", "errsecnottrusted")),
+        ("TIMESTAMP_SERVICE", ("the timestamp service is not available",
+                               "a timestamp was expected but was not found")),
+        ("ERR_SEC_INTERNAL_COMPONENT", ("errsecinternalcomponent",)),
+    )
+    folded = output.casefold()
+    for category, messages in known:
+        if any(message in folded for message in messages):
+            return category
+    return "UNKNOWN"
+
+
 def api(path: str, method: str = "GET", body: dict | None = None,
         missing_ok: bool = False):
     arguments = ["gh", "api", "--method", method, "-H",
@@ -555,6 +631,10 @@ def main() -> None:
     command.add_argument("--github-output", type=Path)
     command = sub.add_parser("tools")
     command.add_argument("--destination", type=Path, required=True)
+    command = sub.add_parser("signing-identity")
+    command.add_argument("--keychain", type=Path, required=True)
+    command = sub.add_parser("signing-probe-error")
+    command.add_argument("--log", type=Path, required=True)
     command = sub.add_parser("prepare")
     command.add_argument("--plan", type=Path, required=True)
     command.add_argument("--archives", type=Path, required=True)
@@ -584,6 +664,14 @@ def main() -> None:
         print(f"Validated {plan['tag']} at {plan['sha']}.")
     elif args.command == "tools":
         print(fetch_tools(args.destination))
+    elif args.command == "signing-identity":
+        print(query_signing_identity(args.keychain, dict(os.environ)))
+    elif args.command == "signing-probe-error":
+        try:
+            output = args.log.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            output = ""
+        print(classify_signing_probe_error(output))
     elif args.command == "prepare":
         prepare(read_plan(args.plan), args.archives)
     elif args.command == "validate-zip":
