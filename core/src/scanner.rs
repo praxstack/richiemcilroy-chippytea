@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::Read;
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2636,6 +2636,7 @@ pub(crate) fn revalidate_observing(
 
 const MAX_GIT_POINTER_BYTES: u64 = 4096;
 const MAX_GIT_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+const GIT_OUTPUT_WAIT: Duration = Duration::from_millis(15);
 
 #[derive(Debug)]
 struct GitEvidenceEntry {
@@ -3101,6 +3102,51 @@ impl GitEvidence {
     }
 }
 
+/// Poll is only a scheduling hint; the existing read and child-status checks
+/// remain authoritative. A failed, interrupted or unexpected poll falls back
+/// to the unspent portion of the old sleep, without introducing a new error.
+fn git_output_wait_duration(
+    stdout_pending: bool,
+    poll: impl FnOnce() -> (libc::c_int, libc::c_short, Duration),
+) -> Duration {
+    if !stdout_pending {
+        // EOF can precede child exit. Polling that hung-up descriptor again
+        // would return immediately while try_wait still reports a live child.
+        return GIT_OUTPUT_WAIT;
+    }
+    let (count, events, elapsed) = poll();
+    let readable = libc::POLLIN | libc::POLLHUP;
+    if (count == 0 && events == 0)
+        || (count == 1 && events & readable != 0 && events & !readable == 0)
+    {
+        Duration::ZERO
+    } else {
+        // Includes POLLERR/POLLNVAL, unknown readiness and every errno,
+        // including EINTR. Repeated poll failures must not create a spin loop.
+        GIT_OUTPUT_WAIT.saturating_sub(elapsed)
+    }
+}
+
+fn poll_git_output(fd: RawFd) -> (libc::c_int, libc::c_short, Duration) {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let started = Instant::now();
+    // Cancellation is an atomic flag, not a descriptor event. Never wait for
+    // the whole child deadline here; retain the old cooperative wait quantum.
+    let count = unsafe { libc::poll(&mut descriptor, 1, GIT_OUTPUT_WAIT.as_millis() as i32) };
+    (count, descriptor.revents, started.elapsed())
+}
+
+fn wait_for_git_output(fd: RawFd, stdout_pending: bool) {
+    let remaining = git_output_wait_duration(stdout_pending, || poll_git_output(fd));
+    if !remaining.is_zero() {
+        std::thread::sleep(remaining);
+    }
+}
+
 /// No repository means no Git-tracked descendants. A real repository requires a
 /// successful, empty, literal-pathspec query; every uncertainty fails closed.
 fn git_untracked(
@@ -3168,14 +3214,14 @@ fn git_untracked(
         if let Err(reason) = safety::cancelled(cancel) {
             break Err(reason);
         }
-        match output.read(&mut buffer) {
+        let stdout_pending = match output.read(&mut buffer) {
             Ok(count) if count > 0 => {
                 break Err("Git tracks content inside this artifact; cleanup is excluded".into());
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(_) => break Err("Git tracking output could not be verified".into()),
-        }
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
@@ -3197,9 +3243,9 @@ fn git_untracked(
         if Instant::now() >= deadline {
             break Err("Git tracking timed out; the artifact is excluded".into());
         }
-        // A coarser poll keeps this worker mostly asleep; the 2-second overall
-        // deadline above is unchanged and still fails closed.
-        std::thread::sleep(Duration::from_millis(15));
+        // Only pending stdout uses readiness. EOF while the child is alive
+        // keeps the old sleep; the deadline and all decisions remain above.
+        wait_for_git_output(fd, stdout_pending);
     };
     let _ = child.kill();
     let _ = child.wait();
@@ -3857,6 +3903,101 @@ mod tests {
             b"keep me"
         );
     }
+    #[test]
+    fn git_output_wait_does_not_poll_eof_while_a_child_is_still_alive() {
+        let delay = git_output_wait_duration(false, || {
+            panic!("EOF must sleep rather than repeatedly poll a hung-up pipe")
+        });
+        assert_eq!(delay, Duration::from_millis(15));
+    }
+
+    #[test]
+    fn git_output_wait_returns_to_read_and_status_checks_after_readiness_or_timeout() {
+        for (count, events, elapsed) in [
+            (0, 0, Duration::from_millis(15)),
+            (1, libc::POLLIN, Duration::from_millis(2)),
+            (1, libc::POLLHUP, Duration::from_millis(3)),
+            (1, libc::POLLIN | libc::POLLHUP, Duration::from_millis(4)),
+        ] {
+            assert_eq!(
+                git_output_wait_duration(true, || (count, events, elapsed)),
+                Duration::ZERO,
+                "Readiness and EOF are wakeups, never ownership decisions"
+            );
+        }
+    }
+
+    #[test]
+    fn git_output_wait_errors_and_unknown_events_use_only_the_remaining_quantum() {
+        for (count, events) in [
+            (-1, 0), // Every poll errno, including EINTR, has this result.
+            (1, libc::POLLERR),
+            (1, libc::POLLNVAL),
+            (1, libc::POLLOUT),
+            (1, libc::POLLIN | libc::POLLERR),
+            (1, libc::POLLHUP | libc::POLLNVAL),
+            (1, 0),
+            (0, libc::POLLIN),
+            (2, libc::POLLIN),
+        ] {
+            for (elapsed, remaining) in [(0, 15), (4, 11), (15, 0), (20, 0)] {
+                assert_eq!(
+                    git_output_wait_duration(true, || {
+                        (count, events, Duration::from_millis(elapsed))
+                    }),
+                    Duration::from_millis(remaining),
+                    "count={count}, events={events}, elapsed={elapsed}"
+                );
+            }
+        }
+    }
+
+    fn git_output_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+        // Keep both ends close-on-exec so concurrently spawned test children
+        // cannot inherit the writer and delay this pipe's EOF.
+        let (reader, writer) = std::io::pipe().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        (reader, writer)
+    }
+
+    #[test]
+    fn git_output_poll_leaves_pipe_bytes_and_eof_for_the_original_reader() {
+        let (mut reader, mut writer) = git_output_pipe();
+        let mut buffer = [0u8; 256];
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        // Already-available bytes avoid any timing-sensitive producer race.
+        writer.write_all(b"tracked\0").unwrap();
+        let ready = poll_git_output(reader.as_raw_fd());
+        assert_eq!(ready.0, 1);
+        assert_ne!(ready.1 & libc::POLLIN, 0);
+        assert_eq!(git_output_wait_duration(true, || ready), Duration::ZERO);
+        assert_eq!(reader.read(&mut buffer).unwrap(), b"tracked\0".len());
+        assert_eq!(&buffer[..b"tracked\0".len()], b"tracked\0");
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        // Closing the owned writer produces EOF, not proof of child success.
+        drop(writer);
+        let hung_up = poll_git_output(reader.as_raw_fd());
+        assert_eq!(hung_up.0, 1);
+        assert_ne!(hung_up.1 & (libc::POLLIN | libc::POLLHUP), 0);
+        assert_eq!(git_output_wait_duration(true, || hung_up), Duration::ZERO);
+        assert_eq!(reader.read(&mut buffer).unwrap(), 0);
+        assert_eq!(
+            git_output_wait_duration(false, || panic!("Do not poll EOF again")),
+            Duration::from_millis(15)
+        );
+    }
+
     #[test]
     fn tracked_descendant_disqualifies_the_whole_artifact() {
         let (_temp, root, project) = fixture();
