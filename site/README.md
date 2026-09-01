@@ -12,6 +12,8 @@ bun run dev
 
 `bun run build` checks the production build. `bun run start` serves it locally.
 
+Dependency updates are currently manual. As of 1 September 2026, Dependabot cannot read the version 2 `bun.lock` written by Bun 1.4. Keep the lockfile committed and verify updates with a frozen install and production build.
+
 The public download link should only point to a published, verified release. Until then, the primary button points to the source-build instructions.
 
 ## The illustrated demo

@@ -39,15 +39,5 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
-  - package-ecosystem: bun
-    directory: /site
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: build
-    groups:
-      compatible-site-dependencies:
-        patterns: ["*"]
-        update-types: [minor, patch]
+  # As of 2026-09-01, Dependabot cannot read Bun 1.4's v2 lockfile.
+  # Site dependencies need manual updates until v2 support is available.
