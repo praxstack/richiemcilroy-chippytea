@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>Chippytea</string>
+<key>CFBundleIdentifier</key><string>app.chippytea.mac</string>
+<key>CFBundleName</key><string>Chippytea</string>
+<key>CFBundleDisplayName</key><string>Chippytea</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>0.1.0</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSUIElement</key><true/>
+<key>NSHighResolutionCapable</key><true/>
+<key>SUFeedURL</key><string>https://github.com/richiemcilroy/chippytea/releases/latest/download/appcast.xml</string>
+<key>SUPublicEDKey</key><string>TjONVQyhvdnM/GGpn2RW6fxPWuK4nniEfX1OkSUelgo=</string>
+<key>SUEnableAutomaticChecks</key><true/>
+<key>SUScheduledCheckInterval</key><integer>86400</integer>
+<key>SUAutomaticallyUpdate</key><false/>
+<key>SUEnableSystemProfiling</key><false/>
+<key>SUVerifyUpdateBeforeExtraction</key><true/>
+<key>SURequireSignedFeed</key><true/>
+<key>SUSignedFeedFailureExpirationInterval</key><integer>0</integer>
+<key>NSDesktopFolderUsageDescription</key><string>Chippytea looks for old developer build files on your Desktop. Cleanup always waits for your review.</string>
+<key>NSDocumentsFolderUsageDescription</key><string>Chippytea looks for old developer build files in Documents. Cleanup always waits for your review.</string>
+<key>NSDownloadsFolderUsageDescription</key><string>Chippytea finds large downloads for you to review. Nothing is removed automatically.</string>
+<key>NSHumanReadableCopyright</key><string>Copyright © 2026 Chippytea contributors. MIT.</string>
+</dict></plist>
