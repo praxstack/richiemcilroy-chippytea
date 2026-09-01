@@ -231,6 +231,10 @@ struct DiscoveryPresentation: Equatable {
     @Published var showDiskAccess = false
     @Published var diskAccessPhase = DiskAccessPhase.intro
     @Published var diskAccessMessage: String?
+    /// The setup page on screen. Phases record intent; this is presentation only.
+    @Published var diskAccessStep = DiskAccessStep.permission
+    /// Screenshot staging freezes the setup sketches at one moment of their loop.
+    var diskAccessSceneTime: Double?
     @Published private(set) var diskAccessNeedsReplacement = false
     @Published var reviewItems: [Candidate] = []
     @Published var busy = false
@@ -419,6 +423,7 @@ struct DiscoveryPresentation: Equatable {
             if accessRecord == .waiting && diskAccessRevision == accessRevisionAtStart {
                 showDiskAccess = true
                 diskAccessPhase = .waiting
+                diskAccessStep = .enable
                 diskAccessMessage = nil
             }
             if let data = try? Data(contentsOf: directory.appendingPathComponent("bookmarks.json")) { bookmarks = (try? JSONDecoder().decode([String: Data].self, from: data)) ?? [:] }
@@ -466,13 +471,17 @@ struct DiscoveryPresentation: Equatable {
                     } else {
                         showDiskAccess = true
                         diskAccessPhase = .waiting
+                        diskAccessStep = .enable
                         diskAccessMessage = HomeFolderAccess.message(for: blocked)
                     }
                 }
             }
             if homeAuthorized && !diskAccessConfigured && diskAccessRevision == accessRevisionAtStart {
                 showDiskAccess = true
-                if diskAccessMessage == nil { diskAccessPhase = accessRecord == .waiting ? .waiting : .intro }
+                if diskAccessMessage == nil {
+                    diskAccessPhase = accessRecord == .waiting ? .waiting : .intro
+                    diskAccessStep = accessRecord == .waiting ? .enable : .permission
+                }
             }
             if let data = try await client?.request(["action": "cursor"]), let value = try JSONSerialization.jsonObject(with: data) as? [String: UInt64] { cursor = value["cursor"] ?? 0 }
             restoringAccess = false
@@ -726,6 +735,7 @@ struct DiscoveryPresentation: Equatable {
             diskAccessRevision &+= 1
             diskAccessTask?.cancel()
             diskAccessPhase = .intro
+            diskAccessStep = .permission
             diskAccessMessage = nil
         }
         showReview = false
@@ -754,6 +764,7 @@ struct DiscoveryPresentation: Equatable {
         diskAccessTask?.cancel(); diskAccessTask = nil
         showDiskAccess = false
         diskAccessPhase = .intro
+        diskAccessStep = .permission
         diskAccessMessage = nil
         finishDiskAccessSystemDialog()
         restartWatcher()
@@ -818,6 +829,7 @@ struct DiscoveryPresentation: Equatable {
                     try await self.saveDiskAccessSetup(.waiting)
                     guard !Task.isCancelled, self.showDiskAccess, self.diskAccessRevision == revision else { return }
                     self.diskAccessPhase = .waiting
+                    self.diskAccessStep = .enable
                     self.diskAccessMessage = HomeFolderAccess.message(for: blocked)
                     return
                 }
@@ -833,6 +845,7 @@ struct DiscoveryPresentation: Equatable {
             } catch {
                 guard self.diskAccessRevision == revision else { return }
                 self.diskAccessPhase = .waiting
+                self.diskAccessStep = .enable
                 self.diskAccessMessage = "Could not save the scan setup: \(error.localizedDescription)"
             }
         }
@@ -896,6 +909,7 @@ struct DiscoveryPresentation: Equatable {
         let revision = diskAccessRevision
         diskAccessTask?.cancel()
         diskAccessPhase = .openingSettings
+        diskAccessStep = .add
         diskAccessTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -913,6 +927,7 @@ struct DiscoveryPresentation: Equatable {
             } catch {
                 guard self.diskAccessRevision == revision else { return }
                 self.diskAccessPhase = .intro
+                self.diskAccessStep = .permission
                 self.diskAccessMessage = "Could not save your place: \(error.localizedDescription)"
             }
         }

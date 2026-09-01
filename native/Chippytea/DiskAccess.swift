@@ -49,3 +49,17 @@ struct DiskAccessAppIdentity: Codable, Equatable, Sendable {
         return DiskAccessAppIdentity(path: Bundle.main.bundleURL.path, requirement: text as String)
     }
 }
+
+/// The setup page on screen. Phases record intent; the step is presentation:
+/// three pages you click through, resuming on the last one after Quit & Reopen.
+enum DiskAccessStep: Int, CaseIterable, Sendable {
+    case permission = 1, add, enable
+
+    var title: String {
+        switch self {
+        case .permission: return "Permission"
+        case .add: return "Drag it in"
+        case .enable: return "Switch it on"
+        }
+    }
+}

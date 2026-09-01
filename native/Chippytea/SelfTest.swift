@@ -90,14 +90,16 @@ enum NativeSelfTest {
         }
         var model: AppModel? = AppModel(directory: data, scanHome: home)
         await model!.start()
-        try require(model!.showDiskAccess && model!.diskAccessPhase == .waiting, "Restart must resume the saved instructions")
+        try require(model!.showDiskAccess && model!.diskAccessPhase == .waiting && model!.diskAccessStep == .enable,
+                    "Restart must resume the saved instructions on the last setup page")
         try require(model!.snapshot.roots.isEmpty && !model!.snapshot.scanning, "Setup must not authorize or scan before the explicit start action")
         model!.diskAccessReturned()
         try require(model!.diskAccessPhase == .waiting && model!.snapshot.roots.isEmpty, "Returning from Settings must not probe folders or start scanning")
         model!.dismissDiskAccess()
         try await until("Dismissal was not saved") { stored() == "dismissed" }
-        try require(!model!.showDiskAccess && model!.diskAccessPhase == .intro, "Dismissal must close setup")
+        try require(!model!.showDiskAccess && model!.diskAccessPhase == .intro && model!.diskAccessStep == .permission, "Dismissal must close setup")
         model!.beginDiskAccessSetup()
+        try require(model!.diskAccessStep == .permission, "A fresh setup must open on the first page")
         model!.confirmDiskAccessAndScan()
         try require(model!.snapshot.roots.isEmpty && model!.diskAccessPhase == .intro, "Intro must not bypass the Settings step")
         model!.diskAccessPhase = .waiting // Simulate the saved return from System Settings.
@@ -108,6 +110,7 @@ enum NativeSelfTest {
         try await until("Denied folder access did not stay in setup") {
             model!.diskAccessPhase == .waiting && model!.diskAccessMessage?.contains("Documents") == true
         }
+        try require(model!.diskAccessStep == .enable, "A denied check must stay on the switch-it-on page")
         try require(model!.snapshot.roots.isEmpty && !model!.snapshot.scanning && stored() != "completed", "A blocked permission check must not authorize, scan or save completion")
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: deniedFolder.path)
         model!.confirmDiskAccessAndScan()
