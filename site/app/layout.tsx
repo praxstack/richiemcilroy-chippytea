@@ -2,9 +2,9 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "chippytea: tidy your disk, earn your tea",
+  title: "Chippytea: Free up space on your Mac",
   description:
-    "Review old build files and downloads, make space, and earn chips for credited storage. A native Mac menu-bar app built with SwiftUI and Rust. Free, MIT licensed.",
+    "Chippytea is an ultra-performant, native macOS app that clears space on your Mac. Free and open source. No account or telemetry.",
 };
 
 export const viewport: Viewport = {
