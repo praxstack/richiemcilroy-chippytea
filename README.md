@@ -6,10 +6,13 @@
   </picture>
 </p>
 
-<h3 align="center">Room on your Mac, chips in the paper.</h3>
+<h3 align="center">Free up space on your Mac.</h3>
 
 <p align="center">
-  A native Mac app for finding old build files, making space, and earning your tea.<br>
+  Chippytea is an ultra-performant, native macOS app that clears space on your Mac.
+  Built with SwiftUI and Rust, it helps you find old build folders, project dependencies
+  and installers you may no longer need. Review their estimated sizes, see what removing
+  them means, and choose what to keep or remove.<br>
   SwiftUI + Rust · macOS 14+ · Free and open source
 </p>
 
@@ -28,17 +31,26 @@
 
 <p align="center"><sub>An illustrated cleanup, not a live scan. Animation respects reduced motion.</sub></p>
 
-Chippytea lives in your menu bar. It looks for stale developer artifacts and old downloads, tells you what removing them means, and leaves the decision to you. No account, no telemetry, no automatic deletion.
+Chippytea runs locally from your menu bar. No account, no telemetry, no automatic deletion.
 
 ## How it works
 
-1. **Find a little room.** Scan folders you choose, or use the guided home-folder scan. Old `target` and `node_modules` folders are good places to start.
+1. **Find cleanup opportunities.** Scan folders you choose, or use the guided home-folder scan. Old `target` and `node_modules` folders are good places to start.
 2. **Check before you clean.** Review the files, estimated size, and consequences. Tracked files, active projects, cloud-managed items, and uncertain candidates stay out.
-3. **Earn your tea.** Eligible permanent cleanup earns one chip per **100 MB of conservatively credited space**. A thousand chips is a battered fish. Smaller amounts carry forward as scraps.
+3. **Choose what to remove.** Move files to Trash, or permanently remove eligible build files and dependencies. Review the outcome and any credited space in the cleanup history.
 
-Moving something to **Trash earns no chips**. Downloads are Trash-only. Chips stay on your Mac and have no monetary value; estimated rewards never go straight into the wallet.
+Moving files to **Trash does not free storage**. Downloads and installers are Trash-only.
 
 This is early software that can permanently delete files. Start with a disposable test folder and keep backups. Full Disk Access is optional. The [recommendation policy](docs/SUGGESTIONS.md) explains what qualifies, what stays out, and where the checks have limits.
+
+<details>
+<summary>About the chip counter</summary>
+
+The fish and chips are a decorative counter for credited cleanup. Eligible permanent cleanup adds one chip per **100 MB of conservatively credited space**. Smaller amounts carry forward, and a thousand chips is shown as a fish.
+
+Chips stay on your Mac and have no monetary value. Moving files to Trash adds no chips; estimated sizes never update the counter.
+
+</details>
 
 ## Build and run
 
@@ -60,7 +72,7 @@ cargo clippy --all-targets --locked -- -D warnings
 
 Working on the landing page? See [site/README.md](site/README.md).
 
-## Under the paper
+## Project structure
 
 | Part | What's inside |
 | --- | --- |
@@ -71,7 +83,7 @@ Working on the landing page? See [site/README.md](site/README.md).
 
 [Architecture](docs/ARCHITECTURE.md) · [Design](docs/DESIGN.md) · [Disk access](docs/DISK-ACCESS.md) · [Performance](docs/PERFORMANCE.md)
 
-## Pull up a chair
+## Contributing
 
 Bug reports, careful safety tests, clearer docs, and small fixes are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing cleanup behaviour. Please keep personal paths, logs, and credentials out of public issues. Security problems belong in a [private report](https://github.com/richiemcilroy/chippytea/security/advisories/new).
 
