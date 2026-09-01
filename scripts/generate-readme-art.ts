@@ -99,7 +99,7 @@ function paper(theme: Theme) {
 
 function logo(theme: Theme) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="430" height="112" viewBox="0 0 430 112" role="img" aria-labelledby="title">
-  <title id="title">Chippytea: a battered fish and hand-lettered wordmark</title>
+  <title id="title">chippytea: a battered fish and hand-lettered wordmark</title>
   <g transform="translate(4 18) scale(1.5)">${fish("logo-fish", theme)}</g>
   <g transform="translate(120 5) scale(.93)">${word("chippytea", theme.ink)}</g>
 </svg>\n`;
@@ -170,7 +170,7 @@ function hero(theme: Theme) {
   <g class="tray">${paper(theme)}</g>
   <text x="772" y="357" text-anchor="middle" font-size="14" class="biro">your tea, in the paper</text>
   ${[0, 1, 2, 3, 4].map((i) => `<g class="flight f${i + 1}">${chip(501 + i * 7, 35)}</g>`).join("")}
-  <text x="52" y="385" font-size="13" class="soft">100 MB credited = 1 chip. 1,000 chips = a battered fish.</text>
+  <text x="52" y="385" font-size="13" class="soft">100 MB saved = 1 chip. Every reviewed cleanup counts.</text>
 </svg>\n`;
 }
 
