@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+/* One material: cream paper, charcoal ink, marigold gold, one ballpoint-blue
+   accent. Values are TeaTheme's, from docs/DESIGN.md. */
+@theme {
+  --color-paper: #faf5ea;
+  --color-paper-deep: #f1eadb;
+  --color-card: #fffdf6;
+  --color-ink: #33302b;
+  --color-ink-soft: #7a736a;
+  --color-gold: #f2b63c;
+  --color-gold-deep: #c07f17;
+  --color-biro: #3f5fa8;
+  --color-rust: #b4553d;
+
+  --font-sans: ui-rounded, -apple-system, BlinkMacSystemFont, "SF Pro Rounded", "Segoe UI", system-ui, sans-serif;
+
+  --animate-panel-in: panel-in 0.18s ease-out both;
+  @keyframes panel-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+/* The barely-there notebook dot grid. */
+@utility paper-dots {
+  background-color: var(--color-paper);
+  background-image: radial-gradient(circle, rgba(51, 48, 43, 0.05) 0.85px, transparent 0.95px);
+  background-size: 18px 18px;
+}
+
+@layer base {
+  html {
+    color-scheme: light only;
+  }
+
+  body {
+    @apply paper-dots text-ink font-sans text-[15px] leading-[1.55] antialiased;
+  }
+
+  ::selection {
+    background: rgba(63, 95, 168, 0.18);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-biro);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+}
+
+/* Boiling: three pre-drawn ink phases, cycled at ~6 fps. Rationed, as in the
+   app: the shop sign boils while hovered, the tape flourishes once on load. */
+.bp1,
+.bp2 {
+  opacity: 0;
+}
+
+@keyframes b0 {
+  0%, 32.9% { opacity: 1; }
+  33%, 100% { opacity: 0; }
+}
+@keyframes b1 {
+  0%, 32.9% { opacity: 0; }
+  33%, 65.9% { opacity: 1; }
+  66%, 100% { opacity: 0; }
+}
+@keyframes b2 {
+  0%, 65.9% { opacity: 0; }
+  66%, 100% { opacity: 1; }
+}
+
+.boil-hover:hover .bp0,
+.boil-on .bp0 { animation: b0 0.5s linear infinite; }
+.boil-hover:hover .bp1,
+.boil-on .bp1 { animation: b1 0.5s linear infinite; }
+.boil-hover:hover .bp2,
+.boil-on .bp2 { animation: b2 0.5s linear infinite; }
+
+.boil-load .bp0 { animation: b0 0.5s linear 2; }
+.boil-load .bp1 { animation: b1 0.5s linear 2; }
+.boil-load .bp2 { animation: b2 0.5s linear 2; }
+
+/* The quiet fading ink note a 0-chip operation earns — never sound. */
+@keyframes fade-note {
+  0% { opacity: 0; }
+  10% { opacity: 1; }
+  65% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* A suggestion expanding inline: the two-tap cleanup. */
+.reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.15s ease-in-out;
+}
+
+.reveal.open {
+  grid-template-rows: 1fr;
+}
+
+.reveal > div {
+  overflow: hidden;
+  /* Collapsed content must not catch taps or keyboard focus. */
+  visibility: hidden;
+  transition: visibility 0s 0.15s;
+}
+
+.reveal.open > div {
+  visibility: visible;
+  transition: visibility 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bp0,
+  .bp1,
+  .bp2,
+  .reveal {
+    animation: none !important;
+    transition: none !important;
+  }
+}
