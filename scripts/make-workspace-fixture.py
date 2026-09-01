@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a disposable npm, Bun or pnpm workspace for shared-lock parsing."""
+"""Create a disposable npm, Bun or pnpm workspace for parsing benchmarks."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ SPEC.loader.exec_module(fixture)
 PAYLOAD_BYTES = 100 * 1024**2
 CHUNK_BYTES = 1024**2
 WORKSPACE_NAME = "chippytea-shared-lock-fixture"
+MAX_MANIFEST_KIB = 256
 
 
 def json_bytes(value: object) -> bytes:
@@ -31,6 +32,32 @@ def json_bytes(value: object) -> bytes:
 
 def member_name(number: int) -> str:
     return f"chippytea-member-{number:04d}"
+
+
+def root_manifest(size: int = 0) -> tuple[bytes, int]:
+    """Keep the original manifest, or fill an exact size with synthetic dependencies."""
+    original = json_bytes({
+        "name": WORKSPACE_NAME, "version": "1.0.0", "private": True,
+        "workspaces": ["packages/*"],
+    })
+    if size == 0:
+        return original + b"\n", 0
+    if not 1024 <= size <= MAX_MANIFEST_KIB * 1024:
+        raise ValueError("Root manifest size must be zero or between 1 and 256 KiB")
+    parts = [original[:-1] + b',"dependencies":{']
+    ending = b"}}\n"
+    used = len(parts[0]) + len(ending)
+    dependencies = 0
+    while True:
+        name = f"synthetic-manifest-dependency-{dependencies:06d}"
+        entry = (b"," if dependencies else b"") + json_bytes(name) + b':"1.0.0"'
+        if used + len(entry) > size:
+            break
+        parts.append(entry)
+        used += len(entry)
+        dependencies += 1
+    parts.extend((ending, b" " * (size - used)))
+    return b"".join(parts), dependencies
 
 
 def shared_lock(members: int, size: int) -> tuple[bytes, int]:
@@ -137,12 +164,15 @@ def main(argv: list[str] | None = None) -> int:
     arguments.add_argument("--members", type=int, default=128, help="Workspace members, 2..512 (default: 128)")
     arguments.add_argument("--lock-kib", type=int, default=1024, help="Exact shared lock size, 256..4096 KiB (default: 1024)")
     arguments.add_argument("--lock-format", choices=("npm", "bun", "pnpm"), default="npm", help="Shared lock format (default: npm)")
+    arguments.add_argument("--manifest-kib", type=int, default=0, help="Exact root package.json size, 1..256 KiB; 0 preserves the original manifest (default: 0)")
     arguments.add_argument("--age-days", type=int, default=8, help="Age all fixture modification times, 8..3650 days (default: 8)")
     args = arguments.parse_args(argv)
     if not 2 <= args.members <= 512:
         arguments.error("--members must be between 2 and 512")
     if not 256 <= args.lock_kib <= 4096:
         arguments.error("--lock-kib must be between 256 and 4096")
+    if not 0 <= args.manifest_kib <= MAX_MANIFEST_KIB:
+        arguments.error("--manifest-kib must be zero or between 1 and 256")
     if not 8 <= args.age_days <= 3650:
         arguments.error("--age-days must be between 8 and 3650")
 
@@ -155,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         "pnpm": (shared_pnpm_lock, "pnpm-lock.yaml"),
     }[args.lock_format]
     lock, dependencies = lock_builder(args.members, args.lock_kib * 1024)
+    root_manifest_data, manifest_dependencies = root_manifest(args.manifest_kib * 1024)
     workspace_config = b"packages:\n  - 'packages/*'\n" if args.lock_format == "pnpm" else None
     ancestor = requested.parent
     while not ancestor.exists():
@@ -163,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
     directories = 2 + 2 * args.members  # baseline, packages, members, artifacts.
     files = args.members + 3 + int(workspace_config is not None)
     projected = PAYLOAD_BYTES + len(lock) + directories * 18_432 + files * 8192
+    if args.manifest_kib:
+        projected += len(root_manifest_data)
     fixture.require_space(ancestor, projected)
     requested.parent.mkdir(parents=True, exist_ok=True)
     root = requested.parent.resolve() / requested.name
@@ -184,6 +217,10 @@ def main(argv: list[str] | None = None) -> int:
         "shared_lock_bytes": len(lock),
         "shared_lock_sha256": hashlib.sha256(lock).hexdigest(),
         "synthetic_dependency_entries": dependencies,
+        "root_manifest_requested_kib": args.manifest_kib,
+        "root_manifest_bytes": len(root_manifest_data),
+        "root_manifest_sha256": hashlib.sha256(root_manifest_data).hexdigest(),
+        "synthetic_manifest_dependency_entries": manifest_dependencies,
         "payload_files": 1,
         "bytes_per_payload_file": PAYLOAD_BYTES,
         "empty_artifacts": args.members - 1,
@@ -197,13 +234,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         baseline = root / "baseline"
         baseline.mkdir()
-        manifest = json_bytes({
-            "name": WORKSPACE_NAME, "version": "1.0.0", "private": True,
-            "workspaces": ["packages/*"],
-        }) + b"\n"
-        fixture.write_new(baseline / "package.json", manifest)
+        fixture.write_new(baseline / "package.json", root_manifest_data)
         fixture.write_new(baseline / lock_name, lock)
-        logical_bytes += len(manifest) + len(lock)
+        logical_bytes += len(root_manifest_data) + len(lock)
         if workspace_config is not None:
             fixture.write_new(baseline / "pnpm-workspace.yaml", workspace_config)
             logical_bytes += len(workspace_config)
