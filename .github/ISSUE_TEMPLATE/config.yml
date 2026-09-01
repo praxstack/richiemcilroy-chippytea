@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security or deletion-safety issue
+    url: https://github.com/richiemcilroy/chippytea/security/policy
+    about: Read the security policy before sharing sensitive details.

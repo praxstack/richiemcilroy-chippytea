@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a useful change to Chippytea.
+body:
+  - type: markdown
+    attributes:
+      value: Keep examples free of personal files, private paths and credentials. Please search existing issues first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would this help you do?
+      description: Describe the problem or the part of the current experience that gets in your way.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: What do you suggest?
+      description: A small example is useful. For cleanup features, explain how the user stays in control and what must never be removed.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Optional. Is there a simpler change or a workaround?

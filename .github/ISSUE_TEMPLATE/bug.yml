@@ -1,0 +1,48 @@
+name: Bug report
+description: Something in Chippytea did not work as expected.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This report is public. Do not attach raw logs, databases, cleanup receipts, personal files or credentials. Redact screenshots and replace real names and paths with examples.
+
+        For a security issue or possible unsafe deletion, read the [security policy](https://github.com/richiemcilroy/chippytea/security/policy) before posting. Do not repeat a destructive operation on files you need.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: App version or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include your macOS version and Mac chip, or browser for a website issue.
+      placeholder: macOS 15.7, Apple M1
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe what you expected and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Safe steps to reproduce
+      description: Use a fresh, disposable fixture. If you cannot reproduce safely, say so and describe the original steps without retrying them.
+      placeholder: |
+        1. Create a disposable test folder...
+        2. ...
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Before posting
+      options:
+        - label: I checked this report and its attachments for credentials, private paths and personal data.
+          required: true
