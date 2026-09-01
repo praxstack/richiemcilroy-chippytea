@@ -1,0 +1,60 @@
+# Native build output and machine-local signing settings.
+/target/
+/.build/
+/build/
+/.swiftpm/
+*.dSYM/
+*.xcuserstate
+
+# Website dependencies, build output and deployment settings, at any depth.
+node_modules/
+.next/
+.vercel/
+*.tsbuildinfo
+
+# Credentials never belong in this repository. Examples must use placeholders.
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!.env.sample
+.envrc
+.direnv/
+.npmrc
+.pypirc
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+sparkle-private-key
+sparkle-private-key.*
+credentials.json
+service-account*.json
+.aws/
+.ssh/
+
+# Local reports can contain file paths, scan results or signing details.
+/benchmarks/local/
+/research/
+/docs/local/
+*.log
+
+# Optional local soundtrack, pending documented redistribution rights.
+/site/public/save-your-mac-with-chippytea.mp3
+
+# Editor, agent and system state.
+.DS_Store
+.idea/
+.codex/
+.claude/
+__pycache__/
+*.py[cod]
+.pytest_cache/
