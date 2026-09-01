@@ -1,4 +1,4 @@
-# The Chippytea landing page
+# The chippytea landing page
 
 Next.js 16 on Bun. The page uses the app's paper, ink, and hand-drawn fish and chips. It needs no API keys, downloaded fonts, or tracking scripts.
 
@@ -18,11 +18,11 @@ Dependency updates are currently manual. As of 1 September 2026, Dependabot cann
 
 ## Download routing
 
-The **Download for Mac** button calls `/download`. It checks the latest stable GitHub release and redirects only to its exact uploaded, nonempty `Chippytea-<version>-universal.dmg`. It rejects drafts, prereleases, duplicate installers, and unexpected download URLs. Both valid links and unavailable results are cached server-side, with a five-minute revalidation interval. A previous result may be served while the cache refreshes. GitHub requests time out after eight seconds.
+The **Download for Mac** button calls `/download`. It checks the latest stable GitHub release and redirects only to its exact uploaded, nonempty `chippytea-<version>-universal.dmg`. It rejects drafts, prereleases, duplicate installers, and unexpected download URLs. Both valid links and unavailable results are cached server-side, with a five-minute revalidation interval. A previous result may be served while the cache refreshes. GitHub requests time out after eight seconds.
 
 If no valid installer is available, the route returns a `503` page with retry, release, and source-build links. The homepage also keeps a **Build from source** link. A working website does not by itself mean a signed, notarized app has been published.
 
-Production hosting needs a Next.js runtime for `/download`, not a static-only export. Build from a fresh checkout or reviewed public-source snapshot, without local `.env`, `.next`, `.vercel`, or soundtrack files. Include the root `LICENSE` when packaging a site-only snapshot.
+Production hosting needs a Next.js runtime for `/download`, not a static-only export. Build from a fresh checkout or reviewed public-source snapshot, without local `.env`, `.next`, or `.vercel` files. Include the committed soundtrack and root `LICENSE` when packaging a site-only snapshot.
 
 ## The illustrated demo
 
@@ -41,8 +41,20 @@ The native policy lives in [SUGGESTIONS.md](../docs/SUGGESTIONS.md).
 
 The landing page keeps its cream-paper theme. The README has separate light and dark artwork. Both respect reduced-motion preferences.
 
-## Optional soundtrack
+## Soundtrack and karaoke
 
-The shop radio appears only when `public/save-your-mac-with-chippytea.mp3` exists at build time. That local soundtrack is ignored by Git while redistribution rights are unconfirmed; a fresh checkout works without it.
+The project-owned **Save Your Mac with chippytea** soundtrack is committed at `public/save-your-mac-with-chippytea.mp3` and published with the maintainer's permission. Fresh checkouts and production deployments include it. The **Play the chippytea song** slip appears in the hero when that file exists at build time.
 
-Do not publish a replacement track without permission to redistribute it. Remove private metadata and document its license first. Original code and drawing paths use the root [MIT license](../LICENSE); that does not establish rights to an independently supplied recording.
+Pressing the slip opens the karaoke (`components/Karaoke.tsx`): the lyric a line at a time with each word wiped gold as it is sung, a chip bouncing over the words, fish and chips behind (`lib/karaokeScene.ts`), a hand-lettered chip count, and a chip thrown into the wrap wherever the page is tapped. Escape or the drawn cross fades it out, song included; opening it again starts from the top.
+
+Word timings live in `lib/lyrics.ts`, generated from the lyric sheet in `scripts/save-your-mac-with-chippytea.lyrics.txt` and a Whisper word-level transcript of the recording:
+
+```sh
+whisper public/save-your-mac-with-chippytea.mp3 --model base.en --language en \
+  --word_timestamps True --output_format json --output_dir /tmp/whisper
+python3 scripts/align-lyrics.py /tmp/whisper/save-your-mac-with-chippytea.json
+```
+
+Edit the sheet, not the generated file, if the words change.
+
+Permission to publish this soundtrack does not grant rights to independently supplied replacements. Check ownership and remove private metadata before publishing another recording. Original code and drawing paths use the root [MIT license](../LICENSE); the soundtrack's rights are separate from that code license.
