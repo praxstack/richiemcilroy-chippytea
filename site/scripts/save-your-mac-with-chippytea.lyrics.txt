@@ -1,0 +1,59 @@
+# The sung lyric sheet for "Save Your Mac with chippytea", as performed on the
+# local recording (which differs slightly from the written lyrics: an extra
+# "chippy tea, chippy tea" in the second chorus, a "whoa, whoa" in the last).
+# Lines starting with [ name a section. Blank lines and # comments are ignored.
+# Regenerate lib/lyrics.ts with scripts/align-lyrics.py after editing.
+
+[intro]
+Oi mate, I just want my chippy tea!
+
+[chorus]
+Ohhhh chippy tea, chippy tea,
+Come and save your Mac some storage with chippytea!
+Chips for me, space for free,
+Clear that clutter, keep your files,
+and save your Mac with chippytea!
+
+[verse 1]
+My hard drive's full of holiday snaps,
+Old downloads, memes, and tax mishaps.
+chippytea comes with a clever little plan:
+Find those chunky files and bin them when you can!
+
+[pre-chorus]
+Click-click, sort it out,
+Watch those little chips pop out!
+
+[chorus]
+Ohhhh chippy tea, chippy tea,
+Come and save your Mac some storage with chippytea!
+Chippy tea, chippy tea!
+Chips for me, space for free,
+Clear that clutter, keep your files,
+and save your Mac with chippytea!
+
+[verse 2]
+There's a folder called “New Folder Two”,
+and seventeen copies of the same old brew.
+No need to panic, no need to plead,
+chippytea finds the files you don't need!
+
+[bridge]
+Round and round the folders go,
+High score rising, nice and slow!
+One more chip, then one more cheer,
+Your Mac's got room for another year!
+
+[last chorus]
+Ohhhh chippy tea,
+chippy tea,
+Come and save your Mac some storage with chippytea!
+Whoa, whoa!
+Chips for me, space for free,
+Clear that clutter, keep your files,
+and save your Mac with chippytea!
+Chippy tea! Chippy tea!
+Save your Mac with chippytea!
+Chippy tea! Chippy tea!
+More space, more chips,
+hooray for me!
