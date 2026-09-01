@@ -4,6 +4,67 @@ Reproducible performance comparisons below use generated, disposable fixtures. P
 
 Measured 31 August and 1 September 2026 on an Apple M4 Max MacBook Pro (`Mac16,6`), 16 CPU cores, 128 GiB memory, arm64, macOS 27.0 build `26A5421a`, local APFS. The workstation was also in normal use; these are reproducible local measurements, not a hardware-wide promise.
 
+## Shared pnpm importer facts
+
+The pnpm follow-up avoids walking the same shared lockfile for every workspace member. A scan-local cache retains only sorted importer keys, keyed by the digest of the exact, currently identity-validated bytes. It holds at most eight entries and 1 MiB of actual retained capacity, including the entry slots. Inputs below 32 KiB bypass retention. Temporary borrowed-key collection has a separate 1 MiB bound; these caps are not a total process-memory limit. Oversized valid evidence remains usable without retention or eviction of existing entries.
+
+The original limited pnpm grammar and error order are preserved, including duplicate-importer OR membership, exact scalar bytes and the literal `.` root importer. A matching key does not skip later validation. This is not a general YAML validator. Current workspace declarations, file identities, configuration, evidence hashes and shared-store restrictions remain outside the facts cache; cleanup still revalidates without it.
+
+This comparison starts from the **combined Bun/npm parser checkpoint below**, not the original pre-task scanner. The candidate changes only the pnpm scanner path; the fixture generator also gains a pnpm mode. Both release CLIs use Rust 1.97.1. Each of seven fixtures has one separate first pair and five alternating warm pairs: **84 invocations**, all completing without errors. Every final candidate field and non-timing terminal statistic matched across variants and repetitions, including ineligible diagnostics. Each fixture retained its one expected eligible 100 MiB artifact, and before/after physical audits matched.
+
+| Workload | Warm elapsed median, before → after | Warm CPU median, before → after | Maximum lifetime CLI RSS, before → after |
+| --- | ---: | ---: | ---: |
+| pnpm: 128 members, 1 MiB lock | 75.857 → 25.922 ms | 60 → 10 ms | 5.562 → 5.641 MiB |
+| pnpm: 512 members, 4 MiB lock | 865.662 → 87.217 ms | 850 → 70 ms | 11.859 → 11.844 MiB |
+| Bun: 512 members, 4 MiB lock | 94.493 → 96.159 ms | 80 → 80 ms | 12.266 → 12.344 MiB |
+| npm: 512 members, 4 MiB lock | 88.974 → 90.339 ms | 80 → 80 ms | 17.469 → 17.562 MiB |
+| 1,001 separate small npm projects | 161.236 → 144.151 ms | 150 → 130 ms | 3.797 → 3.891 MiB |
+| Million ordinary source files | 309.580 → 308.926 ms | 300 → 300 ms | 3.219 → 3.250 MiB |
+| Directory-heavy source tree | 894.297 → 886.953 ms | 880 → 870 ms | 3.203 → 3.250 MiB |
+
+The large pnpm case was **9.9× faster** with **91.8% less median CPU**. Peak RSS was essentially unchanged; the 128-member case used 80 KiB more, while the 512-member difference was 16 KiB lower. The gain is reduced repeated parsing, not a demonstrated memory reduction. Bun and npm control medians were slightly slower, and all controls had slightly higher peak RSS. Their mixed timing differences do not establish a general speedup or regression-free guarantee.
+
+| Workload | First elapsed pair, before → after | Warm elapsed p95, before → after |
+| --- | ---: | ---: |
+| pnpm: 128 members, 1 MiB lock | 75.001 → 301.679 ms | 76.114 → 30.670 ms |
+| pnpm: 512 members, 4 MiB lock | 845.310 → 90.876 ms | 886.645 → 94.704 ms |
+| Bun: 512 members, 4 MiB lock | 145.573 → 89.640 ms | 101.298 → 110.212 ms |
+| npm: 512 members, 4 MiB lock | 146.357 → 86.017 ms | 94.267 → 94.682 ms |
+| 1,001 separate small npm projects | 381.416 → 168.467 ms | 168.890 → 152.198 ms |
+| Million ordinary source files | 315.909 → 317.442 ms | 331.899 → 313.663 ms |
+| Directory-heavy source tree | 897.992 → 928.806 ms | 908.080 → 903.856 ms |
+
+The slower first pnpm128 invocation is retained. Large-pnpm first-eligible p95 was **331.517 → 42.992 ms** at CLI output observation, not native rendering. Five-sample nearest-rank p95 is the maximum, not a reliable population-tail estimate. Each invocation starts a new process and empty scan-local caches, including a first lock parse. Fixture creation and audits warm filesystem caches; neither first nor warm pairs establish controlled cold-disk performance. CPU is whole-process user plus system time at Darwin `/usr/bin/time -l` resolution; RSS is the maximum lifetime high-water mark across all six invocations per variant. Other project builds were paused, but normal desktop workloads remained. The million-file control is names-first discovery, not exhaustive metadata inventory.
+
+The frozen candidate passed **346 Rust tests**, formatting and Clippy with warnings denied using Rust 1.98.0, followed by the matched release build. Differential tests retain independent copies of the original scalar and importer parsers. They cover malformed and duplicate sections, error precedence, unsupported scalar forms, exact UTF-8 keys, root membership, late errors after a match, bounded collection, LRU eviction, oversized evidence, small-input bypass and cancellation. Existing integration coverage now also checks pnpm cache hits against changed lock bytes, workspace exclusions, configuration and substituted symlinks. Valid-fixture equality alone does not prove these safety properties.
+
+Both disposable native suites passed: cleanup/restore/restart and access/interaction. One additional native pnpm512 rescan verified all **1,542 entries**, the expected artifact and an unchanged ledger. It observed **242.493 ms wall time**, **174.011 ms process CPU** and **111.766 MiB lifetime peak RSS**. This single warm observation does not establish a native before/after gain, p95, rendering latency or idle CPU. The endpoint is main-actor snapshot delivery before final rendering. The isolated ad-hoc app links the exact candidate Rust archive to the initial native source; it does not validate the separate updater, distribution packaging or minimum supported macOS version.
+
+All **40 cancellation samples** passed, requesting cancellation after 40 ms: `cancelled=true`, `complete=false`, zero scan errors and no timeout.
+
+| Fixture | Median wall-minus-delay upper bound | p95 upper bound | Maximum upper bound |
+| --- | ---: | ---: | ---: |
+| pnpm, 512 members | 9.417 ms | 13.767 ms | 13.960 ms |
+| Million ordinary source files | 13.206 ms | 13.732 ms | 14.780 ms |
+
+These bounds include startup, timer scheduling and shutdown; they do not timestamp the Rust cancellation flag or a native button. Cancellation remains cooperative around the pnpm parse and compaction; the parser traversal and sorting are not individually preemptible.
+
+```sh
+python3 scripts/make-workspace-fixture.py /private/tmp/chippytea-pnpm-512 \
+  --lock-format pnpm --members 512 --lock-kib 4096 --age-days 9
+python3 scripts/benchmark-suggestions.py /private/tmp/chippytea-pnpm-512 \
+  --baseline-cli /path/to/before/chippytea-cli \
+  --candidate-cli target/release/chippytea-cli --warm-runs 5 \
+  --output benchmarks/local/pnpm-512-comparison
+```
+
+Both paths must be new. For the smaller fixture use 128 members and 1,024 KiB. The generated dependency records are synthetic ownership/performance evidence, not an installable package-manager lockfile.
+
+- Baseline CLI SHA-256: `7bd78ebfdd2249996bfc8fcb18561da1d486737f8c6f0577bc4c0b383ce4a730`.
+- Candidate CLI SHA-256: `d0ad99489155de36084883dc49adc940f2acbec70a15dbbabe4cb18ecc3db2f7`.
+- Candidate scanner SHA-256: `ee7a394704267bcb7d8db8cb63bc13850cb9679cc93ffe45f9f38e2114f29c66`.
+- Private evidence: `benchmarks/local/scan-performance-20260901/pnpm-facts-*`, `pnpm-fixture-*` and `native-pnpm-facts*`. Raw paths and source/build manifests remain ignored, not published.
+
 ## Combined parser checkpoint
 
 The retained core combines the shared Bun-facts cache and safer discovery with strict, lower-allocation Bun and npm parsing. It also includes the separate fixed-size digest-chunk compatibility change. This final comparison starts from the original pre-task scanner, not the intermediate R1 or R2 implementations measured below. Neither parsed facts nor a previous scan authorize deletion: current evidence and uncached cleanup revalidation remain mandatory.
