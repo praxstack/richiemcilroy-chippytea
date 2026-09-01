@@ -29,9 +29,12 @@ for component in \
         printf 'The pinned Sparkle framework is missing %s\n' "$component" >&2
         exit 1
     fi
+    printf 'Signing Sparkle component: %s\n' "$component"
     codesign "${sign[@]}" --preserve-metadata=entitlements "$framework/$component"
 done
+printf 'Signing Sparkle framework…\n'
 codesign "${sign[@]}" "$framework"
+printf 'Signing application bundle…\n'
 codesign "${sign[@]}" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
