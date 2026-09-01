@@ -134,6 +134,9 @@ SwiftPM uses separate arm64 and x86_64 scratch directories under
 CHIPPYTEA_SWIFT_BUILD_PATH (or .build locally), so incremental universal builds
 do not reuse another architecture's build database.
 
+CI and release jobs both select Xcode 26.2 explicitly. Update that selection in
+both workflows together and verify the new toolchain before publishing.
+
 The resulting release contains:
 
 | Asset | Use |
