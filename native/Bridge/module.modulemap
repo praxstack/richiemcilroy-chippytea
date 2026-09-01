@@ -1,0 +1,4 @@
+module ChippyteaCore {
+    header "chippytea.h"
+    export *
+}
