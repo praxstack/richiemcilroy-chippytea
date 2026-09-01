@@ -37,9 +37,24 @@ The native policy lives in [SUGGESTIONS.md](../docs/SUGGESTIONS.md).
 - `components/DemoPanel.tsx` handles the interactive example.
 - `lib/chime.ts` synthesizes the short collection sound.
 - `bun scripts/gen-icon.ts` regenerates the fish favicon.
+- `bun scripts/gen-og.ts` regenerates the share image and touch icon (see below).
 - `bun ../scripts/generate-readme-art.ts` regenerates the repository's light and dark SVGs.
 
 The landing page keeps its cream-paper theme. The README has separate light and dark artwork. Both respect reduced-motion preferences.
+
+## Metadata, share image and icons
+
+`lib/site.ts` holds the name, title, description, GitHub link and author that every metadata file repeats. `app/layout.tsx` turns them into the page title, description, canonical link, Open Graph and Twitter cards, robots directives and a JSON-LD `SoftwareApplication` plus `SoftwareSourceCode` graph. `app/robots.ts`, `app/sitemap.ts` and `app/manifest.ts` generate `robots.txt` (everything crawlable except the `/download` redirect), `sitemap.xml` and the web manifest.
+
+Absolute URLs come from `siteUrl()`: set `NEXT_PUBLIC_SITE_URL` (for example `https://chippytea.example`) for a custom domain. On Vercel the project's production domain is used automatically; locally it is `http://localhost:3000`.
+
+`app/opengraph-image.png` (1200 × 630 at 2×) and `app/apple-icon.png` are committed files drawn from the page's own art: the sign, the headline, the drawn download button and the app's card with the hand-lettered balance and the wrap of chips. Regenerate them after changing the drawing or the headline:
+
+```sh
+bun scripts/gen-og.ts
+```
+
+It renders a small HTML page in headless Google Chrome (or Chromium; `CHROME_PATH` overrides the search) with the system font, the same way the page renders in a browser. `app/opengraph-image.alt.txt` is the image's alt text.
 
 ## Soundtrack and karaoke
 
