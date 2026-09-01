@@ -205,7 +205,7 @@ final class TrayPanel: NSPanel {
             button.imagePosition = .imageLeading
             button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
             button.target = self; button.action = #selector(statusClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.sendAction(on: [.leftMouseDown, .rightMouseUp])
             button.toolTip = "chippytea — your chips"
         }
 
@@ -425,6 +425,14 @@ final class TrayPanel: NSPanel {
     func windowDidResignKey(_ notification: Notification) {
         guard !suppressAutoDismiss, (notification.object as AnyObject?) === panel else { return }
         guard model.systemDialogDepth == 0 else { return }
+        // AppKit can resign key before delivering the status item's mouse-down.
+        // Let that press toggle the still-visible panel instead of reopening it.
+        if NSEvent.pressedMouseButtons & 1 != 0,
+           let button = statusItem.button,
+           let window = button.window,
+           window.convertToScreen(button.convert(button.bounds, to: nil)).contains(NSEvent.mouseLocation) {
+            return
+        }
         hidePanel()
     }
 
