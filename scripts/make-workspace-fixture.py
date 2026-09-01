@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a disposable npm or Bun workspace for repeated shared-lock parsing."""
+"""Create a disposable npm, Bun or pnpm workspace for shared-lock parsing."""
 
 from __future__ import annotations
 
@@ -104,12 +104,39 @@ def shared_bun_lock(members: int, size: int) -> tuple[bytes, int]:
     return b"".join(parts), dependencies
 
 
+def shared_pnpm_lock(members: int, size: int) -> tuple[bytes, int]:
+    """Create synthetic pnpm importer/package records with an exact byte size."""
+    parts = [b"lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n"]
+    parts.extend(
+        f"  packages/member-{number:04d}: {{}}\n".encode()
+        for number in range(members)
+    )
+    parts.append(b"\npackages:\n")
+    ending = b"\nsnapshots: {}\n"
+    used = sum(map(len, parts)) + len(ending)
+    if used > size:
+        raise ValueError("The requested lock size cannot contain the workspace member table")
+    dependencies = 0
+    while True:
+        entry = (
+            f"  synthetic-dependency-{dependencies:06d}@1.0.0:\n"
+            "    resolution: {integrity: sha512-synthetic-fixture-not-for-installation}\n"
+        ).encode()
+        if used + len(entry) > size:
+            break
+        parts.append(entry)
+        used += len(entry)
+        dependencies += 1
+    parts.extend((ending, b" " * (size - used)))
+    return b"".join(parts), dependencies
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = argparse.ArgumentParser(description=__doc__)
     arguments.add_argument("path", type=Path, help="A NEW directory for this fixture")
     arguments.add_argument("--members", type=int, default=128, help="Workspace members, 2..512 (default: 128)")
     arguments.add_argument("--lock-kib", type=int, default=1024, help="Exact shared lock size, 256..4096 KiB (default: 1024)")
-    arguments.add_argument("--lock-format", choices=("npm", "bun"), default="npm", help="Shared lock format (default: npm)")
+    arguments.add_argument("--lock-format", choices=("npm", "bun", "pnpm"), default="npm", help="Shared lock format (default: npm)")
     arguments.add_argument("--age-days", type=int, default=8, help="Age all fixture modification times, 8..3650 days (default: 8)")
     args = arguments.parse_args(argv)
     if not 2 <= args.members <= 512:
@@ -122,15 +149,19 @@ def main(argv: list[str] | None = None) -> int:
     requested = args.path.expanduser().absolute()
     if os.path.lexists(requested):
         arguments.error(f"Refusing an existing path: {requested}")
-    lock_builder = shared_lock if args.lock_format == "npm" else shared_bun_lock
-    lock_name = "package-lock.json" if args.lock_format == "npm" else "bun.lock"
+    lock_builder, lock_name = {
+        "npm": (shared_lock, "package-lock.json"),
+        "bun": (shared_bun_lock, "bun.lock"),
+        "pnpm": (shared_pnpm_lock, "pnpm-lock.yaml"),
+    }[args.lock_format]
     lock, dependencies = lock_builder(args.members, args.lock_kib * 1024)
+    workspace_config = b"packages:\n  - 'packages/*'\n" if args.lock_format == "pnpm" else None
     ancestor = requested.parent
     while not ancestor.exists():
         ancestor = ancestor.parent
     # Include directory and file metadata headroom beyond the actual payload.
     directories = 2 + 2 * args.members  # baseline, packages, members, artifacts.
-    files = args.members + 3  # Root manifest, shared lock, member manifests, payload.
+    files = args.members + 3 + int(workspace_config is not None)
     projected = PAYLOAD_BYTES + len(lock) + directories * 18_432 + files * 8192
     fixture.require_space(ancestor, projected)
     requested.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
         fixture.write_new(baseline / "package.json", manifest)
         fixture.write_new(baseline / lock_name, lock)
         logical_bytes += len(manifest) + len(lock)
+        if workspace_config is not None:
+            fixture.write_new(baseline / "pnpm-workspace.yaml", workspace_config)
+            logical_bytes += len(workspace_config)
         packages = baseline / "packages"
         packages.mkdir()
         for number in range(args.members):
@@ -221,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
                 "special_files": 0,
                 "project_manifests": args.members + 1,
                 "project_lockfiles": 1,
-                "project_evidence_files": args.members + 2,
+                "project_evidence_files": args.members + 2 + int(workspace_config is not None),
             },
             cases={},
         )
