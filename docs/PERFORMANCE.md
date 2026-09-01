@@ -4,9 +4,67 @@ Reproducible performance comparisons below use generated, disposable fixtures. P
 
 Measured 31 August and 1 September 2026 on an Apple M4 Max MacBook Pro (`Mac16,6`), 16 CPU cores, 128 GiB memory, arm64, macOS 27.0 build `26A5421a`, local APFS. The workstation was also in normal use; these are reproducible local measurements, not a hardware-wide promise.
 
+## Combined parser checkpoint
+
+The retained core combines the shared Bun-facts cache and safer discovery with strict, lower-allocation Bun and npm parsing. It also includes the separate fixed-size digest-chunk compatibility change. This final comparison starts from the original pre-task scanner, not the intermediate R1 or R2 implementations measured below. Neither parsed facts nor a previous scan authorize deletion: current evidence and uncached cleanup revalidation remain mandatory.
+
+Each of seven fixtures has one separate first pair and five alternating warm pairs: **84 CLI invocations** in total. Every scan completed without errors. A separate raw-output check matched every field of every final candidate, including ineligible diagnostics, and every non-timing terminal statistic across variants and repetitions. All runs retained their one expected eligible 100 MiB artifact. Physical fixture audits before and after each batch matched.
+
+| Workload | Warm elapsed median, before → after | Warm CPU median, before → after | Maximum lifetime CLI RSS, before → after |
+| --- | ---: | ---: | ---: |
+| Bun: 128 members, 1 MiB lock | 432.545 → 34.017 ms | 420 → 20 ms | 9.047 → 5.812 MiB |
+| Bun: 512 members, 4 MiB lock | 6,667.400 → 110.178 ms | 6,640 → 100 ms | 21.688 → 12.219 MiB |
+| npm: 128 members, 1 MiB lock | 31.884 → 30.919 ms | 20 → 20 ms | 11.844 → 6.672 MiB |
+| npm: 512 members, 4 MiB lock | 101.941 → 100.153 ms | 90 → 80 ms | 37.266 → 17.594 MiB |
+| 1,001 separate small npm projects | 177.619 → 171.205 ms | 160 → 160 ms | 3.797 → 3.797 MiB |
+| Million ordinary source files | 325.318 → 326.756 ms | 310 → 320 ms | 3.203 → 3.219 MiB |
+| Directory-heavy source tree | 939.386 → 942.128 ms | 920 → 930 ms | 3.250 → 3.250 MiB |
+
+The large Bun case was **60.5× faster**, used **98.5% less median CPU**, and had **43.7% lower peak RSS**. The large npm case had **52.8% lower peak RSS** with a modest median-time difference. Ordinary-file and directory-heavy controls were slightly slower in median elapsed time and CPU; this is not a general speedup or regression-free guarantee. The million-file workload examines names first and is not an exhaustive metadata inventory.
+
+First invocations and p95 remain visible rather than being folded into the median:
+
+| Workload | First elapsed pair, before → after | Warm elapsed p95, before → after |
+| --- | ---: | ---: |
+| Bun: 128 members, 1 MiB lock | 451.766 → 263.047 ms | 433.682 → 34.910 ms |
+| Bun: 512 members, 4 MiB lock | 6,652.400 → 110.074 ms | 6,682.622 → 114.194 ms |
+| npm: 128 members, 1 MiB lock | 46.020 → 31.804 ms | 34.370 → 32.258 ms |
+| npm: 512 members, 4 MiB lock | 104.332 → 104.434 ms | 104.916 → 104.994 ms |
+| 1,001 separate small npm projects | 393.654 → 178.219 ms | 184.027 → 177.446 ms |
+| Million ordinary source files | 339.472 → 337.771 ms | 341.953 → 328.003 ms |
+| Directory-heavy source tree | 925.624 → 978.593 ms | 946.220 → 948.605 ms |
+
+The large Bun first-eligible p95 was **2,451.159 → 55.783 ms**, measured when the CLI harness observes the completed finding. Five-sample nearest-rank p95 is the maximum, not a reliable population-tail estimate. Every invocation starts a new process and empty scan-local caches, including a first lockfile parse. Fixture creation and audits warm filesystem caches; neither the first nor warm pairs establish controlled cold-disk performance. CPU is whole-process user plus system time at the coarse resolution of Darwin `/usr/bin/time -l`; RSS is the maximum lifetime high-water mark across all six invocations per variant, not live heap or retained-cache size. Concurrent project builds were paused during timing. Earlier adverse observations remain in the separately identified R1/R2/R3 series below.
+
+The exact combined source passed **340 Rust tests**, formatting and Clippy with warnings denied, followed by an optimized build. After promotion into the working tree, all 340 tests, formatting and Clippy passed again using Rust 1.98.0, with source hashes unchanged throughout. Differential tests compare the original full-JSON parsers with the projected parsers on malformed values, duplicate and decoded keys, numeric ranges, depth, trailing input and cancellation. Cache limits and cleanup ownership checks are unchanged. Valid-fixture equality alone is not the evidence for malformed-input safety.
+
+Both disposable native suites passed: cleanup/restore/restart and access/interaction. Two additional single warm native rescans used fresh synthetic libraries, verified all 1,541 fixture entries and the expected artifact, and left the accounting ledger unchanged:
+
+| Native fixture | Observed scan wall time | Process CPU | Lifetime peak RSS |
+| --- | ---: | ---: | ---: |
+| Bun, 512 members | 217.092 ms | 179.806 ms | 113.953 MiB |
+| npm, 512 members | 253.727 ms | 183.702 ms | 119.203 MiB |
+
+These single native observations do not establish a native before/after speed or memory improvement, p95, rendering latency or idle CPU. The endpoint is main-actor snapshot delivery before final rendering. The isolated ad-hoc app links the exact combined Rust archive to the initial native source; it does not validate the separate updater, distribution packaging or minimum supported macOS version.
+
+All **60 cancellation samples** exited successfully with `cancelled=true`, `complete=false`, zero scan errors and no timeout, requesting cancellation after 40 ms:
+
+| Fixture | Median wall-minus-delay upper bound | p95 upper bound | Maximum upper bound |
+| --- | ---: | ---: | ---: |
+| Bun, 512 members | 6.290 ms | 13.814 ms | 14.090 ms |
+| npm, 512 members | 9.156 ms | 13.795 ms | 14.928 ms |
+| Million ordinary source files | 7.848 ms | 13.382 ms | 13.389 ms |
+
+These bounds include startup, timer scheduling and shutdown; they do not timestamp the Rust cancellation flag or a native button. Cancellation remains cooperative, and individual JSON tokens, the retained Bun workspace subtree and sorting are not individually preemptible.
+
+- Original CLI SHA-256: `3c0c52273fce70c9ec0fa7035d35bef23ec1fa384c943730fd1650503c29ca83`.
+- Combined CLI SHA-256: `7bd78ebfdd2249996bfc8fcb18561da1d486737f8c6f0577bc4c0b383ce4a730`.
+- Combined parser source SHA-256: `13b84265775fe215961259588c3e52399ef467420b1b064fdee7638d8fe0ee7a`.
+- Private evidence: `benchmarks/local/scan-performance-20260901/final-original-*`, `final-parser-evidence-audit.json`, `final-parser-validation`, `live-parser-validation`, `native-final-parser-*` and `final-parser-cancel-*`. Source manifests and raw-output checks are retained there, not published.
+
 ## Shared Bun workspaces and safer discovery
 
-The 1 September scanner update reuses compact Bun workspace ownership facts instead of repeatedly normalizing and parsing the same shared lockfile. The cache holds at most eight entries and 1 MiB of retained capacity. It contains workspace keys and optional names, not dependency trees or permission to delete. Current manifest names, captured file identities, workspace declarations and configuration are still checked; cleanup uses uncached revalidation. The first parse still allocates the normalized input and JSON tree, so the retention cap is not a peak-memory limit.
+The first 1 September scanner checkpoint reuses compact Bun workspace ownership facts instead of repeatedly normalizing and parsing the same shared lockfile. The cache holds at most eight entries and 1 MiB of retained capacity. It contains workspace keys and optional names, not dependency trees or permission to delete. Current manifest names, captured file identities, workspace declarations and configuration are still checked; cleanup uses uncached revalidation. At this initial checkpoint, the first parse still allocated the normalized input and JSON tree; the lower-memory parser follow-up is measured separately below. The retention cap is not a peak-memory limit.
 
 Two generated workspaces each contain one independently allocated, eligible 100 MiB artifact; all fixture modification times are nine days old. Each comparison has one separate first pair and five alternating warm pairs. All **24 scans** passed independent before/after fixture audits and returned identical eligible paths, identities, fingerprints, sizes and permanent-cleanup eligibility.
 
@@ -43,6 +101,65 @@ python3 scripts/benchmark-suggestions.py /private/tmp/chippytea-bun-512 \
 
 The fixture and output paths must be new; existing directories are refused. For the smaller case use 128 members and 1,024 KiB. Omit `--lock-format bun` to create the npm control. The OSS review supported retaining bounded, descriptor-relative traversal; see the pinned references in [REFERENCE-STUDY.md](REFERENCE-STUDY.md) and the [ncdu 2.9.2 source](https://dev.yorhel.nl/download/ncdu-2.9.2.tar.gz). These measurements do not compare Chippytea with those tools.
 
+### Lower first-parse memory for Bun locks
+
+The second Bun revision validates dependency and unrelated values without constructing their full JSON trees. It still materializes the normalized input and workspace subtree, and keeps the existing ownership and compact-fact logic. The eight-entry, 1 MiB retained-facts cap is unchanged; it is not a process-memory bound. This comparison uses the already-cached R1 implementation as its baseline, not the original uncached scanner.
+
+| Bun fixture | Warm samples per variant | Median elapsed, R1 → R2 | Median CPU, R1 → R2 | Maximum lifetime CLI RSS, R1 → R2 |
+| --- | ---: | ---: | ---: | ---: |
+| 128 members, 1 MiB lock | 5 | 38.646 → 36.220 ms | 30 → 30 ms | 8.203 → 5.781 MiB |
+| 512 members, 4 MiB lock | 5 | 127.087 → 113.920 ms | 110 → 100 ms | 21.641 → 12.391 MiB |
+| 512 members, 4 MiB lock, repeat | 12 | 115.880 → 112.991 ms | 100 → 100 ms | 21.641 → 12.375 MiB |
+
+The 512-member peak RSS fell **42.7–42.8%** in the two series. This is the supported improvement. The longer repeat had unchanged 100 ms median CPU, and elapsed p95 worsened from **122.685 to 125.358 ms**. It does not establish a reliable additional CPU or tail-latency gain.
+
+Each invocation is a new CLI process with an empty scan-local cache, so every timed scan includes its first Bun parse. Warm refers to filesystem conditions, not a prefilled parser cache. RSS is the largest lifetime high-water mark across the separate first invocation and all warm samples; it is not live heap, parser-only allocation or native-app memory. CPU has the coarse precision of Darwin `/usr/bin/time -l`. Creation and pre-run audits warm caches. The 128-member first pair was **54.305 → 208.667 ms** and is retained; these are not controlled cold-cache results.
+
+Controls are retained without claiming general regression-free performance:
+
+| Control | Warm samples per variant | Median elapsed, R1 → R2 | Elapsed p95, R1 → R2 |
+| --- | ---: | ---: | ---: |
+| 512-member npm workspace | 5 | 123.737 → 127.838 ms | 135.405 → 166.920 ms |
+| Same npm workspace, repeat | 12 | 115.947 → 116.648 ms | 264.199 → 125.063 ms |
+| Million ordinary source files | 5 | 367.817 → 366.751 ms | 404.872 → 387.096 ms |
+| Directory-heavy source tree | 5 | 1186.125 → 1202.454 ms | 1288.143 → 1233.503 ms |
+
+All **112 invocations** passed fixture audits and exact full final-candidate comparison, including ineligible diagnostic outcomes. All terminal coverage fields also matched after excluding elapsed and first-finding time. Each fixture retained its one expected eligible artifact. Binaries alternate within each series; nearest-rank p95 is the maximum for both five and twelve warm samples and is not a reliable population-tail estimate.
+
+The frozen R2 parser candidate passed **335 Rust tests**, formatting and Clippy. Differential tests separately check malformed JSON, duplicate keys, Unicode, numeric ranges, normalization and depth limits; valid-fixture benchmark equality alone cannot establish these semantics. Cancellation remains cooperative: discarded values gain checks, but individual tokens and the retained workspace subtree are not individually preemptible. These CLI series establish neither parser cancellation latency nor native rendering or idle performance. Twenty separate R2 whole-scan cancellation samples requested cancellation after 40 ms and passed; the maximum wall-time-minus-requested-delay upper bound was **20.377 ms** (median **13.767 ms**, p95 **14.329 ms**). This includes startup, scheduling and shutdown, not a timestamped parser or native-button response.
+
+Both disposable native suites passed with the R2 core: cleanup/restore/restart and full access/interaction. A separate isolated native Bun512 rescan verified all 1,541 entries, the one expected eligible artifact and an unchanged ledger, completing in **248.824 ms**, with **189.339 ms CPU** and **114.281 MiB lifetime peak RSS**. This is one warm integration observation, not a native before/after improvement or p95 result. The endpoint is main-actor snapshot delivery before final rendering. The ad-hoc app uses the initial native source and does not validate the separate updater, distribution build or minimum supported OS.
+
+R1 CLI SHA-256: `5d448ac17198417423aeafb3c67df0e37e60d75f51a835601872ec782848f7e0`. R2 CLI: `65be165d9d827f11618e36b1d58226a3871edd15e66221d4f479d2911434a689`. Raw records and the full-output audit are retained under ignored `benchmarks/local/scan-performance-20260901/bun-projection-*`; native evidence is in `native-bun-projection-512` and the `native-projection-*` logs. The combined parser checkpoint includes this Bun parser, but the figures in this section describe only the separately measured R2 binary.
+
+### Lower first-parse memory for npm locks
+
+The npm follow-up validates the complete JSON document while retaining only object-valued package keys and the shape markers needed by the existing ownership check. It avoids constructing dependency-value trees. Decoded-key and duplicate-key behavior, ownership rules, compact facts and cache limits remain unchanged. Discarded values still receive numeric-range, Unicode and nesting validation; this is not an unchecked skip parser. Input bytes, decoded package keys and temporary compact-fact construction still consume memory. The npm cache's eight-entry, 8 MiB retained-facts cap is not a process-memory bound.
+
+| npm fixture | Warm samples per variant | Median elapsed, R2 → R3 | Elapsed p95, R2 → R3 | Maximum lifetime CLI RSS, R2 → R3 |
+| --- | ---: | ---: | ---: | ---: |
+| 128 members, 1 MiB lock | 5 | 29.473 → 28.985 ms | 30.354 → 33.552 ms | 11.797 → 6.781 MiB |
+| 512 members, 4 MiB lock | 12 | 101.837 → 99.9145 ms | 111.687 → 111.749 ms | 37.172 → 17.750 MiB |
+
+For 512 members, peak RSS fell from **38,977,536 to 18,612,224 bytes: 52.2% lower**. The 128-member reduction was 42.5%. Lower peak memory is the primary supported improvement. Warm elapsed medians improved modestly, but elapsed p95 was slightly worse in both fixtures. Median CPU was 90 → 80 ms for 512 members and 20 → 10 ms for 128 members, at the coarse precision of Darwin `/usr/bin/time -l`; these samples do not establish a general CPU or tail-latency improvement.
+
+The separate 128-member first pair was **47.286 → 211.744 ms**, and remains part of the record. The 512-member first pair was 148.862 → 88.484 ms. Neither is a controlled cold-cache comparison: fixture creation and pre-run audits warm filesystem caches. Every invocation starts a fresh CLI process and an empty scan-local cache, including the samples labelled warm, so each scan includes its first npm parse. Maximum RSS includes both first and warm invocations; it is not retained-cache size, live heap, parser-only allocation or native-app memory.
+
+Controls remain visible without claiming regression-free performance:
+
+| Control | Warm samples per variant | Median elapsed, R2 → R3 | Elapsed p95, R2 → R3 |
+| --- | ---: | ---: | ---: |
+| 1,001 projects with separate small npm locks | 5 | 170.187 → 166.137 ms | 181.383 → 181.525 ms |
+| 512-member Bun workspace | 5 | 103.201 → 102.816 ms | 107.271 → 105.343 ms |
+| Million ordinary source files | 5 | 343.791 → 344.528 ms | 358.614 → 410.687 ms |
+| Directory-heavy source tree | 5 | 989.186 → 961.648 ms | 1009.501 → 1011.204 ms |
+
+Observed first-eligible p95 was 14.418 → 15.192 ms for npm128 and 54.469 → 50.265 ms for npm512. This is when the harness observes CLI stdout, not native first-render latency. Variants alternate within each series. With five or twelve warm samples, nearest-rank p95 is the observed maximum, not a reliable population-tail estimate.
+
+All **86 invocations** passed before/after fixture audits and exact comparison of every final Candidate field, including ineligible diagnostics. All terminal stats matched after excluding only elapsed and first-finding time. Each fixture retained its one expected eligible artifact. The frozen R3 prototype passed **340 Rust tests**, formatting, Clippy with warnings denied and a release build. Separate differential parser tests cover malformed JSON, duplicate and decoded keys, numeric versions/ranges, depth limits, trailing input and cancellation semantics; valid-fixture equality alone does not prove those properties. These six CLI series measure neither cancellation latency nor native integration, cleanup or idle performance.
+
+R2 CLI SHA-256: `65be165d9d827f11618e36b1d58226a3871edd15e66221d4f479d2911434a689`. R3 CLI: `a63afaa126afaffb3eb10ab0df12cdc940b7a1602ff71c88149156a55340b4c8`. Only `core/src/lock_facts.rs` changed between the frozen sources. These measurements precede the separate `safety.rs` CI compatibility fix and do not establish results for that later combined artifact. Raw records, the pinned batch/validation manifests and the independent full-output audit remain under ignored `benchmarks/local/scan-performance-20260901/npm-projection-*`.
+
 ### Typed Rust snapshot responses
 
 Native snapshot requests now serialize the typed snapshot directly into the JSON envelope instead of constructing an intermediate generic JSON value tree. The public Rust request API and JSON field semantics are unchanged. A new synthetic FFI harness measures the real `ct_request` and `ct_free_string` calls, including byte-for-byte validation of every timed response.
@@ -68,18 +185,18 @@ python3 scripts/benchmark-snapshot-ffi.py compare \
   --iterations 200 --rounds 6 --output benchmarks/local/snapshot-comparison
 ```
 
-### Integrated verification and limits
+### Initial checkpoint verification and limits
 
-The frozen core passed **330 Rust tests**, formatting and Clippy with warnings denied. Both disposable native suites passed: Trash/restore/permanent cleanup/restart and the complete access/interaction suite. An isolated app using the existing native source and this final core completed one visible Bun512 rescan in **253.654 ms**, using **182.839 ms process CPU** and **122.781 MiB lifetime peak RSS**. It verified all 1,541 entries, the expected eligible artifact and an unchanged ledger. The endpoint is main-actor snapshot delivery before final rendering, not frame latency; this is one warm integration observation, not a native before/after or p95 result. It does not validate the separate updater/release build.
+The initial frozen core passed **330 Rust tests**, formatting and Clippy with warnings denied. Both disposable native suites passed: Trash/restore/permanent cleanup/restart and the complete access/interaction suite. An isolated app using the existing native source and that initial core completed one visible Bun512 rescan in **253.654 ms**, using **182.839 ms process CPU** and **122.781 MiB lifetime peak RSS**. It verified all 1,541 entries, the expected eligible artifact and an unchanged ledger. The endpoint is main-actor snapshot delivery before final rendering, not frame latency; this is one warm integration observation, not a native before/after or p95 result. It does not validate the separate updater/release build.
 
-Forty final-CLI cancellation samples passed: twenty on Bun512 and twenty on the million-source-file fixture, requesting cancellation after 40 ms. Whole-process wall time minus that requested delay was at most **9.335 ms** and **8.845 ms**, respectively. Those are upper bounds including startup, timer scheduling and shutdown, not timestamps of the cancellation flag or native-button latency.
+Forty initial-checkpoint CLI cancellation samples passed: twenty on Bun512 and twenty on the million-source-file fixture, requesting cancellation after 40 ms. Whole-process wall time minus that requested delay was at most **9.335 ms** and **8.845 ms**, respectively. Those are upper bounds including startup, timer scheduling and shutdown, not timestamps of the cancellation flag or native-button latency.
 
 A packed metadata-fingerprint update was also tested and **not retained**: on the exhaustive million-entry artifact fixture, median wall time was 2,058.446 → 2,064.543 ms and median CPU was 2.05 s for both. Exact fingerprints matched, but there was no demonstrated gain.
 
 Private raw timings, fixture audits, source manifests and native logs are under `benchmarks/local/scan-performance-20260901/`. The Bun reports are `bun-comparison-128` and `bun-comparison-512`; controls are `control-*`, and FFI evidence is `ffi-snapshot-probe/comparison-v2`. The rejected FFI protocol-1 probe was never used for results; protocol 2 validates every timed response, not only endpoints.
 
 - Before CLI SHA-256: `3c0c52273fce70c9ec0fa7035d35bef23ec1fa384c943730fd1650503c29ca83`.
-- After CLI SHA-256: `5d448ac17198417423aeafb3c67df0e37e60d75f51a835601872ec782848f7e0`.
+- Initial-checkpoint after CLI SHA-256: `5d448ac17198417423aeafb3c67df0e37e60d75f51a835601872ec782848f7e0`.
 - Before/after Rust libraries and all harness hashes are recorded in the private build and comparison manifests.
 
 ## Immediate background cleanup
