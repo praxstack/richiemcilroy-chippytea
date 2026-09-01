@@ -90,6 +90,24 @@ security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" \
 security set-key-partition-list -S apple-tool:,apple:,codesign: \
     -s -k "$keychain_password" "$keychain" >/dev/null
 
+# Resolve the configured name to one valid certificate/private-key pair before
+# expensive builds. Capture the fingerprint; do not print the identity listing.
+printf 'Checking the imported Developer ID identity…\n'
+signing_fingerprint="$(python3 -B scripts/release/release.py signing-identity --keychain "$keychain")"
+printf 'Checking timestamped signing with a disposable executable…\n'
+cp /usr/bin/true "$work/signing-probe"
+if ! codesign --force --sign "$signing_fingerprint" --keychain "$keychain" \
+    --options runtime --timestamp "$work/signing-probe" >"$work/signing-probe.log" 2>&1; then
+    probe_failure="$(python3 -B scripts/release/release.py signing-probe-error --log "$work/signing-probe.log")"
+    printf 'Developer ID signing probe failed after identity lookup (%s).\n' "$probe_failure" >&2
+    exit 1
+fi
+if ! codesign --verify --strict "$work/signing-probe" >>"$work/signing-probe.log" 2>&1; then
+    printf 'Developer ID signing probe verification failed.\n' >&2
+    exit 1
+fi
+printf 'Developer ID signing preflight passed.\n'
+
 notary_profile="chippytea-release"
 if [[ -f "$asc_key" ]]; then
     xcrun notarytool store-credentials "$notary_profile" --keychain "$keychain" \
@@ -126,7 +144,7 @@ CHIPPYTEA_ARCHS="arm64 x86_64" \
 CHIPPYTEA_BUILD_VERSION="$version" \
 CHIPPYTEA_BUILD_NUMBER="$version" \
 CHIPPYTEA_APP_OUTPUT="$app" \
-CHIPPYTEA_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY" \
+CHIPPYTEA_SIGNING_IDENTITY="$signing_fingerprint" \
 CHIPPYTEA_SIGNING_KEYCHAIN="$keychain" \
 CHIPPYTEA_RELEASE=1 \
 CHIPPYTEA_SWIFT_BUILD_PATH="$work/swift" \
@@ -227,7 +245,7 @@ ditto "$app" "$work/dmg-root/chippytea.app"
 ln -s /Applications "$work/dmg-root/Applications"
 dmg="$output/chippytea-$version-universal.dmg"
 hdiutil create -volname chippytea -srcfolder "$work/dmg-root" -fs APFS -format ULFO "$dmg"
-codesign --force --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" --timestamp "$dmg"
+codesign --force --sign "$signing_fingerprint" --keychain "$keychain" --timestamp "$dmg"
 codesign --verify --strict "$dmg"
 notarize "$dmg" "$log_dir/notary-dmg.json"
 xcrun stapler staple "$dmg"
