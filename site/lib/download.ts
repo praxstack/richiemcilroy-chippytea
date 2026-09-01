@@ -26,7 +26,7 @@ export function resolveReleaseDownload(release: unknown): string | null {
   // JavaScript's $ also matches before a final newline; require the entire tag.
   if (!tag || tag[0] !== release.tag_name) return null;
 
-  const filename = `Chippytea-${tag[1]}-universal.dmg`;
+  const filename = `chippytea-${tag[1]}-universal.dmg`;
   const assets = release.assets.filter((asset) => asset.name === filename);
   if (assets.length !== 1) return null;
 
@@ -89,7 +89,7 @@ const UNAVAILABLE_PAGE = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Download temporarily unavailable: Chippytea</title>
+  <title>Download temporarily unavailable: chippytea</title>
   <style>
     body { margin: 0; padding: 3rem 1.5rem; background: #fffdf6; color: #33302b; font: 1rem/1.6 system-ui, sans-serif; }
     main { max-width: 36rem; margin: 8vh auto; }
@@ -103,7 +103,7 @@ const UNAVAILABLE_PAGE = `<!doctype html>
     <h1>The Mac download is temporarily unavailable.</h1>
     <p>We couldn’t confirm a published Mac installer. Please try again in a few minutes.</p>
     <p><a href="/download">Try again</a> · <a href="${RELEASES_URL}">View releases</a> · <a href="${REPOSITORY_URL}#build-and-run">Build from source</a></p>
-    <p><a href="/">Back to Chippytea</a></p>
+    <p><a href="/">Back to chippytea</a></p>
   </main>
 </body>
 </html>`;

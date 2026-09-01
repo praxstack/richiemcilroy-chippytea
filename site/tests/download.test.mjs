@@ -14,7 +14,7 @@ function responseFromFetch(fetchLatestRelease) {
 }
 
 function release(version = "0.1.0") {
-  const name = `Chippytea-${version}-universal.dmg`;
+  const name = `chippytea-${version}-universal.dmg`;
   return {
     tag_name: `v${version}`,
     draft: false,
@@ -27,7 +27,7 @@ function release(version = "0.1.0") {
         browser_download_url: `${REPOSITORY}/releases/download/v${version}/${name}`,
       },
       { name: "appcast.xml" },
-      { name: `Chippytea-${version}-universal.zip` },
+      { name: `chippytea-${version}-universal.zip` },
       { name: "release-notes.md" },
       { name: "release.json" },
       { name: "SHA256SUMS" },
@@ -69,9 +69,9 @@ test("requires a stable published release shape and well-formed asset entries", 
 
 test("requires exactly one uploaded, nonempty DMG for the release version", () => {
   for (const patch of [
-    { name: "Chippytea-0.1.1-universal.dmg" },
-    { name: "Chippytea-0.1.0-arm64.dmg" },
-    { name: "Chippytea-0.1.0-universal.zip" },
+    { name: "chippytea-0.1.1-universal.dmg" },
+    { name: "chippytea-0.1.0-arm64.dmg" },
+    { name: "chippytea-0.1.0-universal.zip" },
     { state: "starter" }, { state: undefined },
     { size: 0 }, { size: -1 }, { size: 1.5 }, { size: "25000000" },
     { size: NaN }, { size: Infinity }, { size: Number.MAX_SAFE_INTEGER + 1 },
@@ -97,7 +97,7 @@ test("rejects redirects outside the exact immutable GitHub release asset URL", (
     expected.replace("chippytea/", "other-repo/"),
     expected.replace("download/v0.1.0/", "download/v0.1.1/"),
     expected.replace("download/v0.1.0/", "latest/download/"),
-    expected.replace("Chippytea-", "%43hippytea-"),
+    expected.replace("chippytea-", "%63hippytea-"),
     `${expected}?download=1`, `${expected}#fragment`, `${expected}\n`,
     "javascript:alert(1)", "//evil.example/installer.dmg",
   ]) {

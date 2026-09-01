@@ -10,7 +10,7 @@ const lookupRelease = createReleaseLookup(() =>
   fetch(LATEST_RELEASE_API, {
     headers: {
       Accept: "application/vnd.github+json",
-      "User-Agent": "Chippytea-download",
+      "User-Agent": "chippytea-download",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     cache: "no-store",
