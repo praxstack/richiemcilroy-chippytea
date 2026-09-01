@@ -151,11 +151,11 @@ rm -f -- "$certificate" "$asc_key"
 sparkle_bin="$(python3 -B scripts/release/release.py tools --destination "$work/tools")"
 archives="$work/appcast"
 python3 -B scripts/release/release.py prepare --plan "$CHIPPYTEA_RELEASE_PLAN" --archives "$archives"
-previous_args=()
+appcast_validation_args=(validate-appcast)
 if [[ -f "$archives/appcast.xml" ]]; then
     "$sparkle_bin/sign_update" --verify --ed-key-file "$ed_key" "$archives/appcast.xml"
     cp "$archives/appcast.xml" "$work/previous-appcast.xml"
-    previous_args=(--previous "$work/previous-appcast.xml")
+    appcast_validation_args+=(--previous "$work/previous-appcast.xml")
 fi
 
 app="$work/app/chippytea.app"
@@ -286,9 +286,8 @@ cp "$archives/chippytea-$version-universal.md" "$output/release-notes.md"
     --download-url-prefix "https://github.com/richiemcilroy/chippytea/releases/download/v$version/" \
     --full-release-notes-url "https://github.com/richiemcilroy/chippytea/releases/tag/v$version" \
     --link "https://github.com/richiemcilroy/chippytea" "$archives"
-signature="$(python3 -B scripts/release/release.py validate-appcast \
-    --feed "$archives/appcast.xml" --archive "$zip" --version "$version" \
-    "${previous_args[@]}")"
+signature="$(python3 -B scripts/release/release.py "${appcast_validation_args[@]}" \
+    --feed "$archives/appcast.xml" --archive "$zip" --version "$version")"
 "$sparkle_bin/sign_update" --verify --ed-key-file "$ed_key" "$zip" "$signature"
 "$sparkle_bin/sign_update" --verify --ed-key-file "$ed_key" "$archives/appcast.xml"
 cp "$archives/appcast.xml" "$output/appcast.xml"
