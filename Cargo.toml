@@ -1,0 +1,49 @@
+[package]
+name = "chippytea-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Local, conservative storage discovery and cleanup for Chippytea"
+repository = "https://github.com/richiemcilroy/chippytea"
+readme = "README.md"
+publish = false
+
+[lib]
+path = "core/src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "chippytea-cli"
+path = "core/src/bin/chippytea-cli.rs"
+
+[[test]]
+name = "safety"
+path = "core/tests/safety.rs"
+
+[[test]]
+name = "discovery"
+path = "core/tests/discovery.rs"
+
+[[test]]
+name = "hardlinks"
+path = "core/tests/hardlinks.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+rusqlite = "0.37.0"
+libc = "0.2.186"
+blake3 = "1.8.2"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
