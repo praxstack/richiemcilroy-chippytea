@@ -118,12 +118,125 @@
   transition: visibility 0s;
 }
 
+/* The song slip: its three chips dance while hovered, still otherwise. */
+@keyframes eq-bounce {
+  from { transform: scaleY(0.55); }
+  to { transform: scaleY(1.12); }
+}
+
+.song-slip:hover .eq-chip {
+  animation: eq-bounce 0.42s ease-in-out infinite alternate;
+}
+
+/* The karaoke: fades up over the page, fades away on close. */
+@keyframes karaoke-in {
+  from {
+    opacity: 0;
+    transform: scale(1.015);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes karaoke-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.99);
+  }
+}
+
+.karaoke-root {
+  animation: karaoke-in 0.45s ease-out both;
+}
+
+.karaoke-root.leaving {
+  animation: karaoke-out 0.5s ease-in both;
+  pointer-events: none;
+}
+
+/* A soft paper wash behind the words so the fish never swim over them. */
+.karaoke-halo {
+  background: radial-gradient(ellipse 60% 70% at 50% 50%, rgba(250, 245, 234, 0.96) 35%, rgba(250, 245, 234, 0) 78%);
+}
+
+/* One sung word: ink underneath, gold with an ink outline wiped across it. */
+.kw {
+  position: relative;
+  display: inline-block;
+  margin: 0 0.14em;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: transform 0.16s ease-out;
+  will-change: transform;
+}
+
+.kw-gold {
+  position: absolute;
+  inset: 0;
+  color: var(--color-gold);
+  -webkit-text-stroke: 0.045em var(--color-ink);
+  paint-order: stroke fill;
+  pointer-events: none;
+  clip-path: inset(-0.2em 100% -0.25em -0.1em);
+}
+
+.kw[data-state="active"] {
+  transform: translateY(-0.08em) scale(1.07) rotate(-1.5deg);
+}
+
+@keyframes kw-boil {
+  0% { transform: translate(0, 0) rotate(0deg); }
+  33% { transform: translate(0.01em, -0.012em) rotate(0.5deg); }
+  66% { transform: translate(-0.012em, 0.008em) rotate(-0.4deg); }
+  100% { transform: translate(0, 0) rotate(0deg); }
+}
+
+.kw[data-state="active"] .kw-gold {
+  animation: kw-boil 0.5s steps(3) infinite;
+}
+
+.kw-ball {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  opacity: 0;
+  will-change: transform;
+  filter: drop-shadow(0 1px 0 rgba(51, 48, 43, 0.25));
+}
+
 @media (prefers-reduced-motion: reduce) {
   .bp0,
   .bp1,
   .bp2,
-  .reveal {
+  .reveal,
+  .eq-chip,
+  .kw,
+  .kw-gold {
     animation: none !important;
     transition: none !important;
+  }
+
+  .kw[data-state="active"] {
+    transform: none;
+  }
+
+  .karaoke-root {
+    animation-duration: 0.2s;
+  }
+
+  .karaoke-root.leaving {
+    animation-duration: 0.25s;
   }
 }
