@@ -91,6 +91,8 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Test download routing
         run: node --test tests/download.test.mjs
+      - name: Test karaoke particle lifecycle
+        run: bun test tests/karaoke-scene.test.mjs
       - name: Check generated README artwork
         working-directory: .
         run: bun scripts/generate-readme-art.ts --check
