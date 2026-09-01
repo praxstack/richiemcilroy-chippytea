@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a new, disposable Chippytea benchmark fixture; never remove files."""
+"""Create a new, disposable chippytea benchmark fixture; never remove files."""
 
 from __future__ import annotations
 

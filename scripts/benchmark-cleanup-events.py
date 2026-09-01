@@ -3,7 +3,7 @@
 
 One identical Rust child is used for both frozen NativeServices.swift variants.
 The Swift observer retains callback arrays until child exit plus a quiet tail;
-it does not launch Chippytea or run AppModel/the full engine request queue.
+it does not launch chippytea or run AppModel/the full engine request queue.
 """
 from __future__ import annotations
 

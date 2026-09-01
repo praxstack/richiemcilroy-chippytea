@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("A regular fixture marker is required")
     marker = json.loads(marker_path.read_text())
     if marker.get("magic") != benchmark.MAGIC or marker.get("status") != "complete" or marker.get("baseline_relative_path") != "baseline":
-        parser.error("A complete, marked Chippytea fixture is required")
+        parser.error("A complete, marked chippytea fixture is required")
     root = fixture / "baseline"
     if root.is_symlink() or not root.is_dir():
         parser.error("The marked baseline must be a real directory")

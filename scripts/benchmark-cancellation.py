@@ -160,10 +160,10 @@ def main(argv: list[str] | None = None) -> int:
     fixture = requested.resolve(strict=True)
     marker_path = fixture / MARKER
     if marker_path.is_symlink() or not marker_path.is_file() or marker_path.stat().st_size > 1024**2:
-        parser.error("A regular Chippytea fixture marker is required")
+        parser.error("A regular chippytea fixture marker is required")
     marker = json.loads(marker_path.read_text())
     if not isinstance(marker, dict) or marker.get("magic") != MAGIC or marker.get("status") != "complete" or marker.get("baseline_relative_path") != "baseline":
-        parser.error("A complete marked Chippytea disposable fixture is required")
+        parser.error("A complete marked chippytea disposable fixture is required")
     baseline = fixture / "baseline"
     if baseline.is_symlink() or not baseline.is_dir():
         parser.error("Fixture baseline must be a physical directory")

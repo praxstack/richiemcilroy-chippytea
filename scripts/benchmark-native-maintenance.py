@@ -252,7 +252,7 @@ def main() -> int:
     if benchmark.REPO / "benchmarks/local" not in output.parents:
         parser.error("Use a new output directory under benchmarks/local")
     output.mkdir(parents=True, exist_ok=False)
-    binary = args.app.resolve(strict=True) / "Contents/MacOS/Chippytea"
+    binary = args.app.resolve(strict=True) / "Contents/MacOS/chippytea"
     archive = args.core_archive.resolve(strict=True)
     hashes = {"app": digest(binary), "core_archive": digest(archive), "runner": digest(Path(__file__)),
               "shared_helpers": digest(Path(energy.__file__))}

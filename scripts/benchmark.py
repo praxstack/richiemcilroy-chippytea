@@ -293,7 +293,7 @@ def markdown_report(report: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("fixture", type=Path, help="Fixture directory containing the Chippytea marker")
+    parser.add_argument("fixture", type=Path, help="Fixture directory containing the chippytea marker")
     parser.add_argument("--cli", type=Path, default=REPO / "target/release/chippytea-cli")
     parser.add_argument("--warm-runs", type=int, default=5, help="Warm invocations after one first run (default: 5)")
     parser.add_argument("--threads", type=int, default=4, help="dua/dust worker count")
@@ -311,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     fixture = args.fixture.expanduser().resolve(strict=True)
     marker = json.loads((fixture / MARKER).read_text())
     if marker.get("magic") != MAGIC or marker.get("status") != "complete" or marker.get("baseline_relative_path") != "baseline":
-        parser.error("A complete, marked Chippytea fixture is required")
+        parser.error("A complete, marked chippytea fixture is required")
     baseline = fixture / "baseline"
     if baseline.is_symlink() or not baseline.is_dir():
         parser.error("Baseline must be a real directory")

@@ -95,7 +95,7 @@ def ledger(database: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixture", type=Path)
-    parser.add_argument("--app", type=Path, default=benchmark.REPO / "build/Chippytea.app")
+    parser.add_argument("--app", type=Path, default=benchmark.REPO / "build/chippytea.app")
     parser.add_argument("--output", type=Path, required=True, help="New directory under benchmarks/local, outside the fixture")
     parser.add_argument("--expected-eligible", action="append", help="Exact positive path relative to baseline; repeat for each expected suggestion")
     parser.add_argument("--expect-no-findings", action="store_true", help="Declare a negative control; no first-finding claim will be made")
@@ -120,7 +120,7 @@ def main() -> int:
         parser.error("Output must be a fresh benchmarks/local directory outside the fixture")
     output.mkdir(parents=True, exist_ok=False)
     app = args.app.resolve(strict=True)
-    binary = app / "Contents/MacOS/Chippytea"
+    binary = app / "Contents/MacOS/chippytea"
     binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
     state = fixture / "state"
     state_marker = fixture / ".chippytea-energy-state.json"

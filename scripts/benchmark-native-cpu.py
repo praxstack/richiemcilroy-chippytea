@@ -99,7 +99,7 @@ def library_state(database: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixture", type=Path, help="Complete disposable fixture; its sibling state must belong to this harness")
-    parser.add_argument("--app", type=Path, default=benchmark.REPO / "build/Chippytea.app")
+    parser.add_argument("--app", type=Path, default=benchmark.REPO / "build/chippytea.app")
     parser.add_argument("--page", choices=("coins", "discover", "settings"), default="coins")
     parser.add_argument("--coins", type=int, default=118, help="Synthetic collected balance in the disposable database only")
     parser.add_argument("--seconds", type=float, default=20)
@@ -118,7 +118,7 @@ def main() -> int:
     root = fixture / "baseline"
     if (marker.get("magic") != benchmark.MAGIC or marker.get("status") != "complete"
             or marker.get("baseline_relative_path") != "baseline" or root.is_symlink()):
-        parser.error("Use a complete marked Chippytea fixture")
+        parser.error("Use a complete marked chippytea fixture")
     state = fixture / "state"
     state_marker = fixture / ".chippytea-energy-state.json"
     expected_state_marker = {"magic": "chippytea-synthetic-energy-state-v1", "coins": args.coins}
@@ -135,7 +135,7 @@ def main() -> int:
         parser.error("Output must be a new benchmarks/local directory outside the fixture")
     output.mkdir(parents=True, exist_ok=False)
     app = args.app.resolve(strict=True)
-    binary = app / "Contents/MacOS/Chippytea"
+    binary = app / "Contents/MacOS/chippytea"
     binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
     audit_before = benchmark.verify_fixture(root, marker["baseline"])
     if not audit_before["matches_marker"]:
