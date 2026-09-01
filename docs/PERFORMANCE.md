@@ -4,6 +4,89 @@ Reproducible performance comparisons below use generated, disposable fixtures. P
 
 Measured 31 August and 1 September 2026 on an Apple M4 Max MacBook Pro (`Mac16,6`), 16 CPU cores, 128 GiB memory, arm64, macOS 27.0 build `26A5421a`, local APFS. The workstation was also in normal use; these are reproducible local measurements, not a hardware-wide promise.
 
+## Shared ancestor-manifest workspaces
+
+The manifest follow-up avoids fully parsing the same ancestor `package.json` for every workspace member. It retains only the original ordered workspace-pattern strings, keyed by the digest of the exact, currently identity-validated bytes. Each hit evaluates those patterns again for the current relative path; it does not cache a membership answer or deletion permission. Local manifest parsing and Bun's current-name check are unchanged.
+
+This separate scan-local cache holds at most eight entries and **1 MiB of actual retained heap capacity**, including unused entry slots, pattern slots and string capacity. Inputs below 8 KiB take the original parsing branch directly. Successful negative membership can be cached; errors, cancelled operations and oversized valid lists are not retained. An oversized list does not evict useful entries. The cap excludes input bytes, temporary JSON trees, the other evidence caches and total process memory.
+
+The original full-JSON parsing, workspace extraction and ordered matching remain the authority. Invalid later data is not skipped after a match. Current file identities, configuration, repository evidence, evidence hashes and shared-store restrictions remain outside this cache, and cleanup still revalidates without it.
+
+### Measured scope and controls
+
+The comparison starts from the **accepted pnpm checkpoint below**, not the original scanner. Both release CLIs use Rust 1.97.1. Three generated pnpm workspaces each have 512 members, a 4 MiB lockfile, one independently written eligible 100 MiB artifact and 1,542 entries. Their ancestor manifests contain 102 bytes, 10 KiB or 64 KiB; the larger two have 215 and 1,391 synthetic dependency records respectively. These records exercise parsing, not package-manager installation correctness.
+
+Eight fixtures cover the target and unrelated workloads. Every fixture has a separate first pair; the 10 KiB, small-npm and npm512 cases have twelve alternating warm pairs, and the other cases have five: **138 invocations** in this series. All completed without errors. Before/after physical audits matched, every final Candidate field and non-timing terminal statistic matched, and each fixture retained its one expected eligible artifact.
+
+| Workload | Warm elapsed median, before → after | Warm CPU median, before → after | Maximum lifetime CLI RSS, before → after |
+| --- | ---: | ---: | ---: |
+| Shared 10 KiB manifest, 512 members | 98.357 → 88.349 ms | 90 → 80 ms | 11.922 → 11.875 MiB |
+| Shared 64 KiB manifest, 512 members | 185.173 → 89.266 ms | 170 → 80 ms | 12.234 → 12.172 MiB |
+| Shared 102-byte manifest, 512 members | 86.516 → 91.092 ms | 80 → 80 ms | 11.844 → 11.906 MiB |
+| 1,001 separate small npm projects | 150.193 → 161.421 ms | 130 → 140 ms | 3.844 → 3.812 MiB |
+| Bun: 512 members, 4 MiB lock | 93.521 → 97.503 ms | 80 → 80 ms | 12.328 → 12.250 MiB |
+| npm: 512 members, 4 MiB lock | 90.311 → 92.984 ms | 80 → 80 ms | 17.656 → 17.656 MiB |
+| Million ordinary source files | 322.455 → 325.622 ms | 310 → 320 ms | 3.234 → 3.188 MiB |
+| Directory-heavy source tree | 936.774 → 929.671 ms | 920 → 910 ms | 3.250 → 3.203 MiB |
+
+The 64 KiB case was **2.07× faster with 52.9% less median CPU**; the 10 KiB case had 10.2% lower median elapsed time. Peak RSS was essentially unchanged: the target differences were only 48 and 64 KiB. This is a repeated-parsing improvement, not an established memory reduction.
+
+Controls do not establish regression-free performance. The small-npm median was **7.5% slower**, with eight of twelve warm pairs slower and a 10 ms increase in reported median CPU. The small shared-manifest, Bun, npm and ordinary-file medians were also slower. The directory median was slightly lower, but its first candidate invocation and p95 were slower. All results are retained; the targeted gain must not be advertised as a universal scan speedup.
+
+| Workload | First elapsed pair, before → after | Warm elapsed p95, before → after |
+| --- | ---: | ---: |
+| Shared 10 KiB manifest | 160.320 → 97.371 ms | 107.274 → 95.895 ms |
+| Shared 64 KiB manifest | 244.942 → 95.835 ms | 189.530 → 90.439 ms |
+| Shared 102-byte manifest | 140.786 → 97.673 ms | 94.456 → 97.345 ms |
+| 1,001 separate small npm projects | 386.428 → 149.187 ms | 166.987 → 167.352 ms |
+| Bun512 | 150.560 → 91.379 ms | 99.692 → 103.313 ms |
+| npm512 | 151.551 → 90.189 ms | 98.493 → 98.349 ms |
+| Million ordinary source files | 334.779 → 334.563 ms | 346.604 → 337.406 ms |
+| Directory-heavy source tree | 910.327 → 952.408 ms | 957.963 → 960.489 ms |
+
+For the 64 KiB case, observed first-eligible p95 was 77.579 → 41.552 ms at CLI stdout, not native rendering. Five- and twelve-sample nearest-rank p95 is the observed maximum, not a reliable population-tail estimate. Each invocation starts a fresh process and empty scan-local caches, so even warm runs include the first parse. Fixture creation and physical audits warm filesystem caches; neither first nor warm pairs establish cold-disk performance. CPU is whole-process user plus system time at Darwin `/usr/bin/time -l` resolution. RSS is the maximum lifetime high-water mark across all invocations, not live heap or retained-cache size. The million-file control is names-first discovery, not exhaustive metadata inventory.
+
+The entire preceding fast-gate timing series was excluded after its background records revealed concurrent Rust/Swift compilation. Its raw results remain intact, including adverse samples; timing aggregates had already been inspected before exclusion. This replacement repeats all eight cases, not selected favorable cases, with the identical source and binaries. Other build tasks were coordinated, and periodic process snapshots found no compiler overlap during the replacement CLI batch. Normal desktop activity remained; this was not an exclusive host. Earlier prototype and supplemental records remain separate, and are not pooled into these medians.
+
+### Safety and native checks
+
+The frozen candidate passed **353 Rust tests**, formatting and Clippy with warnings denied using Rust 1.98.0, followed by the matched optimized build. Added tests cover original parser/error precedence, duplicate keys, Unicode, trailing invalid data, depth limits, ordered and excluded workspace patterns, changed digests, actual retained capacities, eviction, oversized lists, threshold/disabled limits and cancellation. Existing integration coverage exercises fresh manifest/lock bytes, configuration, workspace exclusions and substituted symlinks after cache population. Local malformed-workspace and Bun-name behavior remain covered. Valid-fixture parity alone does not prove malformed-input safety.
+
+Both disposable native suites passed: cleanup/restore/restart and access/interaction. Two additional single warm native rescans used fresh synthetic libraries and the exact candidate Rust archive, verified all 1,542 entries and the expected artifact, and left the ledger unchanged:
+
+| Native manifest fixture | Observed scan wall time | Process CPU | Lifetime peak RSS |
+| --- | ---: | ---: | ---: |
+| 10 KiB | 227.981 ms | 159.123 ms | 112.609 MiB |
+| 64 KiB | 235.833 ms | 196.397 ms | 113.031 MiB |
+
+These single observations do not establish a native before/after gain, p95, rendering latency or idle CPU. The endpoint is main-actor snapshot delivery before final rendering. The isolated ad-hoc app uses the initial native source, not the separate updater/distribution build; it does not establish the minimum supported macOS version.
+
+All **40 cancellation samples** passed, requesting cancellation after 40 ms: `cancelled=true`, `complete=false`, zero scan errors and no timeout.
+
+| Fixture | Median wall-minus-delay upper bound | p95 upper bound | Maximum upper bound |
+| --- | ---: | ---: | ---: |
+| Shared 64 KiB manifest, 512 members | 13.184 ms | 14.084 ms | 14.180 ms |
+| Million ordinary source files | 12.834 ms | 13.937 ms | 14.017 ms |
+
+These bounds include process startup, timer scheduling and shutdown; they do not timestamp the Rust cancellation flag or a native button. Cancellation is cooperative at entry and after successful parsing/matching, before cache mutation. The full JSON parse and matching are not individually preemptible. Once evaluation starts, its original error chain wins over cancellation discovered afterwards; errors and cancelled outcomes are never cached.
+
+```sh
+python3 scripts/make-workspace-fixture.py /private/tmp/chippytea-manifest-512 \
+  --lock-format pnpm --members 512 --lock-kib 4096 --manifest-kib 64 --age-days 9
+python3 scripts/benchmark-suggestions.py /private/tmp/chippytea-manifest-512 \
+  --baseline-cli /path/to/before/chippytea-cli \
+  --candidate-cli target/release/chippytea-cli --warm-runs 5 \
+  --output benchmarks/local/manifest-512-comparison
+```
+
+Both output paths must be new. Use `--manifest-kib 10` and twelve warm pairs for the smaller target. The default `--manifest-kib 0` preserves the original 102-byte manifest; positive sizes range from 1 to 256 KiB and contain synthetic dependency records plus minimal padding. The fixture marker includes exact bytes, digest and record count. Member manifests and lock construction are unchanged; generated manifest dependencies are not mirrored into the locks, so this is not an installable workspace fixture.
+
+- Baseline CLI SHA-256: `d0ad99489155de36084883dc49adc940f2acbec70a15dbbabe4cb18ecc3db2f7`.
+- Candidate CLI SHA-256: `ad9f1c7f67c5299787047d860839a12834b6531900466c4f9f0d6183b87cae5e`.
+- Candidate scanner SHA-256: `46d9797cf402e64d659d963432406ac1ebc79e11ce35c691b834f558b5ab6e62`.
+- Private evidence: `benchmarks/local/scan-performance-20260901/manifest-fast-gate-*`, `native-manifest-fast-gate*` and `manifest-facts-*`. Accepted timing records use the `coordinated` suffix; the explicit contention note identifies the excluded series. Raw paths and source/build manifests remain ignored, not published.
+
+
 ## Shared pnpm importer facts
 
 The pnpm follow-up avoids walking the same shared lockfile for every workspace member. A scan-local cache retains only sorted importer keys, keyed by the digest of the exact, currently identity-validated bytes. It holds at most eight entries and 1 MiB of actual retained capacity, including the entry slots. Inputs below 32 KiB bypass retention. Temporary borrowed-key collection has a separate 1 MiB bound; these caps are not a total process-memory limit. Oversized valid evidence remains usable without retention or eviction of existing entries.
