@@ -6,6 +6,11 @@ import SQLite3
 enum NativeSelfTest {
     @MainActor static func runAccessFlow() async {
         do {
+            if CommandLine.arguments.contains("--state-directory-regression") {
+                try stateDirectoryMigration()
+                print("PASS native state-directory migration and interrupted recovery")
+                exit(0)
+            }
             if CommandLine.arguments.contains("--forget-summary-regression") {
                 try await forgottenRootInvalidatesScanPresentation()
                 print("PASS native forgotten-root presentation regression")
@@ -29,6 +34,7 @@ enum NativeSelfTest {
                 print("PASS native cleanup queue: bounded FIFO, cancellation, frozen reviews and confirmed rewards")
                 exit(0)
             }
+            try stateDirectoryMigration()
             try await accessFlow()
             try await foregroundSummarySurvivesRestart()
             try await forgottenRootInvalidatesScanPresentation()
@@ -46,6 +52,74 @@ enum NativeSelfTest {
             exit(0)
         }
         catch { fputs("FAIL native access flow: \(error)\n", stderr); exit(1) }
+    }
+
+    @MainActor private static func stateDirectoryMigration() throws {
+        let fm = FileManager.default
+        guard let physical = realpath(fm.temporaryDirectory.path, nil) else {
+            throw EngineError.message("Cannot resolve disposable state-directory test location")
+        }
+        let temporary = URL(fileURLWithPath: String(cString: physical)); free(physical)
+        let base = temporary.appendingPathComponent("chippytea-state-directory-\(UUID().uuidString)")
+        try fm.createDirectory(at: base, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let legacy = base.appendingPathComponent("Chippytea", isDirectory: true)
+        try fm.createDirectory(at: legacy, withIntermediateDirectories: false)
+        let sentinel = Data("Preserve this disposable library through case-only migration".utf8)
+        try sentinel.write(to: legacy.appendingPathComponent("library.sentinel"))
+        let migrated = AppModel.stateDirectory(in: base)
+        try require(migrated.lastPathComponent == "chippytea", "The legacy library must migrate to the lowercase path")
+        // Directory enumeration checks the stored spelling independently of
+        // canonical-path values cached on URLs queried before the rename.
+        try require(try fm.contentsOfDirectory(atPath: base.path) == ["chippytea"],
+                    "Migration must change the stored spelling, not just the lookup spelling")
+        try require(try Data(contentsOf: migrated.appendingPathComponent("library.sentinel")) == sentinel,
+                    "Migration must preserve the library contents")
+        try require(AppModel.stateDirectory(in: base) == migrated, "A second launch must select the same library")
+
+        // Inject only filesystem names and atomic moves: case-sensitive names
+        // and failure points must be exercised even on case-insensitive APFS.
+        func scenario(_ label: String, sensitive: Bool, initial: [String: String], failMove: Int? = nil,
+                      selections: [String], final: [String: String], moves expectedMoves: Int) throws {
+            var libraries = initial
+            var moves = 0
+            func storedName(_ url: URL) -> String? {
+                let requested = url.lastPathComponent
+                return libraries.keys.first {
+                    sensitive ? $0 == requested : $0.caseInsensitiveCompare(requested) == .orderedSame
+                }
+            }
+            for expected in selections {
+                let selected = AppModel.stateDirectory(in: base, storedName: storedName, moveItem: { source, destination in
+                    moves += 1
+                    if moves == failMove { throw EngineError.message("Injected migration move failure") }
+                    guard let name = storedName(source), storedName(destination) == nil else {
+                        throw EngineError.message("Injected filesystem refuses a missing source or occupied destination")
+                    }
+                    libraries[destination.lastPathComponent] = libraries.removeValue(forKey: name)
+                })
+                try require(selected.lastPathComponent == expected, "\(label): selected the wrong library across launches")
+            }
+            try require(libraries == final && moves == expectedMoves, "\(label): library identity, contents or move sequence changed")
+        }
+        try scenario("Fresh state", sensitive: true, initial: [:],
+                     selections: ["chippytea", "chippytea"], final: [:], moves: 0)
+        let coexist = ["chippytea": "current", "Chippytea": "legacy"]
+        try scenario("Distinct current wins", sensitive: true, initial: coexist,
+                     selections: ["chippytea", "chippytea"], final: coexist, moves: 0)
+        for sensitive in [false, true] {
+            try scenario("Case-only migration", sensitive: sensitive, initial: ["Chippytea": "legacy"],
+                         selections: ["chippytea", "chippytea"], final: ["chippytea": "legacy"], moves: 2)
+            let conflict = ["Chippytea": "legacy", "chippytea.renaming": "other"]
+            try scenario("Occupied staging", sensitive: sensitive, initial: conflict,
+                         selections: ["Chippytea", "Chippytea"], final: conflict, moves: 0)
+            try scenario("Failed first move", sensitive: sensitive, initial: ["Chippytea": "legacy"], failMove: 1,
+                         selections: ["Chippytea", "chippytea"], final: ["chippytea": "legacy"], moves: 3)
+            try scenario("Failed final move", sensitive: sensitive, initial: ["Chippytea": "legacy"], failMove: 2,
+                         selections: ["chippytea.renaming", "chippytea"], final: ["chippytea": "legacy"], moves: 3)
+            try scenario("Failed interrupted recovery", sensitive: sensitive, initial: ["chippytea.renaming": "legacy"], failMove: 1,
+                         selections: ["chippytea.renaming", "chippytea"], final: ["chippytea": "legacy"], moves: 2)
+        }
+        print("Disposable state-directory evidence: \(base.path)")
     }
 
     @MainActor private static func accessFlow() async throws {

@@ -350,11 +350,53 @@ struct DiscoveryPresentation: Equatable {
     init(directory: URL? = nil, scanHome: URL? = nil,
          readSnapshot: @escaping (EngineClient) async throws -> EngineSnapshot = { try await $0.snapshot() }) {
         let testDirectory = ProcessInfo.processInfo.environment["CHIPPYTEA_DATA_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
-        self.directory = directory ?? testDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Chippytea", isDirectory: true)
+        self.directory = directory ?? testDirectory
+            ?? Self.stateDirectory(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
         self.scanHome = scanHome ?? FileManager.default.homeDirectoryForCurrentUser
         self.readSnapshot = readSnapshot
         backgroundActivityObservation = snapshotSubject.map(\.scanning).removeDuplicates()
             .sink { [weak self] scanning in self?.scanningActivityChanged(scanning) }
+    }
+
+    /// The state folder is spelt `chippytea` on disk. Earlier builds wrote
+    /// `Chippytea`. A case-insensitive volume opens either spelling, but the
+    /// watcher excludes the folder by comparing the stored spelling with event
+    /// paths, so an old folder is renamed once rather than reached through a
+    /// lookup that differs from the events it produces. Any failure keeps the
+    /// spelling that still holds the library.
+    nonisolated static func stateDirectory(
+        in support: URL,
+        storedName: (URL) -> String? = { url in
+            (try? url.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath)
+                .map { URL(fileURLWithPath: $0).lastPathComponent }
+        },
+        moveItem: (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) }
+    ) -> URL {
+        let current = support.appendingPathComponent("chippytea", isDirectory: true)
+        let legacy = support.appendingPathComponent("Chippytea", isDirectory: true)
+        let staging = support.appendingPathComponent("chippytea.renaming", isDirectory: true)
+        // A distinct current library wins on case-sensitive volumes. On a
+        // case-insensitive volume the old folder still reports "Chippytea".
+        if let name = storedName(current), name != legacy.lastPathComponent {
+            return current
+        }
+        if storedName(legacy) == legacy.lastPathComponent {
+            // Do not substitute a different, pre-existing staging library if
+            // the first move fails. Keep using the legacy library in that case.
+            guard storedName(staging) == nil else { return legacy }
+            do { try moveItem(legacy, staging) }
+            catch { return legacy }
+        } else if storedName(staging) == nil {
+            return current
+        }
+        // Finish either the new rename or one interrupted between its steps.
+        // A failed recovery must not select an absent, empty current library.
+        do {
+            try moveItem(staging, current)
+            return current
+        } catch {
+            return staging
+        }
     }
 
     /// Debounce the raw scanning flag into a calm presentation signal: appear
