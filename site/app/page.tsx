@@ -4,8 +4,9 @@ import { ShopSign, Underlined, Dash, Rule } from "@/components/art";
 import { InkBox } from "@/components/InkBox";
 import { DemoPanel } from "@/components/DemoPanel";
 import { Karaoke } from "@/components/Karaoke";
+import { site } from "@/lib/site";
 
-const GITHUB = "https://github.com/richiemcilroy/chippytea";
+const GITHUB = site.github;
 const BUILD = `${GITHUB}#build-and-run`;
 const hasSoundtrack = existsSync(join(process.cwd(), "public/save-your-mac-with-chippytea.mp3"));
 
