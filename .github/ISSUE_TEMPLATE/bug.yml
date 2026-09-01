@@ -1,5 +1,5 @@
 name: Bug report
-description: Something in Chippytea did not work as expected.
+description: Something in chippytea did not work as expected.
 body:
   - type: markdown
     attributes:

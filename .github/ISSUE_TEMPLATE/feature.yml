@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest a useful change to Chippytea.
+description: Suggest a useful change to chippytea.
 body:
   - type: markdown
     attributes:
