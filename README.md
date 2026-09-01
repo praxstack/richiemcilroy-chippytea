@@ -46,7 +46,7 @@ This is early software that can permanently delete files. Start with a disposabl
 <details>
 <summary>About the chip counter</summary>
 
-The fish and chips are a decorative counter for credited cleanup. Eligible permanent cleanup adds one chip per **100 MB of conservatively credited space**. Smaller amounts carry forward, and a thousand chips is shown as a fish.
+The chips are a decorative counter for space saved. Eligible permanent cleanup adds one chip per **100 MB of conservatively credited space**. Smaller amounts carry forward.
 
 Chips stay on your Mac and have no monetary value. Moving files to Trash adds no chips; estimated sizes never update the counter.
 
