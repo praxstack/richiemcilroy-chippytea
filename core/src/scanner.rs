@@ -179,6 +179,7 @@ pub(crate) struct EvidenceCaches {
     locks: NpmLockCache,
     bun_locks: BunLockCache,
     pnpm_locks: PnpmLockCache,
+    manifest_workspaces: ManifestWorkspaceCache,
     contents: ContentCache,
 }
 
@@ -342,6 +343,129 @@ fn manifest_workspaces(manifest: &Value) -> Result<Vec<String>> {
                 .ok_or_else(|| "Workspace membership is not a list of paths".into())
         })
         .collect()
+}
+
+const MAX_MANIFEST_CACHE_ENTRIES: usize = 8;
+const MAX_MANIFEST_CACHE_BYTES: usize = 1024 * 1024;
+const MIN_MANIFEST_CACHE_BYTES: usize = 8 * 1024;
+
+struct CachedManifestWorkspaces {
+    digest: blake3::Hash,
+    patterns: Vec<String>,
+}
+
+impl CachedManifestWorkspaces {
+    fn heap_bytes(&self) -> Option<usize> {
+        self.patterns.iter().try_fold(
+            self.patterns.capacity().checked_mul(size_of::<String>())?,
+            |bytes, pattern| bytes.checked_add(pattern.capacity()),
+        )
+    }
+}
+
+/// Scan-local ancestor workspace lists, never local manifest names, identities,
+/// membership answers or cleanup permission. Charge all retained capacities,
+/// including unused entry and pattern slots. Input and Value allocations are
+/// transient and remain subject to the existing bounded evidence reader.
+struct ManifestWorkspaceCache {
+    entries: Vec<CachedManifestWorkspaces>,
+    entry_limit: usize,
+    byte_limit: usize,
+    retained_bytes: usize,
+}
+
+impl Default for ManifestWorkspaceCache {
+    fn default() -> Self {
+        Self::with_limits(MAX_MANIFEST_CACHE_ENTRIES, MAX_MANIFEST_CACHE_BYTES)
+    }
+}
+
+impl ManifestWorkspaceCache {
+    fn with_limits(entry_limit: usize, byte_limit: usize) -> Self {
+        let byte_limit = byte_limit.min(MAX_MANIFEST_CACHE_BYTES);
+        let mut entry_limit = entry_limit
+            .min(MAX_MANIFEST_CACHE_ENTRIES)
+            .min(byte_limit / size_of::<CachedManifestWorkspaces>());
+        let mut entries = Vec::with_capacity(entry_limit);
+        let mut retained_bytes = entries.capacity() * size_of::<CachedManifestWorkspaces>();
+        if retained_bytes > byte_limit {
+            entries = Vec::new();
+            entry_limit = 0;
+            retained_bytes = 0;
+        }
+        Self {
+            entries,
+            entry_limit,
+            byte_limit,
+            retained_bytes,
+        }
+    }
+
+    /// The digest describes these exact, currently identity-validated bytes.
+    /// Entry cancellation is an additional cooperative boundary, consistent
+    /// with the lock caches. Once parsing starts, preserve the original error
+    /// order through extraction and matching before polling cancellation again.
+    fn includes_captured(
+        &mut self,
+        digest: blake3::Hash,
+        bytes: &[u8],
+        relative: &str,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        safety::cancelled(cancel)?;
+        if self.entry_limit > 0
+            && bytes.len() >= MIN_MANIFEST_CACHE_BYTES
+            && let Some(index) = self.entries.iter().position(|entry| entry.digest == digest)
+        {
+            let included = workspace_includes(&self.entries[index].patterns, relative)?;
+            safety::cancelled(cancel)?;
+            self.entries[index..].rotate_left(1);
+            return Ok(included);
+        }
+        let parsed = (|| {
+            let manifest = node_manifest(bytes)?;
+            let patterns = manifest_workspaces(&manifest)?;
+            let included = workspace_includes(&patterns, relative)?;
+            Ok((patterns, included))
+        })();
+        self.finish_miss(digest, bytes.len(), parsed, cancel)
+    }
+
+    fn finish_miss(
+        &mut self,
+        digest: blake3::Hash,
+        input_bytes: usize,
+        parsed: Result<(Vec<String>, bool)>,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        // Parse/extraction/matching errors win over cancellation discovered
+        // after that contiguous work. No error or cancelled result is retained.
+        let (patterns, included) = parsed?;
+        safety::cancelled(cancel)?;
+        if self.entry_limit == 0 || input_bytes < MIN_MANIFEST_CACHE_BYTES {
+            return Ok(included);
+        }
+        let entry = CachedManifestWorkspaces { digest, patterns };
+        let Some(heap_bytes) = entry.heap_bytes() else {
+            return Ok(included);
+        };
+        let container_bytes = self.entries.capacity() * size_of::<CachedManifestWorkspaces>();
+        if heap_bytes > self.byte_limit - container_bytes {
+            return Ok(included); // Oversized valid lists answer without eviction.
+        }
+        safety::cancelled(cancel)?;
+        while self.entries.len() == self.entry_limit
+            || heap_bytes > self.byte_limit - self.retained_bytes
+        {
+            let evicted = self.entries.remove(0);
+            self.retained_bytes -= evicted
+                .heap_bytes()
+                .expect("Previously admitted capacities");
+        }
+        self.retained_bytes += heap_bytes;
+        self.entries.push(entry);
+        Ok(included)
+    }
 }
 
 fn yaml_scalar(value: &str) -> Result<&str> {
@@ -717,9 +841,21 @@ fn node_evidence_cached(
         if directory != project && path_exists(&directory.join("package.json"))? {
             let file = directory.join("package.json");
             let source = read_source(&file, cancel, caches.as_deref_mut())?;
-            let ancestor = node_manifest(&source.bytes)?;
-            add_evidence(&mut hash, &file, &source, &mut latest_modified_ns);
-            node_member = workspace_includes(&manifest_workspaces(&ancestor)?, relative)?;
+            if source.bytes.len() >= MIN_MANIFEST_CACHE_BYTES
+                && let Some(caches) = caches.as_deref_mut()
+            {
+                node_member = caches.manifest_workspaces.includes_captured(
+                    source.digest,
+                    &source.bytes,
+                    relative,
+                    cancel,
+                )?;
+                add_evidence(&mut hash, &file, &source, &mut latest_modified_ns);
+            } else {
+                let ancestor = node_manifest(&source.bytes)?;
+                add_evidence(&mut hash, &file, &source, &mut latest_modified_ns);
+                node_member = workspace_includes(&manifest_workspaces(&ancestor)?, relative)?;
+            }
         }
         for name in [
             ".npmrc",
@@ -4510,6 +4646,417 @@ mod tests {
         }
     }
 
+    fn manifest_cacheable(source: &[u8]) -> Vec<u8> {
+        let mut bytes = source.to_vec();
+        bytes.resize(bytes.len().max(MIN_MANIFEST_CACHE_BYTES), b' ');
+        bytes
+    }
+
+    fn manifest_cache_document(patterns: &[&str]) -> Vec<u8> {
+        manifest_cacheable(
+            &serde_json::to_vec(&serde_json::json!({ "workspaces": patterns })).unwrap(),
+        )
+    }
+
+    // Reference the unchanged, uncached pipeline instead of another cache path.
+    fn uncached_manifest_patterns(bytes: &[u8], relative: &str) -> Result<(Vec<String>, bool)> {
+        let manifest = node_manifest(bytes)?;
+        let patterns = manifest_workspaces(&manifest)?;
+        let included = workspace_includes(&patterns, relative)?;
+        Ok((patterns, included))
+    }
+
+    fn assert_manifest_budget(cache: &ManifestWorkspaceCache) {
+        let pattern_bytes: usize = cache
+            .entries
+            .iter()
+            .map(|entry| {
+                entry.patterns.capacity() * size_of::<String>()
+                    + entry.patterns.iter().map(String::capacity).sum::<usize>()
+            })
+            .sum();
+        assert_eq!(
+            cache.retained_bytes,
+            cache.entries.capacity() * size_of::<CachedManifestWorkspaces>() + pattern_bytes
+        );
+        assert!(cache.entries.len() <= cache.entry_limit);
+        assert!(cache.entry_limit <= MAX_MANIFEST_CACHE_ENTRIES);
+        assert!(cache.retained_bytes <= cache.byte_limit);
+        assert!(cache.byte_limit <= MAX_MANIFEST_CACHE_BYTES);
+    }
+
+    fn assert_manifest_parity(source: &[u8], expected: Result<bool>) {
+        assert_eq!(
+            uncached_manifest_patterns(source, "apps/member").map(|(_, included)| included),
+            expected,
+            "unexpected uncached result: {source:?}"
+        );
+        let padded = manifest_cacheable(source);
+        let cancel = AtomicBool::new(false);
+        for mut cache in [
+            ManifestWorkspaceCache::default(),
+            ManifestWorkspaceCache::with_limits(0, 0),
+        ] {
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.includes_captured(blake3::hash(&padded), &padded, "apps/member", &cancel),
+                    expected,
+                );
+                assert_manifest_budget(&cache);
+            }
+            assert_eq!(
+                cache.entries.len(),
+                usize::from(expected.is_ok() && cache.entry_limit > 0)
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_workspace_cache_preserves_json_recognition_and_error_priority() {
+        let invalid = "package.json is not valid JSON";
+        let object = "package.json is not an object";
+        let project = "The package manifest does not identify a project";
+        let list = "Workspace membership is not a supported list";
+        let paths = "Workspace membership is not a list of paths";
+        let local = "Workspace paths are not supported local relative patterns";
+        let complex = "Complex workspace patterns need manual inspection";
+        let limit = "Workspace membership exceeds the bounded evidence limit";
+        let cases: &[(&[u8], std::result::Result<bool, &str>)] = &[
+            (b"{", Err(invalid)),
+            (b"[]", Err(object)),
+            (b"null", Err(object)),
+            (br#""name""#, Err(object)),
+            (b"{}", Err(project)),
+            (
+                br#"{"peerDependencies":{},"scripts":{},"private":true}"#,
+                Err(project),
+            ),
+            (br#"{"name":""}"#, Err(project)),
+            (br#"{"name":" \t\u2003"}"#, Err(project)),
+            (br#"{"name":"owner"}"#, Ok(false)),
+            (br#"{"dependencies":{}}"#, Ok(false)),
+            (br#"{"devDependencies":{}}"#, Ok(false)),
+            (br#"{"optionalDependencies":{}}"#, Ok(false)),
+            (br#"{"dependencies":[]}"#, Err(project)),
+            (br#"{"workspaces":[]}"#, Ok(false)),
+            (br#"{"workspaces":{}}"#, Err(list)),
+            (br#"{"name":"owner","workspaces":null}"#, Err(list)),
+            (br#"{"name":42,"workspaces":["apps/*"]}"#, Ok(true)),
+            (
+                br#"{"workspaces":{"packages":["apps/*"],"nohoist":7}}"#,
+                Ok(true),
+            ),
+            (
+                br#"{"workspaces":[false],"work\u0073paces":["apps/*"]}"#,
+                Ok(true),
+            ),
+            (
+                br#"{"workspaces":["apps/*"],"workspaces":["other/*"]}"#,
+                Ok(false),
+            ),
+            (
+                br#"{"workspaces":{"packages":[false],"pack\u0061ges":["apps/*"]}}"#,
+                Ok(true),
+            ),
+            (
+                br#"{"name":"owner","name":"","workspaces":null}"#,
+                Err(project),
+            ),
+            (br#"{"dependencies":{},"dependencies":null}"#, Err(project)),
+            (
+                br#"{"name":"owner","metadata":[},"metadata":0}"#,
+                Err(invalid),
+            ),
+            (br#"{"name":"owner","metadata":1e999}"#, Err(invalid)),
+            (br#"{"name":"owner","metadata":"\ud800"}"#, Err(invalid)),
+            (b"{\"name\":\"owner\",\"metadata\":\"\xff\"}", Err(invalid)),
+            (br#"{"name":"owner"} trailing"#, Err(invalid)),
+            (br#"{"workspaces":["bad?",7]}"#, Err(paths)),
+            (br#"{"workspaces":["apps/*","bad?"]}"#, Err(complex)),
+            (br#"{"workspaces":["!apps/*","bad?"]}"#, Err(complex)),
+            (br#"{"workspaces":["/bad","bad?"]}"#, Err(local)),
+            (br#"{"workspaces":["bad?","/bad"]}"#, Err(complex)),
+        ];
+        for (source, expected) in cases {
+            assert_manifest_parity(source, expected.map_err(str::to_owned));
+        }
+        let mut patterns = vec![serde_json::json!("apps/*"); 513];
+        patterns[0] = serde_json::json!("bad?");
+        let encoded = |patterns: &[Value]| {
+            serde_json::to_vec(&serde_json::json!({ "workspaces": patterns })).unwrap()
+        };
+        assert_manifest_parity(&encoded(&patterns), Err(limit.into()));
+        patterns[512] = serde_json::json!(false);
+        assert_manifest_parity(&encoded(&patterns), Err(paths.into()));
+        let deep = format!(
+            "{{\"name\":\"owner\",\"metadata\":{}0{}}}",
+            "[".repeat(256),
+            "]".repeat(256)
+        );
+        assert_manifest_parity(deep.as_bytes(), Err(invalid.into()));
+    }
+
+    #[test]
+    fn manifest_workspace_cache_rechecks_relative_paths_and_changed_digests() {
+        let source = manifest_cache_document(&[
+            ".",
+            "apps/*",
+            "!apps/private-*",
+            "src/**/plugin-*",
+            "packages/é*-工具",
+            "visible/.hidden/*",
+        ]);
+        let digest = blake3::hash(&source);
+        let cancel = AtomicBool::new(false);
+        let mut cache = ManifestWorkspaceCache::default();
+        for (relative, expected) in [
+            ("unrelated", false), // An Ok(false) miss still admits reusable facts.
+            ("apps/member", true),
+            ("apps/private-tool", false),
+            ("apps/.hidden", false),
+            ("apps/member/nested", false),
+            ("", true),
+            (".", false),
+            ("src/deep/plugin-example", true),
+            ("src/.hidden/plugin-example", false),
+            ("packages/éx-工具", true),
+            ("packages/e\u{301}x-工具", false),
+            ("visible/.hidden/member", true),
+        ] {
+            assert_eq!(
+                cache.includes_captured(digest, &source, relative, &cancel),
+                Ok(expected)
+            );
+            assert_eq!(
+                uncached_manifest_patterns(&source, relative).unwrap().1,
+                expected
+            );
+            assert_eq!(cache.entries.len(), 1);
+            assert_manifest_budget(&cache);
+        }
+        assert_eq!(
+            cache.entries[0].patterns,
+            manifest_workspaces(&node_manifest(&source).unwrap()).unwrap()
+        );
+        let changed = String::from_utf8(source.clone())
+            .unwrap()
+            .replace("apps/*", "else/*")
+            .into_bytes();
+        assert_eq!(source.len(), changed.len());
+        assert_eq!(
+            cache.includes_captured(blake3::hash(&changed), &changed, "apps/member", &cancel),
+            Ok(false)
+        );
+        assert_eq!(
+            cache.includes_captured(digest, &source, "apps/member", &cancel),
+            Ok(true)
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert_manifest_budget(&cache);
+    }
+
+    #[test]
+    fn manifest_workspace_cache_charges_capacities_and_evicts_lru_entries() {
+        let cancel = AtomicBool::new(false);
+        let [a, b, c] = ["a/*", "b/*", "c/*"].map(|pattern| manifest_cache_document(&[pattern]));
+        let mut cache = ManifestWorkspaceCache::with_limits(2, 4096);
+        for source in [&a, &b, &a, &c] {
+            assert_eq!(
+                cache.includes_captured(blake3::hash(source), source, "missing", &cancel),
+                Ok(false)
+            );
+            assert_manifest_budget(&cache);
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries[0].digest, blake3::hash(&a));
+        assert_eq!(cache.entries[1].digest, blake3::hash(&c));
+
+        let inflate = || {
+            let mut pattern = String::with_capacity(128);
+            pattern.push_str("apps/*");
+            let mut patterns = Vec::with_capacity(8);
+            patterns.push(pattern);
+            patterns
+        };
+        let patterns = inflate();
+        let heap_bytes = patterns.capacity() * size_of::<String>() + patterns[0].capacity();
+        let budget = size_of::<CachedManifestWorkspaces>() + heap_bytes;
+        let mut exact = ManifestWorkspaceCache::with_limits(1, budget);
+        assert_eq!(
+            exact.finish_miss(
+                blake3::hash(&a),
+                MIN_MANIFEST_CACHE_BYTES,
+                Ok((patterns, true)),
+                &cancel
+            ),
+            Ok(true)
+        );
+        assert_eq!(exact.retained_bytes, budget);
+        assert_manifest_budget(&exact);
+        let mut too_small = ManifestWorkspaceCache::with_limits(1, budget - 1);
+        assert_eq!(
+            too_small.finish_miss(
+                blake3::hash(&a),
+                MIN_MANIFEST_CACHE_BYTES,
+                Ok((inflate(), true)),
+                &cancel
+            ),
+            Ok(true)
+        );
+        assert!(too_small.entries.is_empty());
+        assert_manifest_budget(&too_small);
+
+        let entry = CachedManifestWorkspaces {
+            digest: blake3::hash(&a),
+            patterns: uncached_manifest_patterns(&a, "a/member").unwrap().0,
+        };
+        let mut bytes_limited = ManifestWorkspaceCache::with_limits(
+            2,
+            2 * size_of::<CachedManifestWorkspaces>() + entry.heap_bytes().unwrap(),
+        );
+        for source in [&a, &b] {
+            assert_eq!(
+                bytes_limited.includes_captured(blake3::hash(source), source, "missing", &cancel),
+                Ok(false)
+            );
+            assert_manifest_budget(&bytes_limited);
+        }
+        assert_eq!(bytes_limited.entries.len(), 1);
+        assert_eq!(bytes_limited.entries[0].digest, blake3::hash(&b));
+    }
+
+    #[test]
+    fn manifest_workspace_cache_oversized_valid_patterns_never_evict() {
+        let cancel = AtomicBool::new(false);
+        let small = manifest_cache_document(&["apps/*"]);
+        let mut cache = ManifestWorkspaceCache::default();
+        assert!(
+            cache
+                .includes_captured(blake3::hash(&small), &small, "apps/member", &cancel)
+                .unwrap()
+        );
+        let retained = cache.retained_bytes;
+        // The existing matcher trims trailing slashes before its length check.
+        let long = format!("apps/*{}", "/".repeat(MAX_MANIFEST_CACHE_BYTES + 1));
+        let oversized = manifest_cache_document(&[&long]);
+        for (relative, expected) in [("apps/member", true), ("other/member", false)] {
+            assert_eq!(
+                uncached_manifest_patterns(&oversized, relative).unwrap().1,
+                expected
+            );
+            assert_eq!(
+                cache.includes_captured(blake3::hash(&oversized), &oversized, relative, &cancel),
+                Ok(expected)
+            );
+            assert_eq!(cache.retained_bytes, retained);
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.entries[0].digest, blake3::hash(&small));
+        }
+        let invalid = manifest_cache_document(&[&long, "bad?"]);
+        assert_eq!(
+            cache.includes_captured(blake3::hash(&invalid), &invalid, "apps/member", &cancel),
+            Err("Complex workspace patterns need manual inspection".into())
+        );
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(cache.entries[0].digest, blake3::hash(&small));
+        assert_manifest_budget(&cache);
+    }
+
+    #[test]
+    fn manifest_workspace_cache_bypasses_small_inputs_and_disabled_budgets() {
+        let source = br#"{"workspaces":["apps/*"]}"#;
+        let cancel = AtomicBool::new(false);
+        for length in [
+            MIN_MANIFEST_CACHE_BYTES - 1,
+            MIN_MANIFEST_CACHE_BYTES,
+            MIN_MANIFEST_CACHE_BYTES + 1,
+        ] {
+            let mut bytes = source.to_vec();
+            bytes.resize(length, b' ');
+            let mut cache = ManifestWorkspaceCache::default();
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.includes_captured(blake3::hash(&bytes), &bytes, "apps/member", &cancel),
+                    Ok(true)
+                );
+            }
+            assert_eq!(
+                cache.entries.len(),
+                usize::from(length >= MIN_MANIFEST_CACHE_BYTES)
+            );
+            assert_manifest_budget(&cache);
+        }
+        let large = manifest_cacheable(source);
+        for (entries, bytes) in [
+            (0, 4096),
+            (8, 0),
+            (8, size_of::<CachedManifestWorkspaces>() - 1),
+        ] {
+            let mut cache = ManifestWorkspaceCache::with_limits(entries, bytes);
+            assert_eq!(
+                cache.includes_captured(blake3::hash(&large), &large, "apps/member", &cancel),
+                Ok(true)
+            );
+            assert!(cache.entries.is_empty());
+            assert_manifest_budget(&cache);
+        }
+        assert_manifest_budget(&ManifestWorkspaceCache::with_limits(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn manifest_workspace_cache_cancellation_preserves_error_priority_and_state() {
+        use std::sync::atomic::Ordering;
+        let cancel = AtomicBool::new(false);
+        let [a, b, c] = ["a/*", "b/*", "c/*"].map(|pattern| manifest_cache_document(&[pattern]));
+        let mut cache = ManifestWorkspaceCache::default();
+        for source in [&a, &b] {
+            cache
+                .includes_captured(blake3::hash(source), source, "missing", &cancel)
+                .unwrap();
+        }
+        let digests: Vec<_> = cache.entries.iter().map(|entry| entry.digest).collect();
+        let retained = cache.retained_bytes;
+        cancel.store(true, Ordering::Relaxed);
+        for source in [&a[..], &b[..], &c[..], b"\xff"] {
+            assert_eq!(
+                cache.includes_captured(blake3::hash(source), source, "a/member", &cancel),
+                Err("Cancelled".into())
+            );
+        }
+        // Feed the actual completed uncached pipeline to the admission boundary,
+        // with cancellation requested after evaluation instead of a racy timer.
+        for source in [
+            a.as_slice(),
+            c.as_slice(),
+            b"\xff",
+            br#"{"workspaces":{}}"#,
+            br#"{"workspaces":["bad?",7]}"#,
+            br#"{"workspaces":["a/*","bad?"]}"#,
+        ] {
+            cancel.store(false, Ordering::Relaxed);
+            let parsed = uncached_manifest_patterns(source, "a/member");
+            let expected = match &parsed {
+                Ok(_) => Err("Cancelled".into()),
+                Err(error) => Err(error.clone()),
+            };
+            cancel.store(true, Ordering::Relaxed);
+            assert_eq!(
+                cache.finish_miss(blake3::hash(source), source.len(), parsed, &cancel),
+                expected
+            );
+        }
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.digest)
+                .collect::<Vec<_>>(),
+            digests
+        );
+        assert_manifest_budget(&cache);
+    }
+
     // Frozen pre-cache oracle. Keep its scalar rules and ownership walk
     // independent from the shared importer visitor and fact compaction.
     fn original_pnpm_scalar(value: &str) -> Result<&str> {
@@ -5015,6 +5562,9 @@ mod tests {
             ),
         ] {
         let (_temp, root, owner, member) = workspace_fixture();
+        let owner_manifest = owner.join("package.json");
+        let owner_bytes = manifest_cacheable(&std::fs::read(&owner_manifest).unwrap());
+        std::fs::write(&owner_manifest, &owner_bytes).unwrap();
         if name == "pnpm-lock.yaml" {
             std::fs::write(
                 owner.join("pnpm-workspace.yaml"),
@@ -5030,6 +5580,8 @@ mod tests {
         let first = node_evidence_cached(&root, &member, &cancel, Some(&mut cache))
             .unwrap()
             .unwrap();
+        assert_eq!(cache.manifest_workspaces.entries.len(), 1);
+        assert_manifest_budget(&cache.manifest_workspaces);
         if name == "pnpm-lock.yaml" {
             assert_eq!(cache.pnpm_locks.entries.len(), 1);
             assert_pnpm_budget(&cache.pnpm_locks);
@@ -5076,9 +5628,28 @@ mod tests {
             (owner.join("package.json"), br#"{"name":"fixture","workspaces":["other/*"]}"#)
         };
         let original_membership = std::fs::read(&membership).unwrap();
-        std::fs::write(&membership, replacement_membership).unwrap();
+        let replacement_membership = if membership == owner_manifest {
+            let padded = manifest_cacheable(replacement_membership);
+            assert_eq!(padded.len(), original_membership.len());
+            padded
+        } else {
+            replacement_membership.to_vec()
+        };
+        std::fs::write(&membership, &replacement_membership).unwrap();
         assert!(node_evidence_cached(&root, &member, &cancel, Some(&mut cache)).is_err());
         std::fs::write(&membership, original_membership).unwrap();
+
+        // Warm parsed patterns cannot authorize a substituted ancestor manifest.
+        let outside_manifest = tempfile::tempdir().unwrap();
+        let target_manifest = outside_manifest.path().join("package.json");
+        std::fs::write(&target_manifest, &owner_bytes).unwrap();
+        std::fs::remove_file(&owner_manifest).unwrap();
+        std::os::unix::fs::symlink(&target_manifest, &owner_manifest).unwrap();
+        assert!(node_evidence_cached(&root, &member, &cancel, Some(&mut cache)).is_err());
+        assert_eq!(std::fs::read(&target_manifest).unwrap(), owner_bytes);
+        std::fs::remove_file(&owner_manifest).unwrap();
+        std::fs::write(&owner_manifest, &owner_bytes).unwrap();
+
         std::fs::write(owner.join(".yarnrc.yml"), b"nodeLinker: node-modules\n").unwrap();
         let configured = node_evidence_cached(&root, &member, &cancel, Some(&mut cache))
             .unwrap()
@@ -5106,6 +5677,73 @@ mod tests {
             [5u8; 4096]
         );
         }
+    }
+
+    #[test]
+    fn manifest_workspace_cache_is_ancestor_only_and_preserves_bun_names() {
+        let (_temp, root, owner, member) = workspace_fixture();
+        let owner_manifest = owner.join("package.json");
+        std::fs::write(
+            &owner_manifest,
+            manifest_cacheable(&std::fs::read(&owner_manifest).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(
+            owner.join("bun.lock"),
+            br#"{"lockfileVersion":1,"packages":{},"workspaces":{"":{"name":"fixture"},"apps/member":{"name":"member"}}}"#,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut cache = EvidenceCaches::default();
+        node_evidence_cached(&root, &member, &cancel, Some(&mut cache)).unwrap();
+        assert_eq!(cache.manifest_workspaces.entries.len(), 1);
+        for (source, recognized) in [
+            (br#"{"name":"member","workspaces":null}"#.as_slice(), true),
+            (
+                br#"{"name":"","dependencies":{},"workspaces":null}"#.as_slice(),
+                false,
+            ),
+            (
+                br#"{"name":" \t","dependencies":{},"workspaces":null}"#.as_slice(),
+                false,
+            ),
+            (
+                br#"{"name":null,"dependencies":{},"workspaces":null}"#.as_slice(),
+                true,
+            ),
+            (
+                br#"{"dependencies":{},"workspaces":{"packages":false}}"#.as_slice(),
+                true,
+            ),
+        ] {
+            std::fs::write(member.join("package.json"), source).unwrap();
+            let cached = node_evidence_cached(&root, &member, &cancel, Some(&mut cache));
+            assert_eq!(cached.is_ok(), recognized);
+            assert_eq!(
+                cached.map(|found| found.map(|evidence| evidence.fingerprint)),
+                node_evidence(&root, &member, &cancel)
+                    .map(|found| found.map(|evidence| evidence.fingerprint))
+            );
+            assert_eq!(cache.manifest_workspaces.entries.len(), 1);
+        }
+        std::fs::write(
+            &owner_manifest,
+            manifest_cacheable(br#"{"name":"fixture","workspaces":false}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            node_evidence_cached(&root, &member, &cancel, Some(&mut cache)).err(),
+            Some("Workspace membership is not a supported list".into())
+        );
+        // The same manifest is valid locally: its workspace shape is unused.
+        let cached = node_evidence_cached(&root, &owner, &cancel, Some(&mut cache))
+            .unwrap()
+            .unwrap();
+        let fresh = node_evidence(&root, &owner, &cancel).unwrap().unwrap();
+        assert_eq!(cached.fingerprint, fresh.fingerprint);
+        assert_eq!(cached.blocked, fresh.blocked);
+        assert_eq!(cache.manifest_workspaces.entries.len(), 1);
+        assert_manifest_budget(&cache.manifest_workspaces);
     }
 
     #[test]
