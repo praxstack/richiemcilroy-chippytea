@@ -146,7 +146,7 @@ struct DiskAccessView: View {
                     }
                 }
                 .buttonStyle(InkButtonStyle(kind: .quiet, compact: true, seed: 717))
-                .help("Show this running copy of Chippytea in Finder, ready to add with + in System Settings")
+                .help("Show this running copy of chippytea in Finder, ready to add with + in System Settings")
                 .accessibilityHint("Shows the exact running app in Finder so you can add it to Full Disk Access using the plus button.")
                 .disabled(working)
             }
@@ -173,9 +173,9 @@ struct DiskAccessView: View {
         .contentShape(Rectangle())
         .onDrag { NSItemProvider(object: Bundle.main.bundleURL as NSURL) }
         .allowsHitTesting(!working)
-        .help("Drag this copy of Chippytea into the Full Disk Access list in System Settings")
+        .help("Drag this copy of chippytea into the Full Disk Access list in System Settings")
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Chippytea app, drag into the Full Disk Access list")
+        .accessibilityLabel("chippytea app, drag into the Full Disk Access list")
         .accessibilityHint("Alternatively use Reveal Chippytea, then add the app with the plus button in System Settings.")
     }
 

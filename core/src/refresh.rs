@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(
             event_scope(
                 &root,
-                Path::new("/Users/test/Library/Application Support/Chippytea/library.sqlite-wal")
+                Path::new("/Users/test/Library/Application Support/chippytea/library.sqlite-wal")
             )
             .unwrap(),
             None

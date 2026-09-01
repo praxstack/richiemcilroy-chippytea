@@ -1007,7 +1007,7 @@ struct ChipCollectionOverlay: View {
 
 // MARK: - Doodles
 
-/// A steaming mug — the app is called Chippytea.
+/// A steaming mug — the app is called chippytea.
 struct MugDoodle: View {
     var size: CGFloat = 56
     var body: some View {

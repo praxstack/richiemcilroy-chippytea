@@ -116,7 +116,7 @@ private struct Masthead: View {
         .padding(.top, 9)
         .onHover { hovering = $0 }
         .accessibilityElement()
-        .accessibilityLabel("Chippytea")
+        .accessibilityLabel("chippytea")
     }
 }
 
@@ -984,7 +984,7 @@ private struct DiscoveryPage: View {
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             .foregroundStyle(TeaTheme.ink)
             .disabled(changing)
-            .help("Add a folder Chippytea may look inside").accessibilityLabel("Add a folder")
+            .help("Add a folder chippytea may look inside").accessibilityLabel("Add a folder")
         }
         .padding(.horizontal, TeaTheme.panelPadding)
         .padding(.top, 8).padding(.bottom, 8)
@@ -1708,7 +1708,7 @@ private struct SettingsPage: View {
 
                 SettingsSection(title: "App updates", seed: 372) {
                     HStack(alignment: .firstTextBaseline) {
-                        Text("Chippytea \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")")
+                        Text("chippytea \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development")")
                             .font(TeaFont.bodySemibold)
                         Spacer(minLength: 8)
                         Button(updates.availableVersion == nil ? "Check for updates" : "Download update…") {
@@ -1865,7 +1865,7 @@ private struct UpdateBanner: View {
         if let version = updates.availableVersion {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.down.circle").foregroundStyle(TeaTheme.biro)
-                Text("Chippytea \(version) is ready").font(TeaFont.captionMedium)
+                Text("chippytea \(version) is ready").font(TeaFont.captionMedium)
                 Spacer(minLength: 4)
                 Button("Download update…") { updates.checkForUpdates() }
                     .buttonStyle(InkButtonStyle(kind: .quiet, compact: true, seed: 390))

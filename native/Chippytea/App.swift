@@ -201,12 +201,12 @@ final class TrayPanel: NSPanel {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = fishTemplateImage(size: 18)
-            button.image?.accessibilityDescription = "Chippytea"
+            button.image?.accessibilityDescription = "chippytea"
             button.imagePosition = .imageLeading
             button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
             button.target = self; button.action = #selector(statusClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.toolTip = "Chippytea — your chips"
+            button.toolTip = "chippytea — your chips"
         }
 
         panel = TrayPanel(contentRect: NSRect(x: 0, y: 0, width: TeaTheme.panelWidth, height: TeaTheme.panelHeight),
@@ -248,10 +248,10 @@ final class TrayPanel: NSPanel {
 
         let mainMenu = NSMenu()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Show Chippytea", action: #selector(showWindow), keyEquivalent: "0").target = self
+        appMenu.addItem(withTitle: "Show chippytea", action: #selector(showWindow), keyEquivalent: "0").target = self
         appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "").target = self
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "Quit Chippytea", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit chippytea", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let item = NSMenuItem(); item.submenu = appMenu; mainMenu.addItem(item)
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -315,16 +315,16 @@ final class TrayPanel: NSPanel {
             title = " " + (storageStatus?.menuTitle ?? (storageSampleReceived ? "Storage unavailable" : "Storage…"))
             let capacity = storageStatus?.detail ?? (storageSampleReceived
                 ? "Startup disk storage is unavailable." : "Checking startup disk storage…")
-            detail = "Chippytea\n\(capacity)\n\(chips)"
+            detail = "chippytea\n\(capacity)\n\(chips)"
         } else {
             title = pendingChips > 0 ? " \(pendingChips.formatted())" : ""
             detail = pendingChips > 0
                 ? "\(chipsPhrase(pendingChips)) ready to collect"
-                : "Chippytea — your chips"
+                : "chippytea — your chips"
         }
         if let version = updates.availableVersion {
             title += " ↑"
-            detail += "\nChippytea \(version) is available. Open Chippytea to update."
+            detail += "\nchippytea \(version) is available. Open chippytea to update."
         }
         if button.title != title { button.title = title }
         if button.toolTip != detail {
@@ -339,10 +339,10 @@ final class TrayPanel: NSPanel {
         if NSApp.currentEvent?.type == .rightMouseUp {
             let menu = NSMenu()
             menu.addItem(withTitle: "Show your chips", action: #selector(showWindow), keyEquivalent: "").target = self
-            let updateTitle = updates.availableVersion.map { "Update to Chippytea \($0)…" } ?? "Check for Updates…"
+            let updateTitle = updates.availableVersion.map { "Update to chippytea \($0)…" } ?? "Check for Updates…"
             menu.addItem(withTitle: updateTitle, action: #selector(checkForUpdates), keyEquivalent: "").target = self
             menu.addItem(NSMenuItem.separator())
-            menu.addItem(withTitle: "Quit Chippytea", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            menu.addItem(withTitle: "Quit chippytea", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             statusItem.menu = menu; statusItem.button?.performClick(nil); statusItem.menu = nil
         } else if panel.isVisible {
             hidePanel()

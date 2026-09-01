@@ -255,7 +255,7 @@ enum Destination: String, CaseIterable, Identifiable {
     }
     /// The compact label used by the panel's bottom bar; `rawValue` stays the accessible name.
     var tabTitle: String {
-        switch self { case .coins: return "Chippytea"; case .discover: return "Find space"; case .activity: return "Activity"; case .settings: return "Settings" }
+        switch self { case .coins: return "chippytea"; case .discover: return "Find space"; case .activity: return "Activity"; case .settings: return "Settings" }
     }
 }
 

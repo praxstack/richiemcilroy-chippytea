@@ -90,7 +90,7 @@ fn sibling_events_refresh_only_their_scopes_and_ignored_churn_stays_idle() {
     assert!(refreshed.stats.complete);
     assert_eq!(refreshed.stats.entries - initial, 3);
     assert!(refreshed.stats.entries - initial < initial / 10);
-    let ignored=engine.request(json!({"action":"dirty","root_id":root.id,"path":root.path.join("Library/Application Support/Chippytea/library.sqlite-wal")})).unwrap();
+    let ignored=engine.request(json!({"action":"dirty","root_id":root.id,"path":root.path.join("Library/Application Support/chippytea/library.sqlite-wal")})).unwrap();
     assert_eq!(ignored["ignored"], true);
     assert!(!engine.snapshot().unwrap().scanning);
     let noise = (0..100)

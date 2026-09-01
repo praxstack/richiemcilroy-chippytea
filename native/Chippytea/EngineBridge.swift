@@ -44,7 +44,7 @@ final class EngineClient: @unchecked Sendable {
     private let progressQueue = DispatchQueue(label: "app.chippytea.cleanup-progress", qos: .utility)
     private var snapshotDecoder = SnapshotResponseDecoder()
     init(database: URL) throws {
-        guard let handle = database.path.withCString({ ct_open($0, nativeTrash) }) else { throw EngineError.message("The local library could not be opened. Check free space and whether another Chippytea process has it open.") }
+        guard let handle = database.path.withCString({ ct_open($0, nativeTrash) }) else { throw EngineError.message("The local library could not be opened. Check free space and whether another chippytea process has it open.") }
         self.handle = handle
     }
     deinit { ct_close(handle) }
@@ -685,7 +685,7 @@ struct DiscoveryPresentation: Equatable {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
         panel.prompt = "Allow this folder"
-        panel.message = "Chippytea looks only inside folders you choose. Nothing is selected for cleanup automatically."
+        panel.message = "chippytea looks only inside folders you choose. Nothing is selected for cleanup automatically."
         if kind == "downloads" { panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first }
         beginSystemDialog()
         panel.begin { [weak self] result in

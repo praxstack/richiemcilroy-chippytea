@@ -227,7 +227,7 @@ enum UpdateActionState: Equatable, Sendable {
     private func unsafeError(for state: UpdateModelState) -> NSError {
         NSError(domain: "app.chippytea.updater", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: UpdateSafetyPolicy.denialReason(for: state)
-                    ?? "Chippytea is busy."])
+                    ?? "chippytea is busy."])
     }
 
     // MARK: - SPUUpdaterDelegate
@@ -294,7 +294,7 @@ enum UpdateActionState: Equatable, Sendable {
     func standardUserDriverShouldHandleShowingScheduledUpdate(_ update: SUAppcastItem,
                                                                andInImmediateFocus immediateFocus: Bool) -> Bool {
         // A recently active app may show Sparkle's normal alert. A background
-        // menu-bar app must leave the banner/action to Chippytea instead.
+        // menu-bar app must leave the banner/action to chippytea instead.
         immediateFocus
     }
 

@@ -49,11 +49,11 @@ import Sparkle
                                               sessionRequested: false, availableVersion: "1.2.3") == .installing,
                     "Installing state must take priority over an available update")
 
-        try require(UpdateController.updatesSuppressed(arguments: ["Chippytea", "--self-test"]),
+        try require(UpdateController.updatesSuppressed(arguments: ["chippytea", "--self-test"]),
                     "Self-test must suppress Sparkle")
-        try require(UpdateController.updatesSuppressed(arguments: ["Chippytea", "--screenshot"]),
+        try require(UpdateController.updatesSuppressed(arguments: ["chippytea", "--screenshot"]),
                     "Screenshot mode must suppress Sparkle")
-        try require(!UpdateController.updatesSuppressed(arguments: ["Chippytea"]),
+        try require(!UpdateController.updatesSuppressed(arguments: ["chippytea"]),
                     "Normal app launch must not be suppressed")
     }
 

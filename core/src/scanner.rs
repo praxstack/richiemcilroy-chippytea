@@ -2538,7 +2538,7 @@ pub(crate) fn revalidate_observing(
         }
         git
     } else if candidate.eligible_permanent {
-        return Err("Personal files cannot be permanently cleaned by Chippytea".into());
+        return Err("Personal files cannot be permanently cleaned by chippytea".into());
     } else {
         None
     };
@@ -3897,7 +3897,7 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args([
                 "-c",
-                "user.name=Chippytea test",
+                "user.name=chippytea test",
                 "-c",
                 "user.email=test@example.invalid",
             ])

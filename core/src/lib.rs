@@ -270,7 +270,7 @@ impl Engine {
             .open(path.with_extension("lock"))
             .map_err(store::err)?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("This Chippytea library is already open in another process.".into());
+            return Err("This chippytea library is already open in another process.".into());
         }
         let mut store = Store::open(path)?;
         store.reconcile()?;

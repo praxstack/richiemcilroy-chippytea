@@ -26,7 +26,7 @@ enum HomeFolderAccess {
     }
 
     static func message(for locations: [String]) -> String {
-        "macOS still blocks \(locations.joined(separator: ", ")). Enable this copy of Chippytea in Full Disk Access, then quit and reopen it. If Chippytea is already listed, remove the old entry and add this copy again."
+        "macOS still blocks \(locations.joined(separator: ", ")). Enable this copy of chippytea in Full Disk Access, then quit and reopen it. If chippytea is already listed, remove the old entry and add this copy again."
     }
 }
 

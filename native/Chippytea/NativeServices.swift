@@ -11,7 +11,7 @@ func nativeTrash(_ path: UnsafePointer<CChar>?, _ result: UnsafeMutablePointer<C
     do {
         var destination: NSURL?
         try FileManager.default.trashItem(at: URL(fileURLWithPath: String(cString: path)), resultingItemURL: &destination)
-        guard let destination else { throw NSError(domain: "Chippytea", code: 1, userInfo: [NSLocalizedDescriptionKey: "Trash did not return a destination."]) }
+        guard let destination else { throw NSError(domain: "chippytea", code: 1, userInfo: [NSLocalizedDescriptionKey: "Trash did not return a destination."]) }
         message = destination.path ?? ""
     } catch { status = 1; message = error.localizedDescription }
     let bytes = Array(message.utf8)

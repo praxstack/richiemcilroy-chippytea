@@ -104,7 +104,7 @@ fn run() -> Result<()> {
         "--version" | "-V" => println!("chippytea-cli {}", env!("CARGO_PKG_VERSION")),
         _ => {
             println!(
-                "Chippytea benchmark CLI\n  chippytea-cli traverse <fixture> [--cancel-after-ms N]\n  chippytea-cli scan <authorized-folder> [--kind projects|home|folder|downloads] [--metadata-coverage] [--cancel-after-ms N]\n  chippytea-cli index <fixture> [--cancel-after-ms N]\nIndex uses a new disposable database. No CLI command deletes files."
+                "chippytea benchmark CLI\n  chippytea-cli traverse <fixture> [--cancel-after-ms N]\n  chippytea-cli scan <authorized-folder> [--kind projects|home|folder|downloads] [--metadata-coverage] [--cancel-after-ms N]\n  chippytea-cli index <fixture> [--cancel-after-ms N]\nIndex uses a new disposable database. No CLI command deletes files."
             );
         }
     }
