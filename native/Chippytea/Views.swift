@@ -472,9 +472,9 @@ private struct CoinsHero: View {
     }
     private var balanceAccessibilityLabel: String {
         if model.hasCleanupWork && model.pendingCleanupCoinEstimate > 0 {
-            return "\(fishAndChipsPhrase(model.confirmedEarnedCoins)) confirmed, up to \(chipsPhrase(model.pendingCleanupCoinEstimate)) pending cleanup"
+            return "\(chipsPhrase(model.confirmedEarnedCoins)) confirmed, up to \(chipsPhrase(model.pendingCleanupCoinEstimate)) pending cleanup"
         }
-        return "\(fishAndChipsPhrase(model.displayedCoinBalance)) in the paper"
+        return "\(chipsPhrase(model.displayedCoinBalance)) in the paper"
     }
 
     private struct CollectionAnimation: Hashable {
@@ -760,9 +760,8 @@ private struct HowChipsWorkSlip: View {
                         .buttonStyle(.plain).foregroundStyle(TeaTheme.inkSoft)
                         .help("Close").accessibilityLabel("Close how chips work")
                 }
-                line("Clean something up for good and the freed space is measured conservatively, then credited.", seed: 211)
-                line("Every 100 MB credited earns one chip. Anything smaller is scraps — carried forward, never lost.", seed: 213)
-                line("A thousand chips is a battered fish — the full supper. The counter shows both.", seed: 214)
+                line("Clean something up for good and the freed space is measured conservatively, then counted as saved.", seed: 211)
+                line("Every 100 MB saved earns one chip. Anything smaller is scraps — carried forward, never lost.", seed: 213)
                 line("Moving files to Trash earns no chips; nothing is freed until Trash empties.", seed: 215)
                 line("Chips stay on your Mac and have no monetary value. They’re just your tea.", seed: 217)
             }
@@ -1831,7 +1830,7 @@ private struct SettingsPage: View {
                         BatteredFishLogo(height: 20)
                         Text("A proper chippy tea for your disk.").font(TeaFont.bodySemibold)
                     }
-                    Text("One chip per 100 MB of space credited, on your Mac only. A thousand chips makes a battered fish. Anything smaller is scraps and carries forward. Trash earns no chips. Chips and fish have no monetary value.")
+                    Text("One chip per 100 MB of space saved, on your Mac only. Anything smaller is scraps and carries forward. Trash earns no chips. Chips have no monetary value.")
                         .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
                         .lineSpacing(2).fixedSize(horizontal: false, vertical: true)
                 }

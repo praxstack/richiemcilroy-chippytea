@@ -722,9 +722,8 @@ func drawGlyph(_ symbol: Int, in context: inout GraphicsContext, origin: CGPoint
     context.stroke(region, with: .color(outline), style: StrokeStyle(lineWidth: max(1.2, 1.6 * scale * 2), lineJoin: .round))
 }
 
-/// The balance: fish and chips, hand-lettered digits with the denominations
-/// written out beside them in ink — "0 fish 900 chips". Interpolates like a
-/// number, draws like a felt-tip. One battered fish is a thousand chips.
+/// The balance: hand-lettered digits with "chips" written out beside them in
+/// ink — "958 chips". Interpolates like a number, draws like a felt-tip.
 struct AnimatedChipNumber: View, Animatable {
     var value: Double
     var digitHeight: CGFloat = 42
@@ -740,42 +739,31 @@ struct AnimatedChipNumber: View, Animatable {
         if value >= Double(UInt64.max) { return .max }
         return UInt64(value.rounded(.down))
     }
+    /// The unit word's height at the reference digit height; it scales with the digits.
     private static let wordHeight: CGFloat = 18
 
     var body: some View {
-        let order = FishAndChips(totalChips: total)
-        let fishDigits = String(order.fish).compactMap(\.wholeNumberValue)
-        let chipDigits = String(order.chips).compactMap(\.wholeNumberValue)
+        let digits = String(total).compactMap(\.wholeNumberValue)
+        let word = total == 1 ? "chip" : "chips"
         let scale = digitHeight / glyphBox.height
-        let wordScale = Self.wordHeight / 92
+        let wordScale = Self.wordHeight * min(1, digitHeight / 42) / 92
         let cell = glyphAdvance * scale
         let gap: CGFloat = 7
-        let fishWordWidth = handWordWidth("fish") * wordScale
-        let chipsWordWidth = handWordWidth("chips") * wordScale
-        let width = CGFloat(fishDigits.count + chipDigits.count) * cell
-            + fishWordWidth + chipsWordWidth + gap * 3 + 8
+        let wordWidth = handWordWidth(word) * wordScale
+        let width = CGFloat(digits.count) * cell + wordWidth + gap + 8
         Canvas { context, _ in
             var ctx = context
             var penX: CGFloat = 3
-            // Words sit on the digits' baseline, like a unit written after a sum.
+            // The word sits on the digits' baseline, like a unit written after a sum.
             let baseline: CGFloat = 4 + 87 * scale
             let wordY = baseline - 70 * wordScale
-            for (index, digit) in fishDigits.enumerated() {
-                drawGlyph(digit, in: &ctx, origin: CGPoint(x: penX, y: 4), scale: scale,
-                          seed: 900 &+ index &* 31 &+ digit &* 7 &+ boil &* 13)
-                penX += cell
-            }
-            penX += gap
-            paintHandWord("fish", in: &ctx, origin: CGPoint(x: penX, y: wordY), scale: wordScale,
-                          color: TeaTheme.ink, seed: 530 + boil * 9)
-            penX += fishWordWidth + gap * 2
-            for (index, digit) in chipDigits.enumerated() {
+            for (index, digit) in digits.enumerated() {
                 drawGlyph(digit, in: &ctx, origin: CGPoint(x: penX, y: 4), scale: scale,
                           seed: 700 &+ index &* 31 &+ digit &* 7 &+ boil &* 13)
                 penX += cell
             }
             penX += gap
-            paintHandWord("chips", in: &ctx, origin: CGPoint(x: penX, y: wordY), scale: wordScale,
+            paintHandWord(word, in: &ctx, origin: CGPoint(x: penX, y: wordY), scale: wordScale,
                           color: TeaTheme.ink, seed: 560 + boil * 9)
         }
         .frame(width: width, height: digitHeight + 10)
@@ -792,20 +780,22 @@ struct ChipPortion: View {
     let chips: UInt64
     var landing = false
     var boil: Int = 0
+    /// Draws at a fraction of its design size, for the compact chips strip.
+    var scale: CGFloat = 1
 
     private static let rows: [(count: Int, lift: CGFloat, spread: CGFloat, length: CGFloat)] = [
         (6, 0, 0.52, 36), (5, 12, 0.43, 34), (4, 23, 0.33, 33), (2, 33, 0.20, 31), (1, 42, 0.0, 30)
     ]
 
     var body: some View {
-        Canvas { context, size in
-            let width = size.width
-            let baseY = size.height * 0.66
-            let order = FishAndChips(totalChips: chips)
-            // At most two fish and eighteen chips are rendered, so the cost
-            // stays constant however large the balance grows.
-            let fishDrawn = min(Int(min(order.fish, 2)), 2)
-            let drawn = min(Int(min(order.chips, 18)), 18)
+        Canvas { canvas, size in
+            var context = canvas
+            context.scaleBy(x: scale, y: scale)
+            let width = size.width / scale
+            let baseY = size.height / scale * 0.66
+            // At most eighteen chips are rendered, so the cost stays constant
+            // however large the balance grows.
+            let drawn = min(Int(min(chips, 18)), 18)
             let seed = 200 + boil * 7
 
             // The wrap behind the heap: unfolded paper, corners poking up.
@@ -840,7 +830,7 @@ struct ChipPortion: View {
             let crease = handPath([CGPoint(x: width * 0.105, y: baseY - 14), CGPoint(x: width * 0.15, y: baseY + 4)], amplitude: 0.6, seed: seed &+ 35)
             context.stroke(crease, with: .color(TeaTheme.ink.opacity(0.2)), style: StrokeStyle(lineWidth: 1, lineCap: .round))
 
-            if fishDrawn == 0 && drawn == 0 {
+            if drawn == 0 {
                 var ghost = context
                 ghost.translateBy(x: width / 2, y: baseY - 8)
                 ghost.rotate(by: .degrees(-9))
@@ -867,19 +857,6 @@ struct ChipPortion: View {
                     chip.translateBy(x: slot.point.x, y: slot.point.y)
                     chip.rotate(by: .degrees(Double((slot.index * 29) % 44) - 22))
                     paintChip(&chip, center: .zero, length: slot.length, seed: seed &+ slot.index &* 3)
-                }
-                // The battered fish rides on top of the chips, as it's served.
-                for index in 0..<fishDrawn {
-                    var fish = context
-                    let placement: (x: CGFloat, y: CGFloat, angle: Double) = index == 0
-                        ? (width * 0.46, baseY - 28, -7)
-                        : (width * 0.62, baseY - 12, 8)
-                    fish.translateBy(x: placement.x, y: placement.y)
-                    fish.rotate(by: .degrees(placement.angle))
-                    let fishScale: CGFloat = 36.0 / 44.0
-                    fish.scaleBy(x: fishScale, y: fishScale)
-                    fish.translateBy(x: -32, y: -22)
-                    paintBatteredFish(&fish, seed: seed &+ 60 &+ index &* 9, steam: false)
                 }
                 // A pinch of salt over the heap.
                 for index in 0..<6 {

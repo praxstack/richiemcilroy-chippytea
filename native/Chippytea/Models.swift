@@ -259,32 +259,11 @@ enum Destination: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - Fish and chips
+// MARK: - Chips
 
-/// The chip-shop denominations. The wallet and engine count plain chips;
-/// a battered fish is the interface's name for every full thousand.
-let chipsPerFish: UInt64 = 1000
-
-struct FishAndChips: Equatable {
-    let fish: UInt64
-    let chips: UInt64
-    init(totalChips: UInt64) {
-        fish = totalChips / chipsPerFish
-        chips = totalChips % chipsPerFish
-    }
-}
-
-/// The hero phrasing: both denominations, always — "0 fish, 900 chips".
-func fishAndChipsPhrase(_ total: UInt64) -> String {
-    let order = FishAndChips(totalChips: total)
-    return "\(order.fish.formatted()) fish, \(order.chips.formatted()) \(order.chips == 1 ? "chip" : "chips")"
-}
-
-/// Compact phrasing for captions and receipts: plain chips below one fish,
-/// both denominations from the first full fish.
+/// The wallet and engine count plain chips; this is how the interface says them.
 func chipsPhrase(_ total: UInt64) -> String {
-    guard total >= chipsPerFish else { return "\(total.formatted()) \(total == 1 ? "chip" : "chips")" }
-    return fishAndChipsPhrase(total)
+    "\(total.formatted()) \(total == 1 ? "chip" : "chips")"
 }
 
 func space(_ bytes: UInt64) -> String {
