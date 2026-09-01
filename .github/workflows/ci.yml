@@ -89,8 +89,10 @@ jobs:
           bun-version-file: site/package.json
       - name: Install locked dependencies
         run: bun install --frozen-lockfile
+      - name: Test download routing
+        run: node --test tests/download.test.mjs
       - name: Check generated README artwork
         working-directory: .
         run: bun scripts/generate-readme-art.ts --check
-      - name: Build the static website
+      - name: Build the website
         run: bun run build
