@@ -1,13 +1,12 @@
 # Scan access on macOS
 
-“Scan my Mac” opens a setup page in the existing notebook interface before scanning the home folder. Choosing individual folders remains available throughout.
+“Scan my Mac” opens scan setup in the existing notebook interface before scanning the home folder: three pages you click through, each with one drawing, one headline, one sentence and one button. Choosing individual folders remains available on every page.
 
-1. Choose **Open System Settings** to open Privacy & Security → Full Disk Access.
-2. Drag the Chippytea app from the setup page into the access list. Alternatively, choose **Reveal Chippytea**, then use **+** in Settings to add that exact running copy.
-3. If setup identifies an earlier app build, remove that stale Chippytea entry and add the current copy. Enable it and accept **Quit & Reopen** if macOS asks. Setup resumes at the saved instructions after reopening.
-4. Confirm in Chippytea to check the intended folders and start the Home scan. If access is still denied, setup stays open with the affected folder names; no scan begins and completion is not saved.
+1. **Permission.** Why Full Disk Access is needed and what stays untouched. **Open System Settings** opens Privacy & Security → Full Disk Access, saves the waiting intent and moves to the next page.
+2. **Drag it in.** A looping sketch shows the app card being carried into the Full Disk Access list and dropped; the real card under it is the drag source. **Reveal in Finder** supports adding the exact running copy with **+** instead. If setup identifies an earlier app build, the page says to remove that stale chippytea entry first.
+3. **Switch it on.** A sketch flips the switch beside chippytea and answers the **Quit & Reopen** prompt. Setup resumes on this page after reopening. **It’s switched on — scan my Mac** checks the intended folders and starts the Home scan. If access is still denied, the page stays open with the affected folder names; no scan begins and completion is not saved.
 
-The four UI phases are `intro`, `openingSettings`, `waiting` and `starting`. Opening Settings saves the waiting intent atomically before handing focus to macOS. Returning focus only releases the hold that keeps Chippytea visible during a system dialog; it does not start a scan. The explicit confirmation button calls `confirmDiskAccessAndScan`; saved waiting intent always resumes in `waiting`.
+The four UI phases are `intro`, `openingSettings`, `waiting` and `starting`. The page is separate presentation state (`diskAccessStep`); a saved waiting intent always resumes on the last page. Opening Settings saves the waiting intent atomically before handing focus to macOS. Returning focus only releases the hold that keeps chippytea visible during a system dialog; it does not start a scan. The explicit confirmation button calls `confirmDiskAccessAndScan`; saved waiting intent always resumes in `waiting`.
 
 Only the user can grant Full Disk Access in macOS. Apple documents the system grant in [Privacy & Security settings](https://support.apple.com/guide/mac-help/change-privacy-security-settings-on-mac-mchl211c911f/mac).
 
@@ -49,7 +48,7 @@ The access-flow test injects a new disposable home and application-data director
 
 The native integration test (`--self-test`) exercises native Trash and receipt restoration after broadening and narrowing authorization, including restart and conflict refusal. Both test modes use disposable files and never grant Full Disk Access or scan the developer's real home.
 
-The screenshot harness supports `disk-access`, `disk-access-waiting` and `disk-access-starting` through `CHIPPYTEA_SCREENSHOT_STATE`. Use a fresh `CHIPPYTEA_DATA_DIR` and `--screenshot`; these static states neither grant access nor probe folders or start scans.
+The screenshot harness supports `disk-access`, `disk-access-add`, `disk-access-waiting` and `disk-access-starting` through `CHIPPYTEA_SCREENSHOT_STATE`, one per page; `CHIPPYTEA_SCREENSHOT_SCENE_TIME` freezes that page's sketch at a moment of its loop, in seconds, and the `-reduceMotion 1` argument captures the still versions. Use a fresh `CHIPPYTEA_DATA_DIR` and `--screenshot`; these static states neither grant access nor probe folders or start scans.
 
 Actual consent in System Settings and its Quit & Reopen prompt remain manual verification on the intended signed app. The configured local build uses a stable certificate; unconfigured contributor builds remain ad-hoc. Distribution still requires its own hardened-runtime, timestamp and notarization verification.
 
