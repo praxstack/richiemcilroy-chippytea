@@ -106,6 +106,7 @@ fi
 chmod +x "$staged_app/Contents/MacOS/chippytea"
 ditto "$framework_source" "$staged_app/Contents/Frameworks/Sparkle.framework"
 cp native/Info.plist "$staged_app/Contents/Info.plist"
+cp native/Assets/AppIcon.icns "$staged_app/Contents/Resources/AppIcon.icns"
 python3 - "$staged_app/Contents/Info.plist" <<'PY'
 import os, plistlib, re, sys
 path = sys.argv[1]
