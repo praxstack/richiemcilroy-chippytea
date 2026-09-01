@@ -38,7 +38,7 @@ export default function Page() {
               <Underlined>on your Mac.</Underlined>
             </h1>
             <p className="max-w-[46ch] text-ink/88">
-              Chippytea is an ultra-performant, native macOS app that clears space on your Mac.
+              chippytea is an ultra-performant, native macOS app that clears space on your Mac.
               Built with SwiftUI and Rust, it helps you find old build folders, project dependencies
               and installers you may no longer need. Review their estimated sizes, see what removing
               them means, and choose what to keep or remove.
