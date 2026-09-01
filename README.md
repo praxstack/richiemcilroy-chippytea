@@ -54,7 +54,7 @@ open build/Chippytea.app
 Local builds are ad-hoc signed by default, not notarized releases. For toolchain versions, a safe test fixture, stable signing, and all test commands, see the [development guide](docs/development.md). Quit the running app before rebuilding.
 
 ```sh
-cargo test --locked
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 

@@ -40,7 +40,23 @@ Run the Rust tests, build and native checks:
 ./scripts/test.sh
 ```
 
-For a Rust-only change, `cargo test --locked` runs the engine tests. Run the full native checks when changing the bridge, interface, permissions, cleanup or accounting.
+For a Rust-only change, run the engine tests:
+
+```sh
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR cargo test --locked
+```
+
+`CARGO_TARGET_DIR` and `CARGO_BUILD_TARGET_DIR` describe custom Cargo output, which the cleanup policy excludes. Passing them into the tests changes the disposable fixtures' eligibility. `scripts/test.sh` unsets both for Rust and native tests while leaving the build environment unchanged.
+
+To isolate compiled test artifacts, use Cargo's `--target-dir` option instead of those environment variables:
+
+```sh
+chippytea_test_target="$(mktemp -d "${TMPDIR:-/tmp}/chippytea-tests.XXXXXX")"
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+  cargo test --locked --target-dir "$chippytea_test_target"
+```
+
+Run the full native checks when changing the bridge, interface, permissions, cleanup or accounting.
 
 `--self-test` exercises real native Trash, restoration, restart and permanent deletion using generated files. `--access-flow-test` checks isolated access setup and native interaction, including cleanup. Both retain local evidence and require space for their fixtures. They do not empty unrelated Trash or grant Full Disk Access. The access test simulates consent states; testing System Settings and Quit & Reopen still needs a manual check on the intended app build.
 
@@ -48,7 +64,8 @@ For updater or release changes, also run these checks after building the app:
 
 ```sh
 python3 -B -m unittest discover -s scripts/release -p test_release.py -v
-build/Chippytea.app/Contents/MacOS/Chippytea --update-self-test
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+  build/Chippytea.app/Contents/MacOS/Chippytea --update-self-test
 ```
 
 The Python tests check version rules, archive paths, feed metadata and publication order using temporary files and mocked remote responses. The native update test checks cleanup gates, cancelled or failed installs, deferred relaunch and bundle configuration without starting a network update. Neither proves release signing, Apple notarization or an installed app's live update. See [Releasing Chippytea](RELEASING.md) for the release workflow and end-to-end checks.
