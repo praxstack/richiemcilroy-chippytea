@@ -540,13 +540,25 @@ final class TrayPanel: NSPanel {
         case "settings":
             model.showDiskAccess = false
             model.destination = .settings
-        case "disk-access", "disk-access-waiting", "disk-access-starting":
+        case "disk-access", "disk-access-add", "disk-access-waiting", "disk-access-starting":
             // Render setup intent without reading user folders or changing TCC.
+            // The optional scene time freezes a sketch at one moment of its loop.
             model.showDiskAccess = true
+            model.diskAccessSceneTime = environment["CHIPPYTEA_SCREENSHOT_SCENE_TIME"].flatMap(Double.init)
             switch environment["CHIPPYTEA_SCREENSHOT_STATE"] {
-            case "disk-access-waiting": model.diskAccessPhase = .waiting
-            case "disk-access-starting": model.diskAccessPhase = .starting
-            default: model.diskAccessPhase = .intro
+            case "disk-access-add":
+                model.diskAccessPhase = .waiting
+                model.diskAccessStep = .add
+            case "disk-access-waiting":
+                model.diskAccessPhase = .waiting
+                model.diskAccessStep = .enable
+            case "disk-access-starting":
+                model.diskAccessPhase = .starting
+                model.diskAccessStep = .enable
+                model.diskAccessMessage = "Checking folder access…"
+            default:
+                model.diskAccessPhase = .intro
+                model.diskAccessStep = .permission
             }
         case "expanded":
             model.destination = .coins
