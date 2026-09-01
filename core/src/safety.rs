@@ -2037,8 +2037,9 @@ impl Digest {
         if let Some(target) = link {
             hash.update(target);
         }
-        for (i, chunk) in hash.finalize().as_bytes().chunks_exact(8).enumerate() {
-            let value = u64::from_le_bytes(chunk.try_into().unwrap());
+        let digest = hash.finalize();
+        for (i, chunk) in digest.as_bytes().as_chunks::<8>().0.iter().enumerate() {
+            let value = u64::from_le_bytes(*chunk);
             self.sum[i] = self.sum[i].wrapping_add(value);
             self.xor[i] ^= value;
         }
