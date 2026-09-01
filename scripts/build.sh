@@ -27,7 +27,7 @@ fi
 
 export MACOSX_DEPLOYMENT_TARGET=14.0
 export CFLAGS="${CFLAGS:-} -mmacosx-version-min=14.0"
-app_output="${CHIPPYTEA_APP_OUTPUT:-build/Chippytea.app}"
+app_output="${CHIPPYTEA_APP_OUTPUT:-build/chippytea.app}"
 swift_build_path="${CHIPPYTEA_SWIFT_BUILD_PATH:-.build}"
 cargo_target_dir="${CARGO_TARGET_DIR:-target}"
 host_arch="$(uname -m)"
@@ -43,7 +43,7 @@ done
 mkdir -p "$(dirname "$app_output")"
 staging="$(mktemp -d "$(dirname "$app_output")/.chippytea-build.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
-staged_app="$staging/Chippytea.app"
+staged_app="$staging/chippytea.app"
 mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources" "$staged_app/Contents/Frameworks"
 executables=()
 framework_source=""
@@ -70,15 +70,15 @@ for arch in "${architectures[@]}"; do
     # SwiftPM cannot observe changes to an external static archive. Invalidate
     # just the executable when its Rust input changes; keep cached Swift objects.
     if [[ ! -f "$rust_stamp" ]] || [[ "$(cat "$rust_stamp")" != "$rust_digest" ]]; then
-        rm -f "$swift_bin_dir/Chippytea"
+        rm -f "$swift_bin_dir/chippytea"
     fi
     swift build "${swift_args[@]}" --force-resolved-versions
     printf '%s\n' "$rust_digest" > "$rust_stamp"
     printf '%s %s\n' "$arch" "$rust_digest" >> "$staged_app/Contents/Resources/engine-build.sha256"
-    cp "$swift_bin_dir/Chippytea" "$staging/Chippytea-$arch"
+    cp "$swift_bin_dir/chippytea" "$staging/chippytea-$arch"
     # SwiftPM adds a build-machine rpath for its binary dependency. Only bundle
     # or system-relative rpaths may survive into the distributable executable.
-    python3 - "$staging/Chippytea-$arch" <<'PY'
+    python3 - "$staging/chippytea-$arch" <<'PY'
 import re, subprocess, sys
 binary = sys.argv[1]
 load_commands = subprocess.check_output(['otool', '-l', binary], text=True)
@@ -86,7 +86,7 @@ for path in re.findall(r'cmd LC_RPATH\s+cmdsize \d+\s+path (.+?) \(offset', load
     if not path.startswith('@') and not path.startswith('/usr/lib/'):
         subprocess.run(['install_name_tool', '-delete_rpath', path, binary], check=True)
 PY
-    executables+=("$staging/Chippytea-$arch")
+    executables+=("$staging/chippytea-$arch")
     if [[ -z "$framework_source" ]]; then
         framework_source="$swift_bin_dir/Sparkle.framework"
         if [[ ! -d "$framework_source" ]]; then
@@ -99,11 +99,11 @@ PY
     fi
 done
 if [[ "${#executables[@]}" -eq 1 ]]; then
-    cp "${executables[0]}" "$staged_app/Contents/MacOS/Chippytea"
+    cp "${executables[0]}" "$staged_app/Contents/MacOS/chippytea"
 else
-    lipo -create "${executables[@]}" -output "$staged_app/Contents/MacOS/Chippytea"
+    lipo -create "${executables[@]}" -output "$staged_app/Contents/MacOS/chippytea"
 fi
-chmod +x "$staged_app/Contents/MacOS/Chippytea"
+chmod +x "$staged_app/Contents/MacOS/chippytea"
 ditto "$framework_source" "$staged_app/Contents/Frameworks/Sparkle.framework"
 cp native/Info.plist "$staged_app/Contents/Info.plist"
 python3 - "$staged_app/Contents/Info.plist" <<'PY'

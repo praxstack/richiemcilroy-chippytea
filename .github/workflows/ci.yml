@@ -55,14 +55,14 @@ jobs:
         run: ./scripts/build.sh
       # Checks local policy and bundle configuration, not release signing or a live update.
       - name: Test update policy and bundle configuration
-        run: env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR build/Chippytea.app/Contents/MacOS/Chippytea --update-self-test
+        run: env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR build/chippytea.app/Contents/MacOS/chippytea --update-self-test
       # These tests observe real APFS free space and native system services.
       # Run them deliberately; they are not a portable reward or TCC guarantee.
       - name: Run disposable native integration tests
         if: github.event_name == 'workflow_dispatch' && inputs.native_integration_tests
         run: |
-          env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR build/Chippytea.app/Contents/MacOS/Chippytea --self-test
-          env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR build/Chippytea.app/Contents/MacOS/Chippytea --access-flow-test
+          env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR build/chippytea.app/Contents/MacOS/chippytea --self-test
+          env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR build/chippytea.app/Contents/MacOS/chippytea --access-flow-test
 
   site:
     name: Website build

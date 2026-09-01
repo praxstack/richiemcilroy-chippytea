@@ -119,8 +119,8 @@ jobs:
         with:
           name: chippytea-${{ needs.validate.outputs.version }}-${{ needs.validate.outputs.sha }}
           path: |
-            ${{ runner.temp }}/chippytea-release-output/Chippytea-${{ needs.validate.outputs.version }}-universal.dmg
-            ${{ runner.temp }}/chippytea-release-output/Chippytea-${{ needs.validate.outputs.version }}-universal.zip
+            ${{ runner.temp }}/chippytea-release-output/chippytea-${{ needs.validate.outputs.version }}-universal.dmg
+            ${{ runner.temp }}/chippytea-release-output/chippytea-${{ needs.validate.outputs.version }}-universal.zip
             ${{ runner.temp }}/chippytea-release-output/appcast.xml
             ${{ runner.temp }}/chippytea-release-output/release-notes.md
             ${{ runner.temp }}/chippytea-release-output/release.json

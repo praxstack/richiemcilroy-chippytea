@@ -43,7 +43,7 @@ def feed(path, versions=("0.2.0",), length=8, mutate=None):
         ET.SubElement(item, release.SPARKLE + "shortVersionString").text = version
         ET.SubElement(item, release.SPARKLE + "minimumSystemVersion").text = "14.0"
         ET.SubElement(item, "enclosure", {
-            "url": f"{release.RELEASE_URL}/download/v{version}/Chippytea-{version}-universal.zip",
+            "url": f"{release.RELEASE_URL}/download/v{version}/chippytea-{version}-universal.zip",
             "length": str(length), "type": "application/octet-stream",
             release.SPARKLE + "edSignature": SIGNATURE})
     if mutate:
@@ -53,8 +53,8 @@ def feed(path, versions=("0.2.0",), length=8, mutate=None):
 
 def make_zip(path, entries=(), info=None):
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("Chippytea.app/Contents/Info.plist", plistlib.dumps(info or app_info()))
-        archive.writestr("Chippytea.app/Contents/MacOS/Chippytea", b"fixture executable")
+        archive.writestr("chippytea.app/Contents/Info.plist", plistlib.dumps(info or app_info()))
+        archive.writestr("chippytea.app/Contents/MacOS/chippytea", b"fixture executable")
         for name, value, mode in entries:
             entry = zipfile.ZipInfo(name)
             entry.create_system = 3
@@ -173,9 +173,9 @@ class AppcastTests(TemporaryTests):
     def test_exact_https_versioned_asset_url_is_required(self):
         for url in ("http://github.com/richiemcilroy/chippytea/releases/download/v0.2.0/a.zip",
                     "https://github.com.evil.test/update.zip",
-                    f"{release.RELEASE_URL}/latest/download/Chippytea-0.2.0-universal.zip",
-                    f"{release.RELEASE_URL}/download/v0.1.0/Chippytea-0.2.0-universal.zip",
-                    f"{release.RELEASE_URL}/download/v0.2.0/Chippytea-0.2.0-universal.zip?x=1"):
+                    f"{release.RELEASE_URL}/latest/download/chippytea-0.2.0-universal.zip",
+                    f"{release.RELEASE_URL}/download/v0.1.0/chippytea-0.2.0-universal.zip",
+                    f"{release.RELEASE_URL}/download/v0.2.0/chippytea-0.2.0-universal.zip?x=1"):
             feed(self.path, mutate=lambda root: root.find("channel/item/enclosure").set("url", url))
             with self.subTest(url=url), self.assertRaises(release.ReleaseError):
                 release.parse_appcast(self.path)
@@ -213,10 +213,10 @@ class AppcastTests(TemporaryTests):
 class ArchiveTests(TemporaryTests):
     def setUp(self):
         super().setUp()
-        self.path = self.root / "Chippytea.zip"
+        self.path = self.root / "chippytea.zip"
 
     def test_framework_symlinks_are_preserved_and_accepted(self):
-        base = "Chippytea.app/Contents/Frameworks/Sparkle.framework"
+        base = "chippytea.app/Contents/Frameworks/Sparkle.framework"
         for target in ("Versions/Current/Sparkle", "versions/current/Sparkle"):
             make_zip(self.path, [
                 (f"{base}/Versions/B/Sparkle", b"library", stat.S_IFREG | 0o755),
@@ -226,8 +226,8 @@ class ArchiveTests(TemporaryTests):
                 release.validate_zip(self.path, "0.2.0")
 
     def test_traversal_absolute_and_unrelated_archive_entries_fail(self):
-        for name in ("../escape", "/tmp/escape", "Chippytea.app/../escape",
-                     "Another.app/file", "Chippytea.app\\..\\escape",
+        for name in ("../escape", "/tmp/escape", "chippytea.app/../escape",
+                     "Another.app/file", "chippytea.app\\..\\escape",
                      "__MACOSX/Other.app/resource"):
             make_zip(self.path, [(name, b"bad", stat.S_IFREG | 0o644)])
             with self.subTest(name=name), self.assertRaises(release.ReleaseError):
@@ -235,36 +235,36 @@ class ArchiveTests(TemporaryTests):
 
     def test_absolute_parent_escaping_and_cyclic_symlinks_fail(self):
         for target in ("/tmp/escape", "../../../../escape", "link"):
-            make_zip(self.path, [("Chippytea.app/Contents/link", target, stat.S_IFLNK | 0o777)])
+            make_zip(self.path, [("chippytea.app/Contents/link", target, stat.S_IFLNK | 0o777)])
             with self.subTest(target=target), self.assertRaises(release.ReleaseError):
                 release.validate_zip(self.path, "0.2.0")
 
     def test_symlink_chain_escape_not_visible_to_normpath_fails(self):
         make_zip(self.path, [
-            ("Chippytea.app/Contents/a", "..", stat.S_IFLNK | 0o777),
-            ("Chippytea.app/Contents/b", "a/../../escape", stat.S_IFLNK | 0o777)])
+            ("chippytea.app/Contents/a", "..", stat.S_IFLNK | 0o777),
+            ("chippytea.app/Contents/b", "a/../../escape", stat.S_IFLNK | 0o777)])
         with self.assertRaisesRegex(release.ReleaseError, "escapes"):
             release.validate_zip(self.path, "0.2.0")
 
     def test_case_and_normalization_folded_symlink_escapes_fail(self):
         for name, reference in (("a", "A"), ("\u00e9", "e\u0301")):
             make_zip(self.path, [
-                (f"Chippytea.app/Contents/{name}", "..", stat.S_IFLNK | 0o777),
-                ("Chippytea.app/Contents/b", f"{reference}/../..", stat.S_IFLNK | 0o777),
-                ("Chippytea.app/Contents/b/escape", b"bad", stat.S_IFREG | 0o644)])
+                (f"chippytea.app/Contents/{name}", "..", stat.S_IFLNK | 0o777),
+                ("chippytea.app/Contents/b", f"{reference}/../..", stat.S_IFLNK | 0o777),
+                ("chippytea.app/Contents/b/escape", b"bad", stat.S_IFREG | 0o644)])
             with self.subTest(name=name), self.assertRaisesRegex(release.ReleaseError, "escapes"):
                 release.validate_zip(self.path, "0.2.0")
 
     def test_special_files_fail(self):
-        make_zip(self.path, [("Chippytea.app/Contents/pipe", b"", stat.S_IFIFO | 0o600)])
+        make_zip(self.path, [("chippytea.app/Contents/pipe", b"", stat.S_IFIFO | 0o600)])
         with self.assertRaisesRegex(release.ReleaseError, "device or socket"):
             release.validate_zip(self.path, "0.2.0")
 
     def test_case_collisions_and_alias_overwrites_fail(self):
         for entries in (
-                [("Chippytea.app/contents/Info.plist", b"replacement", stat.S_IFREG | 0o644)],
-                [("Chippytea.app/Contents/alias", "MacOS", stat.S_IFLNK | 0o777),
-                 ("Chippytea.app/Contents/alias/Chippytea", b"replacement", stat.S_IFREG | 0o755)]):
+                [("chippytea.app/contents/Info.plist", b"replacement", stat.S_IFREG | 0o644)],
+                [("chippytea.app/Contents/alias", "MacOS", stat.S_IFLNK | 0o777),
+                 ("chippytea.app/Contents/alias/chippytea", b"replacement", stat.S_IFREG | 0o755)]):
             make_zip(self.path, entries)
             with self.subTest(entries=entries), self.assertRaises(release.ReleaseError):
                 release.validate_zip(self.path, "0.2.0")

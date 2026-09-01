@@ -233,13 +233,13 @@ def prepare(plan: dict, archives: Path) -> None:
     if previous:
         request["previous_tag_name"] = previous["tag"]
     generated = api(f"repos/{REPOSITORY}/releases/generate-notes", "POST", request)
-    notes = (f"# Chippytea {plan['version']}\n\n"
+    notes = (f"# chippytea {plan['version']}\n\n"
              "Requires macOS 14 or later. Includes Apple silicon and Intel support.\n\n"
              f"{generated['body'].strip()}\n\n"
-             "New installation: open the DMG and drag Chippytea to Applications. "
-             "Existing installation: choose **Check for Updates…** in Chippytea.\n\n"
+             "New installation: open the DMG and drag chippytea to Applications. "
+             "Existing installation: choose **Check for Updates…** in chippytea.\n\n"
              f"<!-- chippytea-source: {plan['sha']} -->\n")
-    (archives / f"Chippytea-{plan['version']}-universal.md").write_text(notes)
+    (archives / f"chippytea-{plan['version']}-universal.md").write_text(notes)
 
 
 def signature_bytes(value: str) -> bytes:
@@ -272,7 +272,7 @@ def parse_appcast(path: Path) -> dict[str, dict]:
         enclosures = item.findall("enclosure")
         require(len(enclosures) == 1, "Each release must have one full update enclosure.")
         enclosure = enclosures[0]
-        expected_url = f"{RELEASE_URL}/download/v{version}/Chippytea-{version}-universal.zip"
+        expected_url = f"{RELEASE_URL}/download/v{version}/chippytea-{version}-universal.zip"
         require(enclosure.get("url") == expected_url,
                 "Update URL must point to its exact versioned GitHub ZIP asset.")
         signature = enclosure.get(SPARKLE + "edSignature", "")
@@ -315,10 +315,10 @@ def safe_member_name(name: str) -> PurePosixPath:
             "Archive contains an invalid path.")
     path = PurePosixPath(name)
     require(not path.is_absolute() and ".." not in path.parts, "Archive path escapes its root.")
-    require(path.parts and path.parts[0] in ("Chippytea.app", "__MACOSX"),
-            "ZIP must contain only Chippytea.app and its resource-fork metadata.")
+    require(path.parts and path.parts[0] in ("chippytea.app", "__MACOSX"),
+            "ZIP must contain only chippytea.app and its resource-fork metadata.")
     if path.parts[0] == "__MACOSX":
-        require(len(path.parts) == 1 or path.parts[1] in ("Chippytea.app", "._Chippytea.app"),
+        require(len(path.parts) == 1 or path.parts[1] in ("chippytea.app", "._chippytea.app"),
                 "ZIP contains unrelated resource-fork metadata.")
     return path
 
@@ -361,7 +361,7 @@ def validate_zip(path: Path, version: str) -> None:
                 while pending:
                     component = pending.pop(0)
                     if component == "..":
-                        require(len(resolved) > 1, "ZIP symlink escapes Chippytea.app.")
+                        require(len(resolved) > 1, "ZIP symlink escapes chippytea.app.")
                         resolved.pop()
                     elif component != ".":
                         resolved.append(component)
@@ -376,8 +376,8 @@ def validate_zip(path: Path, version: str) -> None:
                     require(destination not in resolved_names,
                             "ZIP paths collide through a symlink.")
                     resolved_names.add(destination)
-            info_path = PurePosixPath("Chippytea.app/Contents/Info.plist")
-            executable = PurePosixPath("Chippytea.app/Contents/MacOS/Chippytea")
+            info_path = PurePosixPath("chippytea.app/Contents/Info.plist")
+            executable = PurePosixPath("chippytea.app/Contents/MacOS/chippytea")
             require(info_path in names and executable in names, "ZIP is missing the application.")
             require(archive_path_key(info_path) not in links and
                     archive_path_key(executable) not in links,
@@ -437,7 +437,7 @@ def fetch_tools(destination: Path) -> Path:
 
 def artifact_names(version: str) -> list[str]:
     version_tuple(version)
-    return [f"Chippytea-{version}-universal.zip", f"Chippytea-{version}-universal.dmg",
+    return [f"chippytea-{version}-universal.zip", f"chippytea-{version}-universal.dmg",
             "appcast.xml", "release-notes.md", "release.json"]
 
 
@@ -494,7 +494,7 @@ def publish(plan: dict, directory: Path) -> None:
     if existing:
         release = existing
         api(f"repos/{REPOSITORY}/releases/{release['id']}", "PATCH",
-            {"name": f"Chippytea {plan['version']}", "body": notes, "draft": True})
+            {"name": f"chippytea {plan['version']}", "body": notes, "draft": True})
         # An interrupted run may leave a draft. Replace only this source-bound,
         # unpublished draft's assets, never the currently public release.
         for asset in release["assets"]:
@@ -502,7 +502,7 @@ def publish(plan: dict, directory: Path) -> None:
     else:
         release = api(f"repos/{REPOSITORY}/releases", "POST",
                       {"tag_name": plan["tag"], "target_commitish": plan["sha"],
-                       "name": f"Chippytea {plan['version']}", "body": notes,
+                       "name": f"chippytea {plan['version']}", "body": notes,
                        "draft": True, "prerelease": False, "make_latest": "false"})
     run(["gh", "release", "upload", plan["tag"], "--repo", REPOSITORY,
          *[str(path) for path in files]])

@@ -6,7 +6,7 @@ import Foundation
 let rustLibraryPath = ProcessInfo.processInfo.environment["CHIPPYTEA_RUST_LIB_DIR"] ?? "target/release"
 
 let package = Package(
-    name: "Chippytea",
+    name: "chippytea",
     platforms: [.macOS(.v14)],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.6")
@@ -14,7 +14,7 @@ let package = Package(
     targets: [
         .systemLibrary(name: "ChippyteaCore", path: "native/Bridge"),
         .executableTarget(
-            name: "Chippytea",
+            name: "chippytea",
             dependencies: ["ChippyteaCore", .product(name: "Sparkle", package: "Sparkle")],
             path: "native/Chippytea",
             linkerSettings: [

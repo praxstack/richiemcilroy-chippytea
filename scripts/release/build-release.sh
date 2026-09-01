@@ -121,7 +121,7 @@ if [[ -f "$archives/appcast.xml" ]]; then
     previous_args=(--previous "$work/previous-appcast.xml")
 fi
 
-app="$work/app/Chippytea.app"
+app="$work/app/chippytea.app"
 CHIPPYTEA_ARCHS="arm64 x86_64" \
 CHIPPYTEA_BUILD_VERSION="$version" \
 CHIPPYTEA_BUILD_NUMBER="$version" \
@@ -135,13 +135,13 @@ CARGO_TARGET_DIR="$work/cargo" \
 
 python3 -B scripts/release/release.py validate-plist \
     --plist "$app/Contents/Info.plist" --version "$version"
-lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/Chippytea"
+lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/chippytea"
 # Build-directory overrides also change the scanner's ownership rules. Keep
 # them, along with publishing tokens, out of disposable native test processes.
 env -u GH_TOKEN -u GITHUB_TOKEN -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
-    "$app/Contents/MacOS/Chippytea" --self-test
+    "$app/Contents/MacOS/chippytea" --self-test
 env -u GH_TOKEN -u GITHUB_TOKEN -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
-    "$app/Contents/MacOS/Chippytea" --update-self-test
+    "$app/Contents/MacOS/chippytea" --update-self-test
 codesign --display --verbose=4 "$app" 2>"$work/codesign.txt"
 python3 -B - "$work/codesign.txt" "$APPLE_TEAM_ID" <<'PY'
 import pathlib, sys
@@ -205,7 +205,7 @@ verify_app() {
     codesign --verify --deep --strict --verbose=2 "$1"
     xcrun stapler validate "$1"
     spctl --assess --type execute --verbose=2 "$1"
-    lipo -verify_arch arm64 x86_64 "$1/Contents/MacOS/Chippytea"
+    lipo -verify_arch arm64 x86_64 "$1/Contents/MacOS/chippytea"
     python3 -B scripts/release/release.py validate-plist \
         --plist "$1/Contents/Info.plist" --version "$version"
 }
@@ -215,18 +215,18 @@ notarize "$work/notarization.zip" "$log_dir/notary-app.json"
 xcrun stapler staple "$app"
 verify_app "$app"
 
-zip="$output/Chippytea-$version-universal.zip"
+zip="$output/chippytea-$version-universal.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
 python3 -B scripts/release/release.py validate-zip --archive "$zip" --version "$version"
 mkdir "$work/recovered"
 ditto -x -k "$zip" "$work/recovered"
-verify_app "$work/recovered/Chippytea.app"
+verify_app "$work/recovered/chippytea.app"
 
 mkdir "$work/dmg-root"
-ditto "$app" "$work/dmg-root/Chippytea.app"
+ditto "$app" "$work/dmg-root/chippytea.app"
 ln -s /Applications "$work/dmg-root/Applications"
-dmg="$output/Chippytea-$version-universal.dmg"
-hdiutil create -volname Chippytea -srcfolder "$work/dmg-root" -fs APFS -format ULFO "$dmg"
+dmg="$output/chippytea-$version-universal.dmg"
+hdiutil create -volname chippytea -srcfolder "$work/dmg-root" -fs APFS -format ULFO "$dmg"
 codesign --force --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" --timestamp "$dmg"
 codesign --verify --strict "$dmg"
 notarize "$dmg" "$log_dir/notary-dmg.json"
@@ -237,12 +237,12 @@ mkdir "$work/mounted"
 hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$work/mounted" >"$work/mount.log"
 mounted="$work/mounted"
 [[ -L "$mounted/Applications" && "$(readlink "$mounted/Applications")" == "/Applications" ]]
-verify_app "$mounted/Chippytea.app"
+verify_app "$mounted/chippytea.app"
 hdiutil detach "$mounted"
 mounted=""
 
 cp "$zip" "$archives/"
-cp "$archives/Chippytea-$version-universal.md" "$output/release-notes.md"
+cp "$archives/chippytea-$version-universal.md" "$output/release-notes.md"
 "$sparkle_bin/generate_appcast" --ed-key-file "$ed_key" \
     --versions "$version" --maximum-versions 0 --maximum-deltas 0 \
     --embed-release-notes \
