@@ -28,6 +28,8 @@ PY
 
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/chippytea-release.XXXXXX")"
 keychain="$work/signing.keychain-db"
+keychain_search_list_snapshot="$work/keychain-search-list.json"
+restore_keychain_search_list=0
 mounted=""
 cleanup() {
     status="$?"
@@ -35,8 +37,18 @@ cleanup() {
     if [[ -n "$mounted" ]]; then
         hdiutil detach "$mounted" -force >/dev/null 2>&1 || true
     fi
+    if [[ "$restore_keychain_search_list" == "1" ]]; then
+        if ! python3 -B scripts/release/release.py keychain-search-list restore \
+            --snapshot "$keychain_search_list_snapshot"; then
+            printf 'Failed to restore the user keychain search list; publication is blocked.\n' >&2
+            if [[ "$status" == "0" ]]; then status=1; fi
+        fi
+    fi
     security delete-keychain "$keychain" >/dev/null 2>&1 || true
-    rm -rf -- "$work"
+    if ! rm -rf -- "$work" >/dev/null 2>&1; then
+        printf 'Failed to remove temporary release data.\n' >&2
+        if [[ "$status" == "0" ]]; then status=1; fi
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -81,8 +93,15 @@ elif not os.environ.get("APPLE_ID") or not os.environ.get("APPLE_APP_SPECIFIC_PA
     sys.exit("Provide Apple ID notarization credentials or the complete ASC key set.")
 PY
 
+# A private keychain is not automatically part of certificate-chain lookup.
+# Snapshot before creation and arm restoration before any search-list mutation.
+python3 -B scripts/release/release.py keychain-search-list snapshot \
+    --snapshot "$keychain_search_list_snapshot"
+restore_keychain_search_list=1
 keychain_password="$(openssl rand -hex 32)"
 security create-keychain -p "$keychain_password" "$keychain"
+python3 -B scripts/release/release.py keychain-search-list prepend \
+    --snapshot "$keychain_search_list_snapshot" --keychain "$keychain"
 security set-keychain-settings -lut 21600 "$keychain"
 security unlock-keychain -p "$keychain_password" "$keychain"
 security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" \
