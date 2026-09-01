@@ -899,6 +899,10 @@ func drawAsterisk(_ context: inout GraphicsContext, at center: CGPoint, radius: 
 struct ChipCollectionOverlay: View {
     let amount: UInt64
     var anchorX: CGFloat
+    /// Where the chips land, in the overlay's coordinates: the heap in the wrap.
+    var landing: CGRect
+    /// Where the scrawled "+N" pops in.
+    var tallyOrigin: CGPoint
     @State private var started = Date()
 
     var body: some View {
@@ -928,8 +932,9 @@ struct ChipCollectionOverlay: View {
             guard progress > 0 && progress < 1 else { continue }
             let t = CGFloat(progress)
             let seed = CGFloat((index * 73 + 19) % 101) / 101
-            let end = CGPoint(x: size.width * (0.17 + seed * 0.66), y: size.height * (0.80 + seed * 0.12))
-            let control = CGPoint(x: entry.x + (end.x - entry.x) * (0.15 + seed * 0.35), y: size.height * (0.20 + seed * 0.16))
+            let depth = CGFloat((index * 37 + 11) % 101) / 101
+            let end = CGPoint(x: landing.minX + landing.width * seed, y: landing.minY + landing.height * depth)
+            let control = CGPoint(x: entry.x + (end.x - entry.x) * (0.15 + seed * 0.35), y: end.y * (0.22 + seed * 0.16))
             let here = point(entry, control, end, t)
             let fade = min(1, progress * 9) * min(1, (1 - progress) * 9)
             let chipLength = 17 + seed * 10
@@ -966,7 +971,7 @@ struct ChipCollectionOverlay: View {
         let pop: CGFloat = appear < 1 ? 0.55 + appear * 0.60 : 1 - 0.05 * CGFloat(sin(min(1, (elapsed - 0.36) * 8)))
         var tally = context
         tally.opacity = Double(appear) * Double(1 - leave)
-        tally.translateBy(x: min(size.width - 70, TeaTheme.panelPadding + 108), y: 22)
+        tally.translateBy(x: tallyOrigin.x, y: tallyOrigin.y)
         tally.rotate(by: .degrees(-7))
         tally.scaleBy(x: pop, y: pop)
         let scale: CGFloat = 0.24

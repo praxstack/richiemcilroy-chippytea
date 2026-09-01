@@ -391,6 +391,8 @@ private struct TabButton: View {
 
 // MARK: - Home
 
+/// Home is about the space: what chippytea has saved, what is free, and what
+/// to clean next. The chips sit underneath, the reward for all of it.
 private struct CoinsPage: View {
     @ObservedObject var model: AppModel
     /// Home only ever offers what the engine actually recommends.
@@ -403,51 +405,89 @@ private struct CoinsPage: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                CoinsHero(model: model)
-                nextSteps
+                VStack(alignment: .leading, spacing: 8) {
+                    SavedHeadline(model: model)
+                    if let storage = model.storageStatus {
+                        StorageStrip(model: model, status: storage)
+                    }
+                    InkDivider(seed: 179)
+                    ScreenTitle(text: "Make a bit of room.", seed: 181, font: TeaFont.subtitle)
+                    nextSteps
+                    InkDivider(seed: 185).padding(.top, 4)
+                }
+                .padding(.horizontal, TeaTheme.panelPadding)
+                .padding(.top, 8)
+                ChipsStrip(model: model)
             }
+            .coordinateSpace(name: "home")
         }
         .scrollIndicators(.hidden)
     }
 
     @ViewBuilder private var nextSteps: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let storage = model.storageStatus {
-                StorageStrip(model: model, status: storage)
-                InkDivider(seed: 179)
-            }
-            ScreenTitle(text: "Make a bit of room.", seed: 181, font: TeaFont.subtitle)
-
-            if model.snapshot.roots.isEmpty {
-                ScanEverywhereCTA(model: model, seed: 183)
-            } else if !suggestions.isEmpty {
-                InkCard(padding: 0, seed: 187) {
-                    VStack(spacing: 0) {
-                        ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, item in
-                            SuggestionRow(model: model, candidate: item, seed: 221 + index * 8)
-                            if index < suggestions.count - 1 {
-                                InkDivider(seed: 189 + index * 4).padding(.horizontal, 10)
-                            }
+        if model.snapshot.roots.isEmpty {
+            ScanEverywhereCTA(model: model, seed: 183)
+        } else if !suggestions.isEmpty {
+            InkCard(padding: 0, seed: 187) {
+                VStack(spacing: 0) {
+                    ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, item in
+                        SuggestionRow(model: model, candidate: item, seed: 221 + index * 8)
+                        if index < suggestions.count - 1 {
+                            InkDivider(seed: 189 + index * 4).padding(.horizontal, 10)
                         }
                     }
                 }
-            } else {
-                InkCard(seed: 191) {
-                    HStack(spacing: 10) {
-                        if model.discoveryPresentation.isForeground { MagnifierDoodle(size: 32) } else { MugDoodle(size: 32) }
-                        Text(emptyMessage)
-                            .font(TeaFont.bodySemibold).fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 0)
-                    }
+            }
+        } else {
+            InkCard(seed: 191) {
+                HStack(spacing: 10) {
+                    if model.discoveryPresentation.isForeground { MagnifierDoodle(size: 32) } else { MugDoodle(size: 32) }
+                    Text(emptyMessage)
+                        .font(TeaFont.bodySemibold).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
                 }
             }
         }
-        .padding(.horizontal, TeaTheme.panelPadding)
-        .padding(.top, 12).padding(.bottom, 15)
     }
 }
 
-private struct CoinsHero: View {
+/// The headline of the whole app: space freed for good, measured after each
+/// reviewed cleanup, never estimated. Moving files to Trash is not counted.
+private struct SavedHeadline: View {
+    @ObservedObject var model: AppModel
+    private var saved: UInt64 { model.snapshot.wallet.creditedBytes }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ScreenTitle(text: saved == 0 ? "No space saved yet." : "\(space(saved)) saved.", seed: 175, font: TeaFont.headline)
+                .monospacedDigit()
+            Text(saved == 0
+                 ? "Your first reviewed cleanup lands here."
+                 : "Freed for good by cleanups you reviewed, measured after each one.")
+                .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct StripBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+private struct WrapFrameKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    /// Siblings without the key reduce their default in; only the wrap's frame counts.
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next != .zero { value = next }
+    }
+}
+
+/// Your chips: the wrap beside the hand-lettered count, and the moment they
+/// tumble in from under the tape. Counting and collection state live here.
+private struct ChipsStrip: View {
     @ObservedObject var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var counter: Double = 0
@@ -455,20 +495,22 @@ private struct CoinsHero: View {
     @State private var showHowChipsWork = false
     @State private var presentedCollection: CollectionBurst?
     @State private var previewBurst: CleanupPreview?
+    @State private var stripBottom: CGFloat = 0
+    @State private var wrapFrame: CGRect = .zero
     private var wallet: Wallet { model.snapshot.wallet }
     private var reduced: Bool { model.reduceMotion || systemReduceMotion }
     private var empty: Bool { model.displayedCoinBalance == 0 }
     private var contentVisible: Bool { model.panelVisible && !model.showReview && !model.showDiskAccess }
     private var boiling: Bool { contentVisible && !reduced }
     private var remainingBytes: UInt64 { wallet.fractionalBytes >= 100_000_000 ? 0 : 100_000_000 - wallet.fractionalBytes }
-    private var paperCaption: String {
+    private var caption: String {
         if model.hasCleanupWork {
             if !model.pendingCleanupIncludesPermanent { return "Moving to Trash…" }
             let estimate = model.pendingCleanupCoinEstimate
             if estimate == 0 { return "Space credit pending" }
             return "Up to \(chipsPhrase(estimate)) pending"
         }
-        return empty ? "Your first chip’s still in the fryer." : ""
+        return empty ? "Your first chip’s still in the fryer." : "\(space(remainingBytes)) to your next chip"
     }
     private var balanceAccessibilityLabel: String {
         if model.hasCleanupWork && model.pendingCleanupCoinEstimate > 0 {
@@ -490,85 +532,66 @@ private struct CoinsHero: View {
                                                    visible: contentVisible && model.collection == nil,
                                                    target: model.cleanupPreview?.targetCoins)
         let activeBurstID = model.collection?.id ?? previewBurst?.id
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .bottom, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                ScreenTitle(text: "Your chips.", seed: 199, font: TeaFont.subtitle)
+                Button {
+                    withAnimation(reduced ? nil : .easeInOut(duration: 0.15)) { showHowChipsWork.toggle() }
+                } label: {
+                    Image(systemName: showHowChipsWork ? "info.circle.fill" : "info.circle")
+                        .font(TeaFont.caption)
+                        .foregroundStyle(showHowChipsWork ? TeaTheme.biro : TeaTheme.inkSoft)
+                }
+                .buttonStyle(.plain)
+                .help("How chips work")
+                .accessibilityLabel("How chips work")
+                Spacer(minLength: 0)
+            }
+            HStack(alignment: .center, spacing: 12) {
+                Boiling(active: boiling, replay: model.presentation, event: activeBurstID) { phase in
+                    ChipPortion(chips: model.displayedCoinBalance, landing: boiling && landing, boil: phase, scale: 0.5)
+                        .frame(width: 156, height: 64)
+                        .id(boiling)
+                }
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: WrapFrameKey.self, value: geometry.frame(in: .named("home")))
+                })
+                VStack(alignment: .leading, spacing: 5) {
                     Boiling(active: boiling && activeBurstID != nil, event: activeBurstID) { phase in
-                        AnimatedChipNumber(value: counter, boil: phase)
+                        AnimatedChipNumber(value: counter, digitHeight: 28, boil: phase)
                             // A new identity discards in-flight interpolation
                             // when hidden, motion stops, or a verified target changes.
                             .id(previewAnimation)
                     }
                     .accessibilityElement()
                     .accessibilityLabel(balanceAccessibilityLabel)
-                    Spacer(minLength: 0)
-                }
-
-                Text("your tea, in the paper")
-                    .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
-
-                // The only numbers line on this screen; the rule under it says the same thing again, quietly.
-                HStack(spacing: 5) {
-                    Text("\(space(wallet.creditedBytes)) credited · \(space(remainingBytes)) to your next chip")
+                    Text(caption)
                         .font(TeaFont.caption).monospacedDigit().foregroundStyle(TeaTheme.inkSoft)
                         .lineLimit(1).minimumScaleFactor(0.8)
-                    Button {
-                        withAnimation(reduced ? nil : .easeInOut(duration: 0.15)) { showHowChipsWork.toggle() }
-                    } label: {
-                        Image(systemName: showHowChipsWork ? "info.circle.fill" : "info.circle")
-                            .font(TeaFont.caption)
-                            .foregroundStyle(showHowChipsWork ? TeaTheme.biro : TeaTheme.inkSoft)
-                    }
-                    .buttonStyle(.plain)
-                    .help("How chips work")
-                    .accessibilityLabel("How chips work")
-                    Spacer(minLength: 0)
+                    ChipProgressMeter(fraction: Double(wallet.fractionalBytes) / 100_000_000)
                 }
-                .padding(.top, 9)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("\(space(wallet.creditedBytes)) credited. \(space(remainingBytes)) to your next chip.")
-
-                if showHowChipsWork {
-                    HowChipsWorkSlip {
-                        withAnimation(reduced ? nil : .easeInOut(duration: 0.15)) { showHowChipsWork = false }
-                    }
-                    .transition(reduced ? .opacity : .opacity.combined(with: .move(edge: .top)))
-                }
-
-                ChipProgressMeter(fraction: Double(wallet.fractionalBytes) / 100_000_000)
-                    .padding(.top, 5)
-
-                collectAction
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, TeaTheme.panelPadding)
-            .padding(.top, 6)
-
-            VStack(spacing: 3) {
-                Boiling(active: boiling, replay: model.presentation, event: activeBurstID) { phase in
-                    ChipPortion(chips: model.displayedCoinBalance, landing: boiling && landing, boil: phase)
-                        .frame(height: 104)
-                        .id(boiling)
+            collectAction
+            if showHowChipsWork {
+                HowChipsWorkSlip {
+                    withAnimation(reduced ? nil : .easeInOut(duration: 0.15)) { showHowChipsWork = false }
                 }
-                Text(paperCaption)
-                    .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
-                    .lineLimit(1).minimumScaleFactor(0.85)
-                    .frame(height: 14)
-                    .accessibilityHidden(paperCaption.isEmpty)
+                .transition(reduced ? .opacity : .opacity.combined(with: .move(edge: .top)))
             }
-            .padding(.top, 8)
         }
+        .padding(.horizontal, TeaTheme.panelPadding)
+        .padding(.top, 10).padding(.bottom, 15)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay {
-            if let burst = model.collection {
-                if boiling && burst.showsParticles {
-                    ChipCollectionOverlay(amount: burst.amount, anchorX: model.anchorX).id(burst.id)
-                }
-            } else if let preview = previewBurst, preview.id == model.cleanupPreview?.id,
-                      preview.targetCoins == model.cleanupPreview?.targetCoins,
-                      model.cleanupPreview?.presentationFinished == false,
-                      preview.targetCoins > preview.from, boiling {
-                ChipCollectionOverlay(amount: preview.targetCoins - preview.from, anchorX: model.anchorX).id(preview.id)
-            }
+        .background(GeometryReader { geometry in
+            Color.clear.preference(key: StripBottomKey.self, value: geometry.frame(in: .named("home")).maxY)
+        })
+        .onPreferenceChange(WrapFrameKey.self) { wrapFrame = $0 }
+        .onPreferenceChange(StripBottomKey.self) { stripBottom = $0 }
+        .overlay(alignment: .bottom) {
+            // The chips tumble in from under the tape: the overlay reaches back
+            // up to the top of the page and lands them in the wrap's heap.
+            burst.frame(height: max(stripBottom, 1))
         }
         .onAppear { counter = Double(model.collection?.from ?? model.cleanupPreview?.from ?? model.displayedCoinBalance) }
         .onDisappear {
@@ -659,6 +682,25 @@ private struct CoinsHero: View {
         }
     }
 
+    /// The burst lands in the heap of the wrap; the "+N" scrawl pops in on the
+    /// title row, to the right of "Your chips."
+    @ViewBuilder private var burst: some View {
+        let landing = CGRect(x: wrapFrame.minX + 40, y: wrapFrame.minY + 22, width: 76, height: 16)
+        let tally = CGPoint(x: TeaTheme.panelWidth - 92, y: max(0, wrapFrame.minY - 32))
+        if let burst = model.collection {
+            if boiling && burst.showsParticles {
+                ChipCollectionOverlay(amount: burst.amount, anchorX: model.anchorX, landing: landing, tallyOrigin: tally)
+                    .id(burst.id)
+            }
+        } else if let preview = previewBurst, preview.id == model.cleanupPreview?.id,
+                  preview.targetCoins == model.cleanupPreview?.targetCoins,
+                  model.cleanupPreview?.presentationFinished == false,
+                  preview.targetCoins > preview.from, boiling {
+            ChipCollectionOverlay(amount: preview.targetCoins - preview.from, anchorX: model.anchorX, landing: landing, tallyOrigin: tally)
+                .id(preview.id)
+        }
+    }
+
     private func settleCollection(_ burst: CollectionBurst) {
         settleBalance(model.displayedCoinBalance)
         model.finishCollection(id: burst.id)
@@ -691,7 +733,7 @@ private struct CoinsHero: View {
                 .buttonStyle(InkButtonStyle(kind: .primary, fullWidth: true, compact: true, seed: 205))
                 .disabled(model.busy || model.collection != nil)
                 .accessibilityHint("Adds chips you have already earned to your paper. Does not remove any files.")
-                .padding(.top, 10)
+                .padding(.top, 4)
         }
     }
 }
