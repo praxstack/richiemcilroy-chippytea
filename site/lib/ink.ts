@@ -156,12 +156,6 @@ export function roundedRectSamples(
   return points;
 }
 
-/// One fish is a thousand chips — the full supper.
-export function fishAndChips(totalChips: number): { fish: number; chips: number } {
-  const total = Math.max(0, Math.floor(totalChips));
-  return { fish: Math.floor(total / 1000), chips: total % 1000 };
-}
-
 /// "1.2 GB" / "300 MB" — decimal units, the way the app writes sizes.
 export function space(bytes: number): string {
   if (bytes >= 1e9) {

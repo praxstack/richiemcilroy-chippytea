@@ -83,9 +83,9 @@ export default function Page() {
             <details className="mt-4 text-[12.5px] leading-[1.55] text-ink-soft">
               <summary className="cursor-pointer font-medium text-ink">About the chip counter</summary>
               <p className="mb-[7px] mt-2">
-                The fish and chips are a decorative counter for credited cleanup.
-                Eligible permanent cleanup adds one chip per 100&nbsp;MB of conservatively
-                credited space. Smaller amounts carry forward, and a thousand chips is shown as a fish.
+                The chips are a decorative counter for space saved. Eligible permanent
+                cleanup adds one chip per 100&nbsp;MB of conservatively credited space.
+                Smaller amounts carry forward.
               </p>
               <p className="m-0">
                 Chips stay on your Mac and have no monetary value. Moving files to Trash

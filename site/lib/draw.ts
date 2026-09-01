@@ -12,9 +12,8 @@ import {
   lineSamples,
   arcSamples,
   roundedRectSamples,
-  fishAndChips,
 } from "./ink";
-import { fishBodyPoints, letterStrokes, handWordWidth, glyphStrokes, glyphAdvance } from "./art";
+import { letterStrokes, handWordWidth, glyphStrokes, glyphAdvance } from "./art";
 
 type Ctx = CanvasRenderingContext2D;
 
@@ -77,48 +76,6 @@ export function paintChip(ctx: Ctx, cx: number, cy: number, length: number, seed
   shine.moveTo(rx + length * 0.15, ry + thickness * 0.3);
   shine.quadraticCurveTo(rx + length * 0.28, ry + thickness * 0.12, rx + length * 0.42, ry + thickness * 0.24);
   stroke(ctx, shine, "rgba(255, 255, 255, 0.8)", Math.max(0.9, thickness * 0.15));
-}
-
-// MARK: - The fish
-
-/// The battered fish in its 64 × 44 design box; scale the context first.
-export function paintFish(ctx: Ctx, seed: number, steam = true) {
-  if (steam) {
-    const wisps: Pt[][] = [
-      [{ x: 30, y: 9 }, { x: 33, y: 5 }, { x: 29, y: 1 }],
-      [{ x: 40, y: 8 }, { x: 43, y: 4 }, { x: 40, y: 1 }],
-    ];
-    wisps.forEach((wisp, index) => {
-      stroke(ctx, handPath2D(wisp, false, 0.5, seed + index), inkA(0.38), 1.3);
-    });
-  }
-  const body = handPath2D(fishBodyPoints, true, 1.1, seed);
-  ctx.fillStyle = tea.gold;
-  ctx.fill(body);
-  ctx.save();
-  ctx.clip(body);
-  const lines = new Path2D();
-  let x = -30;
-  while (x < 64) {
-    lines.moveTo(x + inkNoise(Math.floor(x), seed) * 0.9, 44);
-    lines.quadraticCurveTo(x + 13, 25 + inkNoise(Math.floor(x) + 7, seed) * 2, x + 30, 6);
-    x += 4.2;
-  }
-  stroke(ctx, lines, goldDeepA(0.32), 1);
-  ctx.restore();
-  stroke(ctx, body, tea.ink, 1.7);
-  stroke(ctx, handPath2D([{ x: 49, y: 21 }, { x: 56, y: 15 }], false, 0.4, seed + 3), inkA(0.7), 1.1);
-  stroke(ctx, handPath2D([{ x: 49, y: 27 }, { x: 56, y: 33 }], false, 0.4, seed + 4), inkA(0.7), 1.1);
-  stroke(ctx, handPath2D([{ x: 17, y: 19 }, { x: 19, y: 24 }, { x: 17, y: 29 }], false, 0.5, seed + 5), inkA(0.55), 1.1);
-  ctx.fillStyle = tea.ink;
-  ctx.beginPath();
-  ctx.ellipse(12, 22, 1.8, 1.8, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = tea.card;
-  ctx.beginPath();
-  ctx.ellipse(11.45, 21.45, 0.55, 0.55, 0, 0, Math.PI * 2);
-  ctx.fill();
-  stroke(ctx, handPath2D([{ x: 22, y: 36 }, { x: 24, y: 39 }, { x: 26, y: 36 }], false, 0.4, seed + 6), inkA(0.5), 1.1);
 }
 
 // MARK: - Hand lettering
@@ -231,33 +188,25 @@ export function drawGlyph(
   }
 }
 
-/// The balance line: "0 fish 958 chips" — digits drawn like a felt-tip, the
-/// denominations written out in ink on the same baseline.
+/// The balance line: "958 chips" — digits drawn like a felt-tip, the unit
+/// written out in ink on the same baseline.
 export function paintBalance(ctx: Ctx, value: number, digitHeight: number, boil: number) {
-  const order = fishAndChips(value);
-  const fishDigits = [...String(order.fish)].map(Number);
-  const chipDigits = [...String(order.chips)].map(Number);
+  const total = Math.max(0, Math.floor(value));
+  const digits = [...String(total)].map(Number);
+  const word = total === 1 ? "chip" : "chips";
   const scale = digitHeight / 92;
-  const wordHeight = 18;
-  const wordScale = wordHeight / 92;
+  const wordScale = (18 * Math.min(1, digitHeight / 42)) / 92;
   const cell = glyphAdvance * scale;
   const gap = 7;
   let penX = 3;
   const baseline = 4 + 87 * scale;
   const wordY = baseline - 70 * wordScale;
-  fishDigits.forEach((digit, index) => {
-    drawGlyph(ctx, digit, penX, 4, scale, 900 + index * 31 + digit * 7 + boil * 13);
-    penX += cell;
-  });
-  penX += gap;
-  paintHandWord(ctx, "fish", penX, wordY, wordScale, tea.ink, 530 + boil * 9);
-  penX += handWordWidth("fish") * wordScale + gap * 2;
-  chipDigits.forEach((digit, index) => {
+  digits.forEach((digit, index) => {
     drawGlyph(ctx, digit, penX, 4, scale, 700 + index * 31 + digit * 7 + boil * 13);
     penX += cell;
   });
   penX += gap;
-  paintHandWord(ctx, "chips", penX, wordY, wordScale, tea.ink, 560 + boil * 9);
+  paintHandWord(ctx, word, penX, wordY, wordScale, tea.ink, 560 + boil * 9);
 }
 
 // MARK: - The wrap
@@ -285,13 +234,11 @@ const wrapRows: { count: number; lift: number; spread: number; length: number }[
   { count: 1, lift: 42, spread: 0.0, length: 30 },
 ];
 
-/// The open paper wrap with its heap of chips and a pinch of salt. At most two
-/// fish and eighteen chips are rendered, however large the balance grows.
+/// The open paper wrap with its heap of chips and a pinch of salt. At most
+/// eighteen chips are rendered, however large the balance grows.
 export function paintWrap(ctx: Ctx, width: number, height: number, totalChips: number, boil: number) {
   const baseY = height * 0.66;
-  const order = fishAndChips(totalChips);
-  const fishDrawn = Math.min(order.fish, 2);
-  const drawn = Math.min(order.chips, 18);
+  const drawn = Math.min(Math.max(0, Math.floor(totalChips)), 18);
   const seed = 200 + boil * 7;
 
   // The wrap behind the heap: unfolded paper, corners poking up.
@@ -334,27 +281,13 @@ export function paintWrap(ctx: Ctx, width: number, height: number, totalChips: n
     1
   );
 
-  if (fishDrawn === 0 && drawn === 0) {
+  if (drawn === 0) {
     ctx.save();
     ctx.translate(width / 2, baseY - 8);
     ctx.rotate((-9 * Math.PI) / 180);
     paintChip(ctx, 0, 0, 40, seed + 3, true);
     ctx.restore();
   } else {
-    // The supper's fish lie in the wrap first, so the chips heap over them.
-    for (let index = 0; index < fishDrawn; index++) {
-      ctx.save();
-      const placement = index === 0
-        ? { x: width * 0.38, y: baseY - 26, angle: -8 }
-        : { x: width * 0.63, y: baseY - 18, angle: 7 };
-      ctx.translate(placement.x, placement.y);
-      ctx.rotate((placement.angle * Math.PI) / 180);
-      const fishScale = 30 / 44;
-      ctx.scale(fishScale, fishScale);
-      ctx.translate(-32, -22);
-      paintFish(ctx, seed + 60 + index * 9, false);
-      ctx.restore();
-    }
     const slots: { x: number; y: number; length: number; index: number }[] = [];
     let order2 = 0;
     wrapRows.forEach((row, rowIndex) => {
