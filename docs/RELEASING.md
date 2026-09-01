@@ -83,9 +83,17 @@ be manufactured by the build; an authorized Apple Developer account must
 supply them.
 
 The signing certificate is imported into a temporary keychain. Signing and
-notarization refer to that keychain explicitly; the workflow does not select
-a new default keychain or replace the user's keychain search list. A cleanup trap removes the
-keychain and temporary secret files even if the build fails.
+notarization refer to that keychain explicitly. The workflow temporarily
+prepends it to the user's keychain search list while preserving every original
+entry and its order; the default keychain and trust settings are unchanged.
+A cleanup trap restores and verifies the original search list before removing
+the temporary keychain and secret files. Failure to restore the list or remove
+temporary files blocks publication. Use the isolated GitHub-hosted runner;
+do not run alongside processes that change the same user's keychain search list.
+
+Before compiling, the workflow resolves the exact valid Developer ID identity
+and tests timestamped signing on a disposable executable. Failure diagnostics
+report fixed categories without exposing raw identity listings or signing logs.
 
 ### Preserve the Sparkle key
 
