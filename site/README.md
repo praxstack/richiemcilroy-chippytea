@@ -12,9 +12,17 @@ bun run dev
 
 `bun run build` checks the production build. `bun run start` serves it locally.
 
+With Node 22.22 or newer, run `node --test tests/download.test.mjs` to check release selection and failure handling. CI runs these tests before building the site.
+
 Dependency updates are currently manual. As of 1 September 2026, Dependabot cannot read the version 2 `bun.lock` written by Bun 1.4. Keep the lockfile committed and verify updates with a frozen install and production build.
 
-The public download link should only point to a published, verified release. Until then, the primary button points to the source-build instructions.
+## Download routing
+
+The **Download for Mac** button calls `/download`. It checks the latest stable GitHub release and redirects only to its exact uploaded, nonempty `Chippytea-<version>-universal.dmg`. It rejects drafts, prereleases, duplicate installers, and unexpected download URLs. Both valid links and unavailable results are cached server-side, with a five-minute revalidation interval. A previous result may be served while the cache refreshes. GitHub requests time out after eight seconds.
+
+If no valid installer is available, the route returns a `503` page with retry, release, and source-build links. The homepage also keeps a **Build from source** link. A working website does not by itself mean a signed, notarized app has been published.
+
+Production hosting needs a Next.js runtime for `/download`, not a static-only export. Build from a fresh checkout or reviewed public-source snapshot, without local `.env`, `.next`, `.vercel`, or soundtrack files. Include the root `LICENSE` when packaging a site-only snapshot.
 
 ## The illustrated demo
 
