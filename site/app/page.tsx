@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { ShopSign, Underlined, Dash, Rule } from "@/components/art";
 import { InkBox } from "@/components/InkBox";
 import { DemoPanel } from "@/components/DemoPanel";
-import { MusicPlayer } from "@/components/MusicPlayer";
+import { Karaoke } from "@/components/Karaoke";
 
 const GITHUB = "https://github.com/richiemcilroy/chippytea";
 const BUILD = `${GITHUB}#build-and-run`;
@@ -60,6 +60,11 @@ export default function Page() {
                 <span>No account, no telemetry, nothing deleted on its own.</span>
               </div>
             </div>
+            {hasSoundtrack ? (
+              <div className="mt-8">
+                <Karaoke />
+              </div>
+            ) : null}
           </div>
 
           <div className="flex w-full flex-col items-center">
@@ -108,8 +113,6 @@ export default function Page() {
           </a>
         </div>
       </footer>
-
-      {hasSoundtrack ? <MusicPlayer /> : null}
     </div>
   );
 }
