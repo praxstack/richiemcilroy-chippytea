@@ -187,7 +187,7 @@ Sources: [XNU listing subset](https://github.com/apple-oss-distributions/xnu/blo
 [dua's minimal and full masks](https://github.com/Byron/dua-cli/blob/48109fe7af6c855dd80435473fdd841717bd16b3/crates/dua-lib/src/macos/attributes.rs#L26).
 
 An isolated 8 KiB minimal-mask prototype was slower than libc names on both
-audited fixture topologies; its measurements are in [PERFORMANCE.md](PERFORMANCE.md#current-directory-traversal-follow-up).
+audited fixture topologies; its measurements are in [PERFORMANCE.md](PERFORMANCE.md#historical-directory-traversal-follow-up).
 It is not part of the engine. Fewer public API calls do not imply fewer kernel
 operations: libc buffers names and can receive an EOF flag with its initial read,
 whereas bulk enumeration requires a later zero-result call. XNU can also emulate
