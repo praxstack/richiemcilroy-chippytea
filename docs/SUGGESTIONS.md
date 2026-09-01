@@ -1,6 +1,6 @@
 # Recommendation policy
 
-Chippytea indexes observations separately from the suggestions shown in the app. An indexed path is not a recommendation or permission to remove it. The public snapshot contains at most 500 completed, eligible suggestions; the coin screen uses the first three in the same order.
+chippytea indexes observations separately from the suggestions shown in the app. An indexed path is not a recommendation or permission to remove it. The public snapshot contains at most 500 completed, eligible suggestions; the coin screen uses the first three in the same order.
 
 ## What earns a place in the list
 

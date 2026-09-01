@@ -243,7 +243,7 @@ python3 scripts/benchmark-suggestions.py /private/tmp/chippytea-bun-512 \
   --output benchmarks/local/bun-512-comparison
 ```
 
-The fixture and output paths must be new; existing directories are refused. For the smaller case use 128 members and 1,024 KiB. Omit `--lock-format bun` to create the npm control. The OSS review supported retaining bounded, descriptor-relative traversal; see the pinned references in [REFERENCE-STUDY.md](REFERENCE-STUDY.md) and the [ncdu 2.9.2 source](https://dev.yorhel.nl/download/ncdu-2.9.2.tar.gz). These measurements do not compare Chippytea with those tools.
+The fixture and output paths must be new; existing directories are refused. For the smaller case use 128 members and 1,024 KiB. Omit `--lock-format bun` to create the npm control. The OSS review supported retaining bounded, descriptor-relative traversal; see the pinned references in [REFERENCE-STUDY.md](REFERENCE-STUDY.md) and the [ncdu 2.9.2 source](https://dev.yorhel.nl/download/ncdu-2.9.2.tar.gz). These measurements do not compare chippytea with those tools.
 
 ### Lower first-parse memory for Bun locks
 
@@ -372,7 +372,7 @@ A separate native GUI check used an isolated library and generated artifacts. It
 Run the focused disposable regression after building the app:
 
 ```sh
-build/Chippytea.app/Contents/MacOS/Chippytea \
+build/chippytea.app/Contents/MacOS/chippytea \
   --access-flow-test --background-cleanup-regression
 ```
 
@@ -517,7 +517,7 @@ python3 scripts/benchmark-snapshot-decoding.py \
   --output benchmarks/local/snapshot-decoding-comparison
 ```
 
-For the native comparison, run `scripts/benchmark-native-maintenance.py --app /path/to/Chippytea.app --core-archive /path/to/linked/libchippytea_core.a --output benchmarks/local/native-comparison-run` once per invocation, with a new output directory each time. Use one first pair followed by four alternating warm pairs of the before and after signed bundles. The harness preserves its fixture, input audit, journal proof, screenshots and raw timings.
+For the native comparison, run `scripts/benchmark-native-maintenance.py --app /path/to/chippytea.app --core-archive /path/to/linked/libchippytea_core.a --output benchmarks/local/native-comparison-run` once per invocation, with a new output directory each time. Use one first pair followed by four alternating warm pairs of the before and after signed bundles. The harness preserves its fixture, input audit, journal proof, screenshots and raw timings.
 
 - Before bridge: `00c3c7801efd630e60365507b81aa68ff115cd2e85f796cf568f3ef6e9e15ed4`.
 - After bridge: `624f06aa6d36d3e186b7c9d26abeb714afa7347b35a0628266980d63f5c4d33f`.
@@ -697,7 +697,7 @@ Raw traces can contain private paths and process environment. They remain in ign
 
 The native fix addresses another way maintenance could appear to be a slowly continuing scan. Forgetting a grant invalidates the full-scan summary, but Swift previously substituted cumulative counters, including work from the removed root. After restart it could instead label one stored scope as the full scan. A missing summary now displays “No saved scan,” and raw diagnostics no longer trigger UI invalidation. Pending requests, active controls, errors and independently derived coverage warnings still publish. Layout and artwork are unchanged.
 
-The regression is available through `Chippytea --access-flow-test --forget-summary-regression`; the full access-flow gate includes it too. It uses disposable files and real native grant actions, scoped Rust maintenance and engine reopening. It must preserve the distinction between a 21-entry full scan, cumulative diagnostic counts of 23 then 25, two restored scope entries, and a later explicit four-entry scan. No full-root repair is scheduled to manufacture the restart result.
+The regression is available through `chippytea --access-flow-test --forget-summary-regression`; the full access-flow gate includes it too. It uses disposable files and real native grant actions, scoped Rust maintenance and engine reopening. It must preserve the distinction between a 21-entry full scan, cumulative diagnostic counts of 23 then 25, two restored scope entries, and a later explicit four-entry scan. No full-root repair is scheduled to manufacture the restart result.
 
 With the same new test, the old production code fails at the post-forget presentation assertion. The candidate passes both native disposable gates, including all 18 files and the empty ledger in the new regression. Twenty no-summary raw updates reach observers with zero UI notifications; incomplete coverage, recovery and changed errors are verified separately through the real snapshot application path. These are publication checks, not frame-time or CPU benchmarks. The cleanup integration also passes native Trash, restore, permanent cleanup and reward persistence across restart, crediting 276,828,160 disposable bytes and two coins.
 
@@ -724,7 +724,7 @@ The ordinary-build comparison uses the same Rust archive and protocol-2 native m
 
 All twelve invocations passed, including the two separately recorded first runs. Median CPU increased **4.5%**, about 6 ms over eight seconds. This series does **not** demonstrate a native CPU reduction. Different observed transitions mean equal scope coverage did not produce equal UI update counts; the measurements cannot isolate the navigation boundary's CPU effect. The supported improvement is less repeated view work. No full-scan, idle-CPU or general app speedup is claimed.
 
-Order alternates, p95 is nearest rank and therefore the maximum of five warm samples, first invocations are not controlled cold-cache measurements, and RSS includes setup. No other Chippytea process, build, test or profiler ran during timing. Each report's app, archive, runner and shared-helper hashes were checked. Reproduce each invocation with `scripts/benchmark-native-maintenance.py --app /path/to/signed/Chippytea.app --core-archive /path/to/exact-linked/libchippytea_core.a --output benchmarks/local/new-comparison`, using identical benchmark sources in both builds. The baseline executable is `a82d7968fcfedb7fe976afbb330004ffc9392290b7d9c3d87627661ec18d9ac6`; the candidate is `a994577be2410869c1abda79bb840fbdd23343bfa8750ce2f8a0ba86744c1ea4`. Both link archive `894ccaacb89b4f0278c9ec40c57098ead201a6febef798baf1e5e7f42f3f44ef`.
+Order alternates, p95 is nearest rank and therefore the maximum of five warm samples, first invocations are not controlled cold-cache measurements, and RSS includes setup. No other chippytea process, build, test or profiler ran during timing. Each report's app, archive, runner and shared-helper hashes were checked. Reproduce each invocation with `scripts/benchmark-native-maintenance.py --app /path/to/signed/chippytea.app --core-archive /path/to/exact-linked/libchippytea_core.a --output benchmarks/local/new-comparison`, using identical benchmark sources in both builds. The baseline executable is `a82d7968fcfedb7fe976afbb330004ffc9392290b7d9c3d87627661ec18d9ac6`; the candidate is `a994577be2410869c1abda79bb840fbdd23343bfa8750ce2f8a0ba86744c1ea4`. Both link archive `894ccaacb89b4f0278c9ec40c57098ead201a6febef798baf1e5e7f42f3f44ef`.
 
 Both native disposable modes passed on those exact candidate bytes. Permanent cleanup credited 276,828,160 bytes and earned two coins through restart. Cleanup acknowledgment was 0.045 ms and the maximum main-actor heartbeat gap was 30.174 ms; these are individual integration observations. The unchanged Rust engine retains the preceding pass's 239-test, formatting and Clippy validation. A separate normal-app GUI check exercised all four tabs, category and text filters, clearing search, Keep and Include again. The list count and global badge changed correctly in both directions, and the restored finding retained the notebook layout. Every disposable file identity/content and all five accounting tables were unchanged. No cleanup ran through this manual GUI check. Exact provenance, profiles, all samples, native logs and screenshots remain under ignored `benchmarks/local/native-ui-updates`.
 
@@ -755,10 +755,10 @@ The new native maintenance runner opens Find space on a guarded disposable libra
 
 All twelve invocations passed, including the two separately recorded first runs. **Native CPU increased 25.8% in this small series** despite the separate Rust statement saving. The absolute difference is about 31 ms over eight seconds. More model UI invalidations occurred in the candidate series. Source inspection points to observed scanning-state edges under these fixed inputs; the next profile should count those transitions directly. Equal scope coverage does not guarantee equal sampling of gaps between workers. This is a reason to profile view updates, not evidence that every invalidation renders a frame or that suppressing truthful control updates is safe. The poll fix is retained for correctness. No full-scan, idle-CPU or general native speedup is claimed.
 
-The native inputs contain one unchanged positive artifact and one changing ownership file, with ten examined entries in the initial Suggestions pass. Each invocation gets fresh identities and preserves its own initial proof. Both sides use the same benchmark code; the production differences are the Rust statement reuse and native polling fix. Order alternates, p95 is nearest rank, setup warms caches, and RSS includes setup. The measured window excludes Python writer CPU, post-endpoint audits and the quiet tail. Counts are model notifications, not compositor frames or event callbacks. No other Chippytea process, build, test or profiler ran during the comparison.
+The native inputs contain one unchanged positive artifact and one changing ownership file, with ten examined entries in the initial Suggestions pass. Each invocation gets fresh identities and preserves its own initial proof. Both sides use the same benchmark code; the production differences are the Rust statement reuse and native polling fix. Order alternates, p95 is nearest rank, setup warms caches, and RSS includes setup. The measured window excludes Python writer CPU, post-endpoint audits and the quiet tail. Counts are model notifications, not compositor frames or event callbacks. No other chippytea process, build, test or profiler ran during the comparison.
 
 ```sh
-python3 scripts/benchmark-native-maintenance.py --app /path/to/signed/Chippytea.app \
+python3 scripts/benchmark-native-maintenance.py --app /path/to/signed/chippytea.app \
   --core-archive /path/to/exact-linked/libchippytea_core.a \
   --output benchmarks/local/new-maintenance-comparison
 ```
@@ -1001,7 +1001,7 @@ Timing ends at final main-actor snapshot delivery, before final presentation ass
 
 ```sh
 python3 scripts/benchmark-native-scan.py /private/tmp/chippytea-workspace-example \
-  --app build/Chippytea.app --output benchmarks/local/native-workspace-example
+  --app build/chippytea.app --output benchmarks/local/native-workspace-example
 ```
 
 Use a fresh fixture or its existing synthetic library with the same synthetic balance. Expected positive paths come from the workspace fixture marker, or repeated `--expected-eligible` arguments. A negative control requires `--expect-no-findings` explicitly. Profiling must run separately from timing.
@@ -1061,19 +1061,19 @@ The directory-only gain is modest. The removed pathname lookup is partly offset 
 
 A separate read-only C prototype compared libc names with minimal `getattrlistbulk` attributes and an 8 KiB buffer, sharing directory validation and exact audited coverage. Five alternating pairs on each fixture retained every invocation, including the first. Median wall time was 1.43/1.57 seconds for the directory-heavy fixture and 0.44/1.93 seconds for the million-file fixture, names/minimal-bulk respectively. That configuration was slower on both topologies and was not adopted. This is a bounded reader experiment, not production scanner timing, proof of permission behavior or a conclusion about every possible bulk configuration. Source, commands and raw observations remain in `benchmarks/local/directory-traversal/minimal-probe`.
 
-Full metadata scanning benefits more from removing unused reader setup. The independent fixture audit matched **1,016,001 entries, 1,008,000 files, 8,001 directories and 32,768,000 allocated bytes**. Every Chippytea run reported exact entry/file counts, complete coverage and zero errors. The following are sequential tool groups, each with one first invocation and three warm invocations; the preserved baseline was run afterward on the same unchanged fixture. p95 is nearest rank, and RSS covers all four invocations.
+Full metadata scanning benefits more from removing unused reader setup. The independent fixture audit matched **1,016,001 entries, 1,008,000 files, 8,001 directories and 32,768,000 allocated bytes**. Every chippytea run reported exact entry/file counts, complete coverage and zero errors. The following are sequential tool groups, each with one first invocation and three warm invocations; the preserved baseline was run afterward on the same unchanged fixture. p95 is nearest rank, and RSS covers all four invocations.
 
 | Full metadata workload | Workers | First invocation | Warm p95 | CPU p95 | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Chippytea raw traversal, before | 1 | 2,970.952 ms | 2,014.386 ms | 1.990 s | 2.766 MiB |
-| Chippytea raw traversal, current | 1 | 7,814.148 ms | 1,781.483 ms | 1.770 s | 2.656 MiB |
-| Chippytea metadata discovery, before | 1 | 5,217.529 ms | 4,465.480 ms | 4.420 s | 3.984 MiB |
-| Chippytea metadata discovery, current | 1 | 4,603.918 ms | 3,330.238 ms | 3.300 s | 3.859 MiB |
+| chippytea raw traversal, before | 1 | 2,970.952 ms | 2,014.386 ms | 1.990 s | 2.766 MiB |
+| chippytea raw traversal, current | 1 | 7,814.148 ms | 1,781.483 ms | 1.770 s | 2.656 MiB |
+| chippytea metadata discovery, before | 1 | 5,217.529 ms | 4,465.480 ms | 4.420 s | 3.984 MiB |
+| chippytea metadata discovery, current | 1 | 4,603.918 ms | 3,330.238 ms | 3.300 s | 3.859 MiB |
 | Apple du | 1 | 5,526.909 ms | 5,715.358 ms | 5.700 s | 2.703 MiB |
 | dua 2.44.0 | 4 | 1,323.164 ms | 1,410.551 ms | 5.530 s | 11.703 MiB |
 | dust 1.2.5 | 4 | 3,839.829 ms | 3,948.427 ms | 15.090 s | 397.906 MiB |
 
-The current metadata-discovery observations used about **25% less CPU time** and completed about **25% sooner** at warm p95. Raw traversal used about 11% less CPU time. dua remains faster than Chippytea's single worker on this workload, at higher aggregate CPU cost. Raw traversal is the equivalent inventory comparison; discovery also checks project evidence and recommendation policy. All tools received the same audited root. dua's statistics matched 1,016,000 entries excluding the root, and its total allocation matched 32,768,000 bytes. du and dust also reported that allocation but expose no comparable entry count in these commands. This does not prove every tool visited identical paths. The harness now parses dua's aggregate total instead of its first child row; original local timing reports remain unchanged, with corrected extraction recorded separately.
+The current metadata-discovery observations used about **25% less CPU time** and completed about **25% sooner** at warm p95. Raw traversal used about 11% less CPU time. dua remains faster than chippytea's single worker on this workload, at higher aggregate CPU cost. Raw traversal is the equivalent inventory comparison; discovery also checks project evidence and recommendation policy. All tools received the same audited root. dua's statistics matched 1,016,000 entries excluding the root, and its total allocation matched 32,768,000 bytes. du and dust also reported that allocation but expose no comparable entry count in these commands. This does not prove every tool visited identical paths. The harness now parses dua's aggregate total instead of its first child row; original local timing reports remain unchanged, with corrected extraction recorded separately.
 
 Twenty cancellation runs on the directory-heavy fixture all reported partial cancellation with zero errors. Whole-process wall time minus the requested 40 ms delay was **9.064 ms p95** and **13.010 ms maximum**, including launch, timer scheduling and shutdown. This is an upper bound, not native button latency or a bound on a blocked filesystem operation.
 
@@ -1120,7 +1120,7 @@ The fixed comparison fixture contains **1,001,106 entries**: one million empty o
 
 On this fixture, warm p95 is **5.7 times faster**, with **83% less CPU time** and slightly lower memory. Both versions examined the same entry count and returned the same 104,857,600-byte opportunity. The new version omitted full metadata for 1,000,002 ordinary files. Its byte totals describe measured entries; they are not a whole-folder disk-usage total.
 
-The harness alternates baseline/candidate order each round and records exact binary and harness hashes. These are whole-process readings from `/usr/bin/time -l`. Creation and the initial audit warm caches; neither first invocation is a controlled cold-cache result. p95 uses nearest rank, which is the largest of five warm observations here. These measurements establish a local improvement over the previous Chippytea discovery algorithm, not superiority over exhaustive inventory tools or a guarantee for every directory topology.
+The harness alternates baseline/candidate order each round and records exact binary and harness hashes. These are whole-process readings from `/usr/bin/time -l`. Creation and the initial audit warm caches; neither first invocation is a controlled cold-cache result. p95 uses nearest rank, which is the largest of five warm observations here. These measurements establish a local improvement over the previous chippytea discovery algorithm, not superiority over exhaustive inventory tools or a guarantee for every directory topology.
 
 A separate 100,206-entry fixture passed the same twelve-run comparison: warm p95 improved from 177.008 to 51.170 ms and CPU p95 from 0.160 to 0.040 s. The candidate's first invocation was slower, 232.055 versus 159.558 ms, although its in-process scan took 38 ms. That launch overhead is included rather than discarded.
 
@@ -1180,22 +1180,22 @@ The table and references to the final run in this section describe the earlier `
 
 Fixture: 1,000,000 empty regular payload files across 4,000 Node projects, plus 8,000 manifest/lock files and 8,001 directories: **1,016,001 entries**. Empty payloads isolate metadata cost and memory; they do not simulate the allocation or age of a useful cleanup opportunity. An independent post-run traversal matched the fixture marker.
 
-Whole-process wall time, one first invocation followed by three warm invocations. p95 uses the nearest-rank rule; with three warm samples it is the largest warm sample. RSS is the maximum across all four invocations. Chippytea uses one traversal worker; dua and dust use four.
+Whole-process wall time, one first invocation followed by three warm invocations. p95 uses the nearest-rank rule; with three warm samples it is the largest warm sample. RSS is the maximum across all four invocations. chippytea uses one traversal worker; dua and dust use four.
 
 | Workload | Baseline warm p95 | Final first run | Final warm p95 | Final peak RSS |
 | --- | ---: | ---: | ---: | ---: |
-| Chippytea metadata traversal | 6.606 s | 2.769 s | 2.680 s | 2.66 MiB |
-| Chippytea discovery and classification | 8.965 s | 4.213 s | 3.104 s | 3.52 MiB |
-| Chippytea engine with a new SQLite index | — | 3.571 s | 4.046 s | 12.12 MiB |
+| chippytea metadata traversal | 6.606 s | 2.769 s | 2.680 s | 2.66 MiB |
+| chippytea discovery and classification | 8.965 s | 4.213 s | 3.104 s | 3.52 MiB |
+| chippytea engine with a new SQLite index | — | 3.571 s | 4.046 s | 12.12 MiB |
 | macOS `du` | — | 7.242 s | 12.751 s | 2.69 MiB |
 | dua 2.44.0 | — | 3.643 s | 3.585 s | 11.89 MiB |
 | dust 1.2.5 | — | 8.141 s | 4.578 s | 397.75 MiB |
 
-The final discovery scan measured **2.9× faster** than the original baseline on this fixture (8,965.245 ms → 3,104.008 ms warm p95); its underlying metadata traversal measured **2.5× faster** (6,605.593 ms → 2,679.709 ms). These are observed ratios across runs on a workstation in normal use. The final indexed-engine run takes 4,045.605 ms warm p95 with 12,713,984 bytes peak RSS. It creates a fresh disposable SQLite database, authorizes the fixture, scans, persists candidate batches and reads snapshots every 150 ms. It is not a cached-index reopen benchmark. All Chippytea modes remain below the 256 MB scanner-memory target on this fixture.
+The final discovery scan measured **2.9× faster** than the original baseline on this fixture (8,965.245 ms → 3,104.008 ms warm p95); its underlying metadata traversal measured **2.5× faster** (6,605.593 ms → 2,679.709 ms). These are observed ratios across runs on a workstation in normal use. The final indexed-engine run takes 4,045.605 ms warm p95 with 12,713,984 bytes peak RSS. It creates a fresh disposable SQLite database, authorizes the fixture, scans, persists candidate batches and reads snapshots every 150 ms. It is not a cached-index reopen benchmark. All chippytea modes remain below the 256 MB scanner-memory target on this fixture.
 
-All 24 final million-file timed invocations succeeded without a timeout. Chippytea's three modes each reported complete coverage of 1,016,001 entries with zero errors; an independent audit matched the marker. Discovery adds classification and recommendation checks; the indexed mode also includes persistence and engine snapshots. Fresh, tiny artifacts intentionally avoid full fingerprint and Git/process work, so this metadata fixture does not represent a million files that all qualify for cleanup.
+All 24 final million-file timed invocations succeeded without a timeout. chippytea's three modes each reported complete coverage of 1,016,001 entries with zero errors; an independent audit matched the marker. Discovery adds classification and recommendation checks; the indexed mode also includes persistence and engine snapshots. Fresh, tiny artifacts intentionally avoid full fingerprint and Git/process work, so this metadata fixture does not represent a million files that all qualify for cleanup.
 
-The sequential tool runs show substantial variance. In the preceding `benchmarks/local/final-million` report, warm p95 was 5,772.048 ms for `du`, 970.423 ms for dua and 3,552.460 ms for dust, compared with 12,751.018 ms, 3,584.891 ms and 4,578.314 ms above. That earlier, apparently less-contended pass also measured Chippytea metadata at 2,077.517 ms, discovery at 3,202.901 ms and indexed discovery at 3,590.743 ms. Contention was not independently measured. **This sequential run does not establish superiority over another tool**; a controlled, interleaved comparison is needed for that claim.
+The sequential tool runs show substantial variance. In the preceding `benchmarks/local/final-million` report, warm p95 was 5,772.048 ms for `du`, 970.423 ms for dua and 3,552.460 ms for dust, compared with 12,751.018 ms, 3,584.891 ms and 4,578.314 ms above. That earlier, apparently less-contended pass also measured chippytea metadata at 2,077.517 ms, discovery at 3,202.901 ms and indexed discovery at 3,590.743 ms. Contention was not independently measured. **This sequential run does not establish superiority over another tool**; a controlled, interleaved comparison is needed for that claim.
 
 An earlier optimized run remains in `benchmarks/local/after-million`: metadata warm p95 1,871.430 ms and discovery warm p95 3,077.050 ms. The table uses the subsequent `release-million` observations rather than selecting the fastest earlier run; all of these timings are historical.
 

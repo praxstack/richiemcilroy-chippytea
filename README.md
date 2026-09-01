@@ -2,14 +2,14 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/chippytea-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/chippytea-light.svg">
-    <img src="docs/assets/chippytea-light.svg" alt="Chippytea" width="310">
+    <img src="docs/assets/chippytea-light.svg" alt="chippytea" width="310">
   </picture>
 </p>
 
 <h3 align="center">Free up space on your Mac.</h3>
 
 <p align="center">
-  Chippytea is an ultra-performant, native macOS app that clears space on your Mac.
+  chippytea is an ultra-performant, native macOS app that clears space on your Mac.
   Built with SwiftUI and Rust, it helps you find old build folders, project dependencies
   and installers you may no longer need. Review their estimated sizes, see what removing
   them means, and choose what to keep or remove.<br>
@@ -31,7 +31,7 @@
 
 <p align="center"><sub>An illustrated cleanup, not a live scan. Animation respects reduced motion.</sub></p>
 
-Chippytea runs locally from your menu bar. No account, no telemetry, no automatic deletion.
+chippytea runs locally from your menu bar. No account, no telemetry, no automatic deletion.
 
 ## How it works
 
@@ -60,7 +60,7 @@ You'll need an **Apple Silicon Mac**, **macOS 14 or later**, **Xcode with its co
 git clone https://github.com/richiemcilroy/chippytea.git
 cd chippytea
 ./scripts/build.sh
-open build/Chippytea.app
+open build/chippytea.app
 ```
 
 Local builds are ad-hoc signed by default, not notarized releases. For toolchain versions, a safe test fixture, stable signing, and all test commands, see the [development guide](docs/development.md). Quit the running app before rebuilding.

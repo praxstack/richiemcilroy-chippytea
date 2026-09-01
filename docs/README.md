@@ -1,4 +1,4 @@
-# Chippytea docs
+# chippytea docs
 
 | Start here | What's covered |
 | --- | --- |

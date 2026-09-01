@@ -19,7 +19,7 @@ From the repository root:
 ./scripts/build.sh
 ```
 
-This builds the release Rust library, links the Swift executable and produces `build/Chippytea.app`. Quit any running copy before rebuilding. Closing the window does not quit the menu-bar app.
+This builds the release Rust library, links the Swift executable and produces `build/chippytea.app`. Quit any running copy before rebuilding. Closing the window does not quit the menu-bar app.
 
 The script uses ad-hoc signing by default. For a stable local identity, set `CHIPPYTEA_SIGNING_IDENTITY` to a certificate already in your keychain, or put the identity on one line in `.swiftpm/chippytea/signing-identity`. That local file stays out of Git. A configured identity must sign successfully; the build will not silently fall back. These commands do not notarize a distribution release.
 
@@ -65,10 +65,10 @@ For updater or release changes, also run these checks after building the app:
 ```sh
 python3 -B -m unittest discover -s scripts/release -p test_release.py -v
 env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
-  build/Chippytea.app/Contents/MacOS/Chippytea --update-self-test
+  build/chippytea.app/Contents/MacOS/chippytea --update-self-test
 ```
 
-The Python tests check version rules, archive paths, feed metadata and publication order using temporary files and mocked remote responses. The native update test checks cleanup gates, cancelled or failed installs, deferred relaunch and bundle configuration without starting a network update. Neither proves release signing, Apple notarization or an installed app's live update. See [Releasing Chippytea](RELEASING.md) for the release workflow and end-to-end checks.
+The Python tests check version rules, archive paths, feed metadata and publication order using temporary files and mocked remote responses. The native update test checks cleanup gates, cancelled or failed installs, deferred relaunch and bundle configuration without starting a network update. Neither proves release signing, Apple notarization or an installed app's live update. See [Releasing chippytea](RELEASING.md) for the release workflow and end-to-end checks.
 
 ## Manual testing without your real library
 
@@ -77,7 +77,7 @@ Use a fresh state directory so a development build cannot resume your saved scan
 ```sh
 chippytea_dev_state="$(mktemp -d "${TMPDIR:-/tmp}/chippytea-dev.XXXXXX")"
 CHIPPYTEA_DATA_DIR="$chippytea_dev_state" \
-  build/Chippytea.app/Contents/MacOS/Chippytea
+  build/chippytea.app/Contents/MacOS/chippytea
 ```
 
 Choose individual folders and select only a disposable fixture. Do not choose **Scan my Mac** for cleanup testing. Isolated state does not restrict which folders you can authorize.
@@ -109,6 +109,6 @@ Use `bun run build` for the production build check. See [the site README](../sit
 - [Recommendation policy](SUGGESTIONS.md): eligibility, exclusions and coverage limits.
 - [Interface design](DESIGN.md): visual language and interaction.
 - [Performance notes](PERFORMANCE.md): measurements and reproduction commands. Keep private raw output local.
-- [Releasing Chippytea](RELEASING.md): signing, notarization, publishing and verifying in-app updates.
+- [Releasing chippytea](RELEASING.md): signing, notarization, publishing and verifying in-app updates.
 
 `MVP.md` is an earlier design proposal, not a list of shipped features. Use the source and current policy documents when describing behavior.

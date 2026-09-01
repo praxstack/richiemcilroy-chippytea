@@ -1,6 +1,6 @@
 # Code of conduct
 
-Chippytea should be a comfortable project to contribute to, whether this is your first pull request or your hundredth.
+chippytea should be a comfortable project to contribute to, whether this is your first pull request or your hundredth.
 
 ## How we work together
 
@@ -9,7 +9,7 @@ Chippytea should be a comfortable project to contribute to, whether this is your
 - Respect people's time, boundaries and privacy.
 - Do not harass, threaten, discriminate, make unwanted sexual advances or publish someone's private information.
 
-These expectations apply to the project's issues, pull requests and other project spaces, including when representing Chippytea elsewhere.
+These expectations apply to the project's issues, pull requests and other project spaces, including when representing chippytea elsewhere.
 
 ## Reporting a problem
 

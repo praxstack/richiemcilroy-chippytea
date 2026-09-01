@@ -1,6 +1,6 @@
 # Security
 
-Chippytea reads filesystem metadata and can permanently remove files after a cleanup action. Reports about authorization bypasses, path or symlink races, unsafe deletion, unintended access and exposure of local data are especially useful.
+chippytea reads filesystem metadata and can permanently remove files after a cleanup action. Reports about authorization bypasses, path or symlink races, unsafe deletion, unintended access and exposure of local data are especially useful.
 
 ## Reporting a vulnerability
 

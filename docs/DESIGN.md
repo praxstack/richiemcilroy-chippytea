@@ -1,4 +1,4 @@
-# Chippytea design system
+# chippytea design system
 
 The design record for the tray panel. Implementation lives in `native/Chippytea/` (`CoinScene.swift` holds the tokens as `TeaTheme` and the hand-drawn rendering primitives); this document is the source of truth the code follows.
 

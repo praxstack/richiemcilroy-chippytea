@@ -1,10 +1,10 @@
-# Releasing Chippytea
+# Releasing chippytea
 
-Chippytea ships as a universal macOS 14+ app for Apple silicon and Intel. The
+chippytea ships as a universal macOS 14+ app for Apple silicon and Intel. The
 release workflow signs it with Developer ID, notarizes it with Apple, and
 publishes a DMG for new installations and a ZIP for in-app updates.
 
-Existing users can choose **Check for Updates…** in Chippytea. Sparkle handles
+Existing users can choose **Check for Updates…** in chippytea. Sparkle handles
 the download, verification, installation, and relaunch inside the app. A normal
 update does not require manually downloading another DMG. macOS may still ask
 for authorization if the installation location is not writable by the user.
@@ -114,7 +114,7 @@ Sparkle key.
    stapling, preserving framework symlinks. Its paths, metadata, and checksums
    are validated before extraction, then the recovered app passes codesign,
    stapler, and Gatekeeper assessment.
-6. The APFS DMG contains Chippytea.app and an Applications shortcut. The DMG
+6. The APFS DMG contains chippytea.app and an Applications shortcut. The DMG
    itself is signed, notarized, stapled, and Gatekeeper-assessed. Its mounted,
    read-only copy of the app is checked again.
 7. The pinned Sparkle distribution produces the update enclosure and signed
@@ -141,8 +141,8 @@ The resulting release contains:
 
 | Asset | Use |
 | --- | --- |
-| Chippytea-X.Y.Z-universal.dmg | New installations; drag Chippytea to Applications. |
-| Chippytea-X.Y.Z-universal.zip | Signed and notarized application consumed by Sparkle. |
+| chippytea-X.Y.Z-universal.dmg | New installations; drag chippytea to Applications. |
+| chippytea-X.Y.Z-universal.zip | Signed and notarized application consumed by Sparkle. |
 | appcast.xml | Signed stable update history with embedded release notes. |
 | release-notes.md | GitHub-generated notes bound to the source SHA. |
 | release.json | Version, source commit, supported architectures, and update channel. |
@@ -198,7 +198,7 @@ bash -n scripts/release/build-release.sh
 These checks do not prove that Apple accepted a release or that a real
 installed app updated. Before considering the first release/update pair
 validated, install release A from its public DMG, launch it from Applications,
-publish release B, check for updates, download and install through Chippytea,
+publish release B, check for updates, download and install through chippytea,
 and verify the relaunched version and existing user data. Test a failed or
 offline check as well. Perform invalid-signature testing on a separate test
 feed; never alter production assets to simulate corruption.

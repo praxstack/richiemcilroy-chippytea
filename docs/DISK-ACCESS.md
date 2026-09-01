@@ -15,9 +15,9 @@ Only the user can grant Full Disk Access in macOS. Apple documents the system gr
 
 Apple does not expose a supported API for reading the Full Disk Access toggle. Apple DTS advises handling errors from the intended operation and warns that the TCC database is not an API. See [Reliable test for Full Disk Access?](https://developer.apple.com/forums/thread/114452).
 
-Opening or enumerating a protected folder to test access can itself trigger a consent prompt. Instead, after the user's confirmation, Chippytea uses the public nonprompting `access` API on Desktop, Documents and Downloads, off the main thread. Apple describes these per-path authorization checks in [WWDC19, Advances in macOS Security](https://developer.apple.com/videos/play/wwdc2019/701/). Missing optional folders are allowed; denied folders keep the app in setup. A remembered Home setup is checked again before startup resumes its scan. Failed confirmation invalidates previous completion, so Back cannot restore a denied setup.
+Opening or enumerating a protected folder to test access can itself trigger a consent prompt. Instead, after the user's confirmation, chippytea uses the public nonprompting `access` API on Desktop, Documents and Downloads, off the main thread. Apple describes these per-path authorization checks in [WWDC19, Advances in macOS Security](https://developer.apple.com/videos/play/wwdc2019/701/). Missing optional folders are allowed; denied folders keep the app in setup. A remembered Home setup is checked again before startup resumes its scan. Failed confirmation invalidates previous completion, so Back cannot restore a denied setup.
 
-These checks establish access to the intended paths, not the state of the global Full Disk Access toggle. Chippytea never queries or modifies TCC, opens unrelated protected files as sentinels, or polls permission state while idle. The saved completion record remains the user's confirmation, tied to this app identity. The Rust scan reports actual coverage and errors.
+These checks establish access to the intended paths, not the state of the global Full Disk Access toggle. chippytea never queries or modifies TCC, opens unrelated protected files as sentinels, or polls permission state while idle. The saved completion record remains the user's confirmation, tied to this app identity. The Rust scan reports actual coverage and errors.
 
 ## Stable identity across builds
 
@@ -41,8 +41,8 @@ Legacy home grants without completed setup also pass through this gate at startu
 
 ```sh
 ./scripts/build.sh
-build/Chippytea.app/Contents/MacOS/Chippytea --access-flow-test
-build/Chippytea.app/Contents/MacOS/Chippytea --self-test
+build/chippytea.app/Contents/MacOS/chippytea --access-flow-test
+build/chippytea.app/Contents/MacOS/chippytea --self-test
 ```
 
 The access-flow test injects a new disposable home and application-data directory. It covers saved waiting intent, dismissal, returning focus without automatic scanning, denied folder access before and after prior completion, successful confirmation, the Home policy, automatic legacy-grant narrowing and scan resumption, failed bookmark persistence, startup/Refresh/filesystem-event gates, and the selected-folder fallback. It checks that fixture contents remain unchanged. The test simulates reaching the waiting phase and denies a disposable directory with ordinary permissions; it does not operate System Settings or prove an actual TCC grant.

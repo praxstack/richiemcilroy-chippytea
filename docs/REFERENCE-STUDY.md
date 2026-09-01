@@ -2,7 +2,7 @@
 
 Reviewed on 2026-08-31 against the commits below. This document records design
 references, not benchmark results or a claim that every technique is implemented.
-No upstream source was copied into Chippytea during this study.
+No upstream source was copied into chippytea during this study.
 
 ## Repositories and licenses
 
@@ -26,7 +26,7 @@ directories. Its iterator stops descending after recognizing a project, returnin
 the project before all projects have been discovered. The CLI separates discovery
 from interaction using a bounded channel with capacity five.
 
-Chippytea can use manifest evidence and early publication without adopting
+chippytea can use manifest evidence and early publication without adopting
 Kondo's full pruning policy. Skipping an entire recognized project would omit
 nested projects. Skipping every hidden directory would also omit projects in
 authorized hidden worktree folders. Recognize an artifact early, publish its explanation,
@@ -34,7 +34,7 @@ and finish measuring its subtree before describing its estimate as complete.
 Track excluded, failed, and cancelled coverage separately.
 
 Kondo's sizing sums logical file lengths. That is an opportunity estimate, not
-proof of recoverable APFS allocation. Chippytea's cleanup requires explicit review
+proof of recoverable APFS allocation. chippytea's cleanup requires explicit review
 and live revalidation; its optional native Trash route remains recoverable.
 
 Sources: [classification and pruning](https://github.com/tbillington/kondo/blob/1d351ca80b3d3adfad9bbe7db872c27359190210/kondo-lib/src/lib.rs#L370),
@@ -66,14 +66,14 @@ Sources: [worker design and result chunks](https://github.com/Byron/dua-cli/blob
 
 dua's retained tree uses 64-byte nodes with 32-bit links and a shared name arena.
 That avoids an owned full path and separate edge allocation for every entry.
-Chippytea should retain candidate summaries and index records, rather than
+chippytea should retain candidate summaries and index records, rather than
 materializing a million full paths in its interface. Its interactive traversal
 also uses a bounded event channel and throttled updates.
 
 For hard links, dua tracks `(device, inode)` and avoids retaining ordinary
 single-link files in the same bookkeeping map. Normalize overlapping roots before
 using this optimization: a single-link file can otherwise be visited again.
-Chippytea's reward ledger must deduplicate cleanup operations independently of
+chippytea's reward ledger must deduplicate cleanup operations independently of
 scan deduplication.
 
 Sources: [arena representation](https://github.com/Byron/dua-cli/blob/ebf4cffd611953725ac7819a8f02d0bf7afd1e75/src/traverse.rs#L128),
@@ -95,7 +95,7 @@ It updates progress through atomics. These are useful examples of keeping the
 common metadata path small.
 
 Its implementation retains a complete node tree, then removes duplicate
-inode/device entries and recomputes totals. Chippytea's million-file memory goal
+inode/device entries and recomputes totals. chippytea's million-file memory goal
 favors streaming aggregation and bounded index writes instead. Allocated bytes
 and apparent bytes are distinct modes; comparisons must select the same one.
 
@@ -108,7 +108,7 @@ Sources: [directory walker and inode pass](https://github.com/bootandy/dust/blob
 ### Absolute directory opens
 
 The macOS 14 XNU source supports `O_NOFOLLOW_ANY`, which rejects a symlink at any
-component of an absolute lookup. Chippytea uses it for directory and evidence-parent
+component of an absolute lookup. chippytea uses it for directory and evidence-parent
 opens after lexical validation, replacing repeated per-component opens on this
 platform. It must not be combined with `O_NOFOLLOW` or `O_SYMLINK`; XNU rejects
 those combinations. Search-only and readable-directory modes remain distinct.
@@ -134,7 +134,7 @@ counted without allocating its full path.
 Sources: [Apple libc reader](https://github.com/apple-oss-distributions/Libc/blob/main/gen/FreeBSD/readdir.c),
 [Darwin directory-entry contract](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getdirentries.2).
 
-Each Chippytea discovery step consumes at most 256 entries before returning to
+Each chippytea discovery step consumes at most 256 entries before returning to
 the worker's progress/cancellation checkpoint. A known `DT_DIR` entry is a hint,
 not authoritative metadata. Lexical scope and Keep exclusions run first, then
 `openat` with `O_DIRECTORY | O_NOFOLLOW` opens the single child name relative to
@@ -150,7 +150,7 @@ directory-identity checks and queued events detect changing coverage; errors
 remain partial. Nested and hidden projects remain within discovery's scope.
 Source: [Apple descriptor-relative open and no-follow flags](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/open.2).
 
-Apple libc's `fdopendir` immediately reads the first directory batch. Chippytea
+Apple libc's `fdopendir` immediately reads the first directory batch. chippytea
 therefore retains an owned descriptor without constructing `DIR` until names
 enumeration is requested. It rechecks the captured identity before that first
 read and transfers descriptor ownership only after successful `fdopendir`.
@@ -197,7 +197,7 @@ performance and protected-path access evidence, not just a smaller attribute mas
 Source: [XNU bulk fallback](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/vfs/vfs_attrlist.c).
 
 Apple TN3150 warns that enumeration can materialize dataless directories and
-that path-based metadata calls can materialize intermediate folders. Chippytea
+that path-based metadata calls can materialize intermediate folders. chippytea
 therefore also uses a scoped thread policy:
 `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
 IOPOL_MATERIALIZE_DATALESS_FILES_OFF)`. The guard restores the previous setting
@@ -210,7 +210,7 @@ The chosen first change keeps one discovery worker. Current dua distributes
 directory jobs across parked workers, while native metadata remains on the
 enumerating worker. Its completion mode streams four-entry batches; its
 parent-first mode collects a directory before publishing, which does not meet
-Chippytea's bounded-memory approach for wide directories. Kondo's project
+chippytea's bounded-memory approach for wide directories. Kondo's project
 recognition and dust's regular-file fast path support reducing unnecessary work;
 neither establishes the best thread count for this app on APFS.
 Sources: [current dua scheduling](https://github.com/Byron/dua-cli/blob/48109fe7af6c855dd80435473fdd841717bd16b3/crates/dua-lib/src/lib.rs#L881),
@@ -280,7 +280,7 @@ The local SDK also exposes `SF_DATALESS`, `EF_IS_SYNC_ROOT`, and
 `EF_IS_PURGEABLE`. Cloud/provider scope requires additional policy beyond a single
 flag; metadata discovery must not materialize dataless content. Listing snapshots
 is not a necessary condition for using private-size metadata. Apple's snapshot
-manual documents privileged/entitled snapshot operations; Chippytea should not
+manual documents privileged/entitled snapshot operations; chippytea should not
 request elevated access merely to award rewards.
 Sources: [Apple file flags](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/stat.h),
 [snapshot API](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/man/man2/fs_snapshot_create.2).
@@ -358,7 +358,7 @@ dust --threads 4 --config /dev/null --limit-filesystem --no-progress \
 Use identical roots, hidden-entry policy, filesystem boundaries, symlink policy,
 and allocated-byte semantics. Output depth affects dust's display, not complete
 subtree traversal. A separate post-run streaming metadata audit verifies the
-fixture against its marker. Chippytea's raw traversal counts are checked against
+fixture against its marker. chippytea's raw traversal counts are checked against
 those counts; baseline tools' lack of comparable entry counters is reported.
 
 Candidate discovery is timed separately with `chippytea-cli scan`; first findings

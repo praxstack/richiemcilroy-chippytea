@@ -1,6 +1,6 @@
-# Contributing to Chippytea
+# Contributing to chippytea
 
-Good bug reports, careful tests, small fixes and design work are all welcome. If a change affects what Chippytea can delete, open an issue first so we can agree on the safety rules.
+Good bug reports, careful tests, small fixes and design work are all welcome. If a change affects what chippytea can delete, open an issue first so we can agree on the safety rules.
 
 ## Getting started
 

@@ -1,4 +1,4 @@
-# Chippytea: original storage optimizer proposal
+# chippytea: original storage optimizer proposal
 
 Product proposal · 31 August 2026
 
@@ -10,7 +10,7 @@ The accompanying concept used fictional files, space measurements and coin balan
 
 An open-source, local macOS app where freeing storage earns coins for a personal collection. Finding useful cleanup opportunities, recovering space and collecting the resulting coins form the main product loop. The collection is the main screen, not a notification added to a conventional cleanup dashboard.
 
-Chippytea lives in the menu bar. Clicking its icon opens a compact panel attached directly beneath it; clicking outside or pressing Escape dismisses the panel and leaves the menu-bar app running. Quit is explicit. There is no permanent Dock icon by default.
+chippytea lives in the menu bar. Clicking its icon opens a compact panel attached directly beneath it; clicking outside or pressing Escape dismisses the panel and leaves the menu-bar app running. Quit is explicit. There is no permanent Dock icon by default.
 
 The first audience is developers with several local projects, alongside ordinary Mac users looking through large downloads. The app should be understandable without knowing what a cache or worktree is.
 
@@ -58,7 +58,7 @@ Do not preselect personal files. The first release starts with nothing selected.
 
 Cleaning a single suggested item confirms inline: the row expands to show the exact item, estimated size, consequence and any blocked state, and a second explicit tap performs the operation through the same validation path as the full review. Multi-item selection leads to one review screen showing the exact items, locations, reported size and removal consequences. In both cases the default operation is **Move to Trash**. It uses the native macOS Trash API and records the destination returned by the system.
 
-For users who need space immediately, provide a separate **Delete permanently** choice in the review screen, with an explicit irreversible confirmation. In v1 this option is restricted to eligible developer artifacts; personal files go through Trash and Finder. Never silently switch from a failed Trash operation to deletion. Chippytea does not empty unrelated Trash contents.
+For users who need space immediately, provide a separate **Delete permanently** choice in the review screen, with an explicit irreversible confirmation. In v1 this option is restricted to eligible developer artifacts; personal files go through Trash and Finder. Never silently switch from a failed Trash operation to deletion. chippytea does not empty unrelated Trash contents.
 
 Immediately before either operation, revalidate root access, volume/file identity, object type, path containment, applicable manifests, recorded directory contents and activity signals. Changes or ambiguity invalidate that item and require a refreshed review. Do not follow symlinks during traversal or removal, cross into a different volume, or operate on overlapping parent/child selections twice. Races must be handled conservatively; these checks are not a claim of zero future risk.
 
@@ -95,7 +95,7 @@ Keep these separate:
 
 Allocated-size sums are estimates of opportunity, not guarantees of reclaimable space. Hard links, APFS clones, snapshots, compression, purgeable storage and concurrent writes affect the actual result. Do not add available space from volumes sharing the same APFS container.
 
-Moving files to Trash generally frees no storage until they are removed from Trash. The result must say **Moved to Trash**, not **Space freed**. After permanent cleanup, show the observed change in available space separately; do not attribute every concurrent capacity change to Chippytea or maintain a fictitious exact lifetime savings total.
+Moving files to Trash generally frees no storage until they are removed from Trash. The result must say **Moved to Trash**, not **Space freed**. After permanent cleanup, show the observed change in available space separately; do not attribute every concurrent capacity change to chippytea or maintain a fictitious exact lifetime savings total.
 
 The reward policy must be conservative: require a successful eligible removal and supporting storage observations; bound credited space by the successful items' allocated-size estimates and the observed capacity increase, and withhold credit when attribution is unclear. This bound alone does not prove causality on APFS. Snapshots, shared blocks and competing disk activity may leave a result checking or uncredited. A capacity increase alone never generates coins, and disappearance from a Trash path never proves permanent deletion.
 
