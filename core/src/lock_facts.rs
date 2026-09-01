@@ -6,8 +6,9 @@
 //! check, avoiding hashing and retention for small, usually unique project locks.
 
 use crate::{model::Result, safety};
+use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
-use std::{mem::size_of, sync::atomic::AtomicBool};
+use std::{fmt, mem::size_of, sync::atomic::AtomicBool};
 
 const MAX_ENTRIES: usize = 8;
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
@@ -16,9 +17,9 @@ const MIN_CACHE_BYTES: usize = 32 * 1024;
 
 fn parsed_npm(bytes: &[u8], cancel: &AtomicBool) -> Result<Value> {
     safety::cancelled(cancel)?;
-    // Keep serde_json::Value's complete validation and duplicate-key last-wins
-    // semantics. In particular, any JSON number is an accepted version here.
-    let parsed = serde_json::from_slice::<Value>(bytes);
+    // Keep Value's full validation and duplicate-key last-wins semantics while
+    // retaining only ownership facts. Any JSON number is an accepted version.
+    let parsed = parse_npm_projection(bytes, cancel);
     safety::cancelled(cancel)?;
     let parsed = parsed.map_err(|_| "The npm lockfile is invalid")?;
     if !parsed.get("lockfileVersion").is_some_and(Value::is_number)
@@ -224,6 +225,432 @@ impl NpmLockCache {
     }
 }
 
+#[derive(Clone, Copy)]
+enum JsonShape {
+    Unsigned(u64),
+    OtherNumber,
+    Object,
+    Other,
+}
+
+/// Validate every discarded value through the same deserialize_any path used
+/// by Value. IgnoredAny and RawValue skip numeric range, Unicode and depth
+/// checks, so neither is suitable for evidence that authorizes ownership.
+#[derive(Clone, Copy)]
+struct CheckedShape<'a> {
+    cancel: &'a AtomicBool,
+}
+
+impl<'de> DeserializeSeed<'de> for CheckedShape<'_> {
+    type Value = JsonShape;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        safety::cancelled(self.cancel).map_err(D::Error::custom)?;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for CheckedShape<'_> {
+    type Value = JsonShape;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(JsonShape::Other)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(u64::try_from(value).map_or(JsonShape::OtherNumber, JsonShape::Unsigned))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(JsonShape::Unsigned(value))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(JsonShape::OtherNumber)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonShape::Other)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(JsonShape::Other)
+    }
+
+    fn visit_seq<S>(self, mut sequence: S) -> std::result::Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(self)?.is_some() {}
+        Ok(JsonShape::Other)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        // MapKey's deserialize_any validates and decodes the string without
+        // retaining an owned key. Children recurse through CheckedShape too.
+        while map.next_key_seed(self)?.is_some() {
+            map.next_value_seed(self)?;
+        }
+        Ok(JsonShape::Object)
+    }
+}
+
+enum NpmField {
+    Version,
+    Packages,
+    Dependencies,
+    Other,
+}
+
+struct NpmFieldSeed;
+
+impl<'de> DeserializeSeed<'de> for NpmFieldSeed {
+    type Value = NpmField;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NpmFieldSeed {
+    type Value = NpmField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON object key")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(match value {
+            "lockfileVersion" => NpmField::Version,
+            "packages" => NpmField::Packages,
+            "dependencies" => NpmField::Dependencies,
+            _ => NpmField::Other,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NpmProjection {
+    Root,
+    Packages,
+}
+
+struct NpmSeed<'a> {
+    cancel: &'a AtomicBool,
+    projection: NpmProjection,
+}
+
+impl<'de> DeserializeSeed<'de> for NpmSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        safety::cancelled(self.cancel).map_err(D::Error::custom)?;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NpmSeed<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<S>(self, sequence: S) -> std::result::Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        CheckedShape {
+            cancel: self.cancel,
+        }
+        .visit_seq(sequence)?;
+        Ok(Value::Null)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let checked = CheckedShape {
+            cancel: self.cancel,
+        };
+        match self.projection {
+            NpmProjection::Packages => {
+                let mut packages = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    safety::cancelled(self.cancel).map_err(M::Error::custom)?;
+                    // Decode every key and validate every value before replacing
+                    // its fact. A later scalar/array removes an earlier object;
+                    // an escaped spelling of the same key is still a duplicate.
+                    if matches!(map.next_value_seed(checked)?, JsonShape::Object) {
+                        packages.insert(key, Value::Object(serde_json::Map::new()));
+                    } else {
+                        packages.remove(&key);
+                    }
+                }
+                Ok(Value::Object(packages))
+            }
+            NpmProjection::Root => {
+                let mut version = Value::Null;
+                let mut packages = Value::Null;
+                let mut dependencies = Value::Null;
+                while let Some(field) = map.next_key_seed(NpmFieldSeed)? {
+                    safety::cancelled(self.cancel).map_err(M::Error::custom)?;
+                    match field {
+                        NpmField::Version => {
+                            version = match map.next_value_seed(checked)? {
+                                JsonShape::Unsigned(_) | JsonShape::OtherNumber => {
+                                    // The unchanged npm shape check asks only
+                                    // whether the version is a JSON number.
+                                    Value::Number(0.into())
+                                }
+                                _ => Value::Null,
+                            };
+                        }
+                        NpmField::Packages => {
+                            packages = map.next_value_seed(NpmSeed {
+                                cancel: self.cancel,
+                                projection: NpmProjection::Packages,
+                            })?;
+                        }
+                        NpmField::Dependencies => {
+                            dependencies = match map.next_value_seed(checked)? {
+                                JsonShape::Object => Value::Object(serde_json::Map::new()),
+                                _ => Value::Null,
+                            };
+                        }
+                        NpmField::Other => {
+                            map.next_value_seed(checked)?;
+                        }
+                    }
+                }
+                // Keep existing ownership, compaction and cache APIs unchanged.
+                // Only final object-valued package keys and shape markers remain.
+                let mut root = serde_json::Map::new();
+                root.insert("lockfileVersion".into(), version);
+                root.insert("packages".into(), packages);
+                root.insert("dependencies".into(), dependencies);
+                Ok(Value::Object(root))
+            }
+        }
+    }
+}
+
+fn parse_npm_projection(bytes: &[u8], cancel: &AtomicBool) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let projected = NpmSeed {
+        cancel,
+        projection: NpmProjection::Root,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(projected)
+}
+
+enum BunField {
+    Version,
+    Packages,
+    Workspaces,
+    Other,
+}
+
+struct BunFieldSeed;
+
+impl<'de> DeserializeSeed<'de> for BunFieldSeed {
+    type Value = BunField;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BunFieldSeed {
+    type Value = BunField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON object key")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        // Compare decoded keys: escaped aliases are duplicates, while suffixes
+        // such as a NUL remain distinct from the recognized field names.
+        Ok(match value {
+            "lockfileVersion" => BunField::Version,
+            "packages" => BunField::Packages,
+            "workspaces" => BunField::Workspaces,
+            _ => BunField::Other,
+        })
+    }
+}
+
+struct BunRootSeed<'a> {
+    cancel: &'a AtomicBool,
+}
+
+impl<'de> DeserializeSeed<'de> for BunRootSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        safety::cancelled(self.cancel).map_err(D::Error::custom)?;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BunRootSeed<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<S>(self, sequence: S) -> std::result::Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        // A non-object root still needs complete JSON validation before the
+        // unchanged Bun shape check is allowed to reject it.
+        CheckedShape {
+            cancel: self.cancel,
+        }
+        .visit_seq(sequence)?;
+        Ok(Value::Null)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let checked = CheckedShape {
+            cancel: self.cancel,
+        };
+        let mut version = Value::Null;
+        let mut packages = Value::Null;
+        let mut workspaces = Value::Null;
+        while let Some(field) = map.next_key_seed(BunFieldSeed)? {
+            safety::cancelled(self.cancel).map_err(M::Error::custom)?;
+            match field {
+                BunField::Version => {
+                    version = match map.next_value_seed(checked)? {
+                        JsonShape::Unsigned(value) => Value::Number(value.into()),
+                        _ => Value::Null,
+                    };
+                }
+                BunField::Packages => {
+                    packages = match map.next_value_seed(checked)? {
+                        JsonShape::Object => Value::Object(serde_json::Map::new()),
+                        _ => Value::Null,
+                    };
+                }
+                BunField::Workspaces => workspaces = map.next_value::<Value>()?,
+                BunField::Other => {
+                    map.next_value_seed(checked)?;
+                }
+            }
+        }
+        // Keep the existing ownership and fact-compaction code unchanged.
+        // Only these markers and the workspace tree survive; all occurrences
+        // were validated and duplicate recognized fields replace, never merge.
+        let mut root = serde_json::Map::new();
+        root.insert("lockfileVersion".into(), version);
+        root.insert("packages".into(), packages);
+        root.insert("workspaces".into(), workspaces);
+        Ok(Value::Object(root))
+    }
+}
+
+fn parse_bun_projection(bytes: &[u8], cancel: &AtomicBool) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let projected = BunRootSeed { cancel }.deserialize(&mut deserializer)?;
+    // Reject trailing input before the caller checks any ownership or shape.
+    deserializer.end()?;
+    Ok(projected)
+}
+
 /// Bun's text lock is JSON with comments and trailing commas. Normalize only
 /// those two extensions, preserving strings verbatim, then use serde's parser.
 fn bun_json(bytes: &[u8], cancel: &AtomicBool) -> Result<Value> {
@@ -307,7 +734,7 @@ fn bun_json(bytes: &[u8], cancel: &AtomicBool) -> Result<Value> {
         }
     }
     safety::cancelled(cancel)?;
-    let parsed = serde_json::from_slice(&normalized);
+    let parsed = parse_bun_projection(&normalized, cancel);
     safety::cancelled(cancel)?;
     parsed.map_err(|_| "The Bun text lock is invalid JSON".into())
 }
@@ -547,6 +974,759 @@ impl BunLockCache {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    // Exact pre-projection npm parser and ownership oracle. Keep independent
+    // from the projection and its shape markers, including error precedence.
+    fn original_parsed_npm(bytes: &[u8], cancel: &AtomicBool) -> Result<Value> {
+        safety::cancelled(cancel)?;
+        // Keep serde_json::Value's complete validation and duplicate-key last-wins
+        // semantics. In particular, any JSON number is an accepted version here.
+        let parsed = serde_json::from_slice::<Value>(bytes);
+        safety::cancelled(cancel)?;
+        let parsed = parsed.map_err(|_| "The npm lockfile is invalid")?;
+        if !parsed.get("lockfileVersion").is_some_and(Value::is_number)
+            || !(parsed.get("packages").is_some_and(Value::is_object)
+                || parsed.get("dependencies").is_some_and(Value::is_object))
+        {
+            return Err("The npm lockfile lacks recognized dependency evidence".into());
+        }
+        Ok(parsed)
+    }
+
+    fn original_npm_owns_value(parsed: &Value, relative: &str) -> bool {
+        relative.is_empty()
+            || parsed
+                .get("packages")
+                .and_then(|packages| packages.get(relative))
+                .is_some_and(Value::is_object)
+    }
+
+    /// Uncached ownership check for callers that must not reuse discovery facts.
+    pub(crate) fn original_npm_owns(
+        bytes: &[u8],
+        relative: &str,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        let parsed = original_parsed_npm(bytes, cancel)?;
+        let owns = original_npm_owns_value(&parsed, relative);
+        safety::cancelled(cancel)?;
+        Ok(owns)
+    }
+
+    fn assert_npm_projection_parity(source: &[u8]) {
+        let cancel = AtomicBool::new(false);
+        let padded = cacheable(source);
+        let digest = blake3::hash(&padded);
+        let mut cache = NpmLockCache::default();
+        let mut disabled = NpmLockCache::with_limits(0, 0);
+        for relative in ["", "a", "b", "a/", "é", "e\u{301}", "\0"] {
+            let expected = original_npm_owns(source, relative, &cancel);
+            assert_eq!(
+                original_npm_owns(&padded, relative, &cancel),
+                expected,
+                "oracle padding changed the result: {source:?}",
+            );
+            assert_eq!(
+                npm_owns(source, relative, &cancel),
+                expected,
+                "uncached npm projection: {source:?}",
+            );
+            assert_eq!(
+                disabled.owns_captured(Some(digest), &padded, relative, &cancel),
+                expected,
+                "disabled npm cache: {source:?}",
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.owns_captured(Some(digest), &padded, relative, &cancel),
+                    expected,
+                    "cached npm projection: {source:?}",
+                );
+            }
+        }
+        assert_budget(&cache);
+        assert_budget(&disabled);
+        assert!(disabled.entries.is_empty());
+        if original_npm_owns(source, "", &cancel).is_err() {
+            assert!(cache.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn npm_projection_validates_all_discarded_values_like_full_value() {
+        let payloads: &[(&[u8], bool)] = &[
+            (b"1e400", false),
+            (b"-1e400", false),
+            (b"1e+", false),
+            (b"00", false),
+            (br#""\q""#, false),
+            (br#""\uD800""#, false),
+            (br#""\uDC00""#, false),
+            (br#""\uD800\u0041""#, false),
+            (b"\"\xff\"", false),
+            (b"{\"\xff\":0}", false),
+            (br#"{"\uD800":0}"#, false),
+            (br#"[{"bad":"\uDC00"}]"#, false),
+            (br#"{"missing_colon" 1}"#, false),
+            (b"[1,2", false),
+            (b"true false", false),
+            (b"18446744073709551616", true),
+            (b"-9223372036854775809", true),
+            (b"1e-400", true),
+            (b"-0", true),
+            (b"0e99999999999999999999999999999999", true),
+            (br#""\uD83D\uDE00""#, true),
+            (b"\"valid\xe2\x98\x95\"", true),
+            (br#"[null,true,{},[],1.0]"#, true),
+        ];
+        let wrappers: &[(&[u8], &[u8])] = &[
+            (
+                br#"{"lockfileVersion":3,"packages":{"a":{"unused":"#,
+                b"}}}",
+            ),
+            (
+                br#"{"lockfileVersion":3,"packages":{"a":{}},"dependencies":{"unused":"#,
+                b"}}",
+            ),
+            (
+                br#"{"lockfileVersion":3,"packages":{"a":{}},"unused":{"nested":["#,
+                b"]}}",
+            ),
+        ];
+        let cancel = AtomicBool::new(false);
+        for (payload, valid) in payloads {
+            for (prefix, suffix) in wrappers {
+                let source = [*prefix, *payload, *suffix].concat();
+                let expected = if *valid {
+                    Ok(true)
+                } else {
+                    Err("The npm lockfile is invalid".into())
+                };
+                assert_eq!(
+                    original_npm_owns(&source, "a", &cancel),
+                    expected,
+                    "unexpected full-Value npm result: {source:?}",
+                );
+                assert_npm_projection_parity(&source);
+            }
+        }
+    }
+
+    #[test]
+    fn npm_projection_preserves_numeric_versions_duplicates_and_legacy_roots() {
+        let cancel = AtomicBool::new(false);
+        let versions: &[&[u8]] = &[
+            b"0",
+            b"3",
+            b"-1",
+            b"-0",
+            b"1.0",
+            b"-0.5",
+            b"1e0",
+            b"1e-400",
+            b"18446744073709551616",
+            b"-9223372036854775809",
+            b"0e99999999999999999999999999999999",
+        ];
+        for version in versions {
+            let source = [
+                br#"{"lockfileVersion":"#.as_slice(),
+                *version,
+                br#", "packages":{"a":{}}}"#.as_slice(),
+            ]
+            .concat();
+            assert_eq!(original_npm_owns(&source, "a", &cancel), Ok(true));
+            assert_npm_projection_parity(&source);
+        }
+        let json_error = "The npm lockfile is invalid";
+        let shape_error = "The npm lockfile lacks recognized dependency evidence";
+        let cases: &[(&[u8], std::result::Result<bool, &str>)] = &[
+            (br#"{"lockfileVersion":"bad","lockfile\u0056ersion":-0.5,"\u0070ackages":{"a":{}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":3,"lockfileVersion":[],"packages":{"a":{}}}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":3,"dependencies":{"a":{}}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"packages":{"":false}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"packages":false,"dependencies":{}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"packages":{"a":{}},"packages":false,"dependencies":{}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"packages":false,"packages":{"a":{}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":3,"dependencies":false,"\u0064ependencies":{}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"dependencies":{},"dependencies":false}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":3,"packages":[],"dependencies":null}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":3,"packages":{"a":{}},"packages":{"b":{}}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"packages":{"a":{},"\u0061":false}}"#, Ok(false)),
+            (br#"{"lockfileVersion":3,"packages":{"a":false,"\u0061":{}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":3,"packages":{"a":{"x":1e400},"a":{}}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":3,"packages":{"a":1e400},"packages":{}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":3,"dependencies":{"x":"\uD800"},"dependencies":{},"packages":{}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":1e400,"lockfileVersion":3,"packages":{}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":{},"packages":{},"unused":{"x":1e400}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":3,"packages":{},"unused":1e400,"unused":null}"#, Err(json_error)),
+            (br#"{"lockfileVersion":3,"packages\u0000":{"a":{}}}"#, Err(shape_error)),
+            (b"{\"lockfileVersion\":3,\"packages\":{},\"\xff\":0}", Err(json_error)),
+            (br#"{"lockfileVersion":3,"packages":{},"\uD800":0}"#, Err(json_error)),
+            (b"null", Err(shape_error)),
+            (b"[]", Err(shape_error)),
+            (b"true", Err(shape_error)),
+            (b"3", Err(shape_error)),
+            (b"[1e400]", Err(json_error)),
+            (br#"{"lockfileVersion":3,"packages":{}} trailing"#, Err(json_error)),
+            (br#"/* comment */{"lockfileVersion":3,"packages":{}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":3,"packages":{,}}"#, Err(json_error)),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                original_npm_owns(source, "a", &cancel),
+                expected.map_err(str::to_owned),
+                "unexpected full-Value npm member result: {source:?}",
+            );
+            assert_eq!(
+                original_npm_owns(source, "", &cancel),
+                expected.map(|_| true).map_err(str::to_owned),
+                "unexpected full-Value npm root result: {source:?}",
+            );
+            assert_npm_projection_parity(source);
+        }
+    }
+
+    #[test]
+    fn npm_projection_preserves_decoded_package_keys() {
+        let source = br#"{"lockfileVersion":3,"packages":{"":false,"a":{},"ab":{},"a/":false,"a/b":{},"\u00e9":{},"e\u0301":false,"\u0000":{},"x\u0000":{}}}"#;
+        let cancel = AtomicBool::new(false);
+        let padded = cacheable(source);
+        let mut cache = NpmLockCache::default();
+        for (relative, expected) in [
+            ("", true),
+            ("a", true),
+            ("ab", true),
+            ("a/", false),
+            ("a/b", true),
+            ("é", true),
+            ("e\u{301}", false),
+            ("\0", true),
+            ("x\0", true),
+            ("x", false),
+            ("b", false),
+            ("a/b/c", false),
+        ] {
+            assert_eq!(original_npm_owns(source, relative, &cancel), Ok(expected));
+            assert_eq!(npm_owns(source, relative, &cancel), Ok(expected));
+            for _ in 0..2 {
+                assert_eq!(cache.owns(&padded, relative, &cancel), Ok(expected));
+            }
+        }
+        assert_budget(&cache);
+        assert_npm_projection_parity(source);
+    }
+
+    #[test]
+    fn npm_projection_preserves_full_document_depth_limits() {
+        type DepthCase<'a> = (&'a [u8], &'a [u8], usize, Option<bool>);
+        let wrappers: &[DepthCase<'_>] = &[
+            (
+                br#"{"lockfileVersion":3,"packages":{"a":{"nested":"#,
+                b"}}}",
+                3,
+                Some(true),
+            ),
+            (br#"{"lockfileVersion":3,"packages":{"a":"#, b"}}", 2, None),
+            (
+                br#"{"lockfileVersion":3,"dependencies":{"nested":"#,
+                b"}}",
+                2,
+                Some(false),
+            ),
+            (
+                br#"{"lockfileVersion":3,"packages":{"a":{}},"unused":"#,
+                b"}",
+                1,
+                Some(true),
+            ),
+        ];
+        let containers: &[(&[u8], u8)] = &[(b"[", b']'), (br#"{"x":"#, b'}')];
+        let cancel = AtomicBool::new(false);
+        for (start, end) in containers {
+            for depth in [0, 1, 123, 124, 125, 126, 127, 128] {
+                let mut payload = Vec::new();
+                for _ in 0..depth {
+                    payload.extend_from_slice(start);
+                }
+                payload.push(b'0');
+                payload.resize(payload.len() + depth, *end);
+                let object_member = *end == b'}' && depth > 0;
+                for (prefix, suffix, enclosing, owned) in wrappers {
+                    let source = [*prefix, payload.as_slice(), *suffix].concat();
+                    let expected = if depth + enclosing >= 128 {
+                        Err("The npm lockfile is invalid".into())
+                    } else {
+                        Ok(owned.unwrap_or(object_member))
+                    };
+                    assert_eq!(
+                        original_npm_owns(&source, "a", &cancel),
+                        expected,
+                        "unexpected full-Value npm depth result: {depth} + {enclosing}",
+                    );
+                    assert_npm_projection_parity(&source);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn npm_projection_cache_limits_and_cancellation_match_oracle() {
+        let source = cacheable(br#"{"lockfileVersion":3,"packages":{"a":{}}}"#);
+        let cancel = AtomicBool::new(false);
+        let mut cache = NpmLockCache::with_limits(2, 1024);
+        assert!(cache.owns(&source, "a", &cancel).unwrap());
+        let digests: Vec<_> = cache.entries.iter().map(|entry| entry.digest).collect();
+        let retained = cache.retained_bytes;
+        let long_key = "x".repeat(2048);
+        let oversized = cacheable(
+            &serde_json::to_vec(&serde_json::json!({
+                "lockfileVersion": -0.5,
+                "packages": {"a": {}, (long_key.as_str()): {"discarded": [1, 2, 3]}},
+            }))
+            .unwrap(),
+        );
+        let mut disabled = NpmLockCache::with_limits(0, 0);
+        for relative in ["", "a", long_key.as_str(), "missing"] {
+            let expected = original_npm_owns(&oversized, relative, &cancel);
+            assert_eq!(npm_owns(&oversized, relative, &cancel), expected);
+            assert_eq!(cache.owns(&oversized, relative, &cancel), expected);
+            assert_eq!(disabled.owns(&oversized, relative, &cancel), expected);
+        }
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.digest)
+                .collect::<Vec<_>>(),
+            digests
+        );
+        assert!(disabled.entries.is_empty());
+        let malformed = cacheable(br#"{"lockfileVersion":3,"packages":{"a":{"x":1e400}}}"#);
+        cancel.store(true, Ordering::Relaxed);
+        for bytes in [&source, &oversized, &malformed] {
+            for relative in ["", "a"] {
+                let expected = original_npm_owns(bytes, relative, &cancel);
+                assert_eq!(expected, Err("Cancelled".into()));
+                assert_eq!(npm_owns(bytes, relative, &cancel), expected);
+                assert_eq!(cache.owns(bytes, relative, &cancel), expected);
+                assert_eq!(disabled.owns(bytes, relative, &cancel), expected);
+            }
+        }
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.digest)
+                .collect::<Vec<_>>(),
+            digests
+        );
+        assert_budget(&cache);
+        assert_budget(&disabled);
+    }
+
+    // Frozen pre-projection oracle, including its independent normalizer.
+    // Do not route expected values through the projected parser or helpers.
+    /// Bun's text lock is JSON with comments and trailing commas. Normalize only
+    /// those two extensions, preserving strings verbatim, then use serde's parser.
+    fn original_bun_json(bytes: &[u8], cancel: &AtomicBool) -> Result<Value> {
+        safety::cancelled(cancel)?;
+        let mut normalized = bytes.to_vec();
+        let mut index = 0;
+        let mut string = false;
+        let mut escaped = false;
+        while index < normalized.len() {
+            if index & 4095 == 0 {
+                safety::cancelled(cancel)?;
+            }
+            let byte = normalized[index];
+            if string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    string = false;
+                }
+            } else if byte == b'"' {
+                string = true;
+            } else if byte == b'/' && normalized.get(index + 1) == Some(&b'/') {
+                while index < normalized.len() && normalized[index] != b'\n' {
+                    if index & 4095 == 0 {
+                        safety::cancelled(cancel)?;
+                    }
+                    normalized[index] = b' ';
+                    index += 1;
+                }
+                continue;
+            } else if byte == b'/' && normalized.get(index + 1) == Some(&b'*') {
+                normalized[index] = b' ';
+                normalized[index + 1] = b' ';
+                index += 2;
+                loop {
+                    if index & 4095 == 0 {
+                        safety::cancelled(cancel)?;
+                    }
+                    if index + 1 >= normalized.len() {
+                        return Err("The Bun text lock contains an unfinished comment".into());
+                    }
+                    if normalized[index] == b'*' && normalized[index + 1] == b'/' {
+                        normalized[index] = b' ';
+                        normalized[index + 1] = b' ';
+                        index += 2;
+                        break;
+                    }
+                    normalized[index] = b' ';
+                    index += 1;
+                }
+                continue;
+            }
+            index += 1;
+        }
+        string = false;
+        escaped = false;
+        for index in 0..normalized.len() {
+            if index & 4095 == 0 {
+                safety::cancelled(cancel)?;
+            }
+            let byte = normalized[index];
+            if string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    string = false;
+                }
+            } else if byte == b'"' {
+                string = true;
+            } else if byte == b',' {
+                let next = normalized[index + 1..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace());
+                if matches!(next, Some(b'}' | b']')) {
+                    normalized[index] = b' ';
+                }
+            }
+        }
+        safety::cancelled(cancel)?;
+        let parsed = serde_json::from_slice(&normalized);
+        safety::cancelled(cancel)?;
+        parsed.map_err(|_| "The Bun text lock is invalid JSON".into())
+    }
+
+    fn original_parsed_bun(bytes: &[u8], cancel: &AtomicBool) -> Result<Value> {
+        let parsed = original_bun_json(bytes, cancel)?;
+        // Match the existing parser exactly: 1.0 is not an integer version, and
+        // duplicate keys retain serde_json::Value's last-wins semantics.
+        if !matches!(
+            parsed.get("lockfileVersion").and_then(Value::as_u64),
+            Some(1 | 2)
+        ) || !parsed.get("packages").is_some_and(Value::is_object)
+        {
+            return Err("The Bun text lock lacks a recognized version and package table".into());
+        }
+        Ok(parsed)
+    }
+
+    fn original_bun_owns_value(
+        parsed: &Value,
+        relative: &str,
+        manifest_name: Option<&str>,
+    ) -> bool {
+        let Some(workspace) = parsed
+            .get("workspaces")
+            .and_then(|workspaces| workspaces.get(relative))
+            .filter(|workspace| workspace.is_object())
+        else {
+            return false;
+        };
+        match (workspace.get("name").and_then(Value::as_str), manifest_name) {
+            (Some(locked), Some(actual)) => locked == actual,
+            _ => true,
+        }
+    }
+
+    /// Uncached Bun ownership check, including the caller's current manifest name.
+    /// Even the empty/root workspace needs an object in the lock's workspace table.
+    pub(crate) fn original_bun_owns(
+        bytes: &[u8],
+        relative: &str,
+        manifest_name: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        let parsed = original_parsed_bun(bytes, cancel)?;
+        let owns = original_bun_owns_value(&parsed, relative, manifest_name);
+        safety::cancelled(cancel)?;
+        Ok(owns)
+    }
+
+    fn assert_bun_projection_parity(source: &[u8]) {
+        let cancel = AtomicBool::new(false);
+        let padded = cacheable(source);
+        let digest = blake3::hash(&padded);
+        let mut cache = BunLockCache::default();
+        for relative in ["", "a", "b"] {
+            for name in [None, Some("alpha"), Some("other")] {
+                let expected = original_bun_owns(source, relative, name, &cancel);
+                assert_eq!(
+                    original_bun_owns(&padded, relative, name, &cancel),
+                    expected,
+                    "oracle padding changed the result: {source:?}",
+                );
+                assert_eq!(
+                    bun_owns(source, relative, name, &cancel),
+                    expected,
+                    "uncached projection: {source:?}",
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        cache.owns_captured(Some(digest), &padded, relative, name, &cancel),
+                        expected,
+                        "cached projection: {source:?}",
+                    );
+                }
+            }
+        }
+        assert_bun_budget(&cache);
+        if original_bun_owns(source, "a", None, &cancel).is_err() {
+            assert!(cache.entries.is_empty());
+        }
+    }
+
+    fn wrap_bun_bytes(prefix: &[u8], value: &[u8], suffix: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(prefix.len() + value.len() + suffix.len());
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(value);
+        bytes.extend_from_slice(suffix);
+        bytes
+    }
+
+    #[test]
+    fn bun_projection_validates_all_discarded_values_like_full_value() {
+        let payloads: &[(&[u8], bool)] = &[
+            (b"1e400", false),
+            (b"-1e400", false),
+            (b"1e+", false),
+            (b"00", false),
+            (br#""\q""#, false),
+            (br#""\uD800""#, false),
+            (br#""\uDC00""#, false),
+            (br#""\uD800\u0041""#, false),
+            (b"\"\xff\"", false),
+            (b"{\"\xff\":0}", false),
+            (br#"{"\uD800":0}"#, false),
+            (br#"[{"bad":"\uDC00"}]"#, false),
+            (br#"{"missing_colon" 1}"#, false),
+            (b"[1,2", false),
+            (b"true false", false),
+            (b"18446744073709551616", true),
+            (b"-9223372036854775809", true),
+            (b"1e-400", true),
+            (b"-0", true),
+            (b"0e99999999999999999999999999999999", true),
+            (br#""\uD83D\uDE00""#, true),
+            (b"\"valid\xe2\x98\x95\"", true),
+            (br#"[null,true,{},[],1.0]"#, true),
+        ];
+        let wrappers: &[(&[u8], &[u8])] = &[
+            (
+                br#"{"lockfileVersion":1,"workspaces":{"a":{"name":"alpha"}},"packages":{"dep":"#,
+                b"}}",
+            ),
+            (
+                br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":"alpha"}},"unused":"#,
+                b"}",
+            ),
+            (
+                br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":"alpha"}},"unused":{"nested":["#,
+                b"]}}",
+            ),
+        ];
+        let cancel = AtomicBool::new(false);
+        for (payload, valid) in payloads {
+            for (prefix, suffix) in wrappers {
+                let source = wrap_bun_bytes(prefix, payload, suffix);
+                let expected = if *valid {
+                    Ok(true)
+                } else {
+                    Err("The Bun text lock is invalid JSON".into())
+                };
+                assert_eq!(
+                    original_bun_owns(&source, "a", Some("alpha"), &cancel),
+                    expected,
+                    "unexpected full-Value oracle result: {source:?}",
+                );
+                assert_bun_projection_parity(&source);
+            }
+        }
+    }
+
+    #[test]
+    fn bun_projection_preserves_duplicate_fields_and_error_precedence() {
+        let json_error = "The Bun text lock is invalid JSON";
+        let shape_error = "The Bun text lock lacks a recognized version and package table";
+        let cases: &[(&[u8], std::result::Result<bool, &str>)] = &[
+            (br#"{"lockfileVersion":[],"lockfile\u0056ersion":2,"\u0070ackages":{},"work\u0073paces":{"a":{"name":"alpha"}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":1.0,"lockfileVersion":1,"packages":{},"workspaces":{"a":{}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":1,"lockfileVersion":1e0,"packages":{}}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":1,"lockfileVersion":{},"packages":{}}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":1,"packages":false,"\u0070ackages":{},"workspaces":{"a":{}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":1,"packages":{},"packages":false}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":1,"packages\u0000":{},"workspaces":{"a":{}}}"#, Err(shape_error)),
+            (br#"{"lockfileVersion":1,"packages":{"x":1e400},"packages":{}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":1e400,"lockfileVersion":1,"packages":{}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":{},"packages":{},"unused":{"x":"\uD800"}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":1,"packages":{},"unused":1e400,"unused":null}"#, Err(json_error)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{}},"workspaces":{"b":{}}}"#, Ok(false)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{}},"workspaces":false}"#, Ok(false)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{}},"workspaces":[]}"#, Ok(false)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{},"\u0061":false}}"#, Ok(false)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":"other","\u006eame":null}}}"#, Ok(true)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":null,"\u006eame":"other"}}}"#, Ok(false)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":1e400,"name":"alpha"}}}"#, Err(json_error)),
+            (br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":1e400},"workspaces":{}}"#, Err(json_error)),
+            (b"{\"lockfileVersion\":1,\"packages\":{},\"\xff\":0}", Err(json_error)),
+            (br#"{"lockfileVersion":1,"packages":{},"\uD800":0}"#, Err(json_error)),
+            (b"null", Err(shape_error)),
+            (b"[]", Err(shape_error)),
+            (b"true", Err(shape_error)),
+            (b"1", Err(shape_error)),
+            (br#""text""#, Err(shape_error)),
+            (b"[1e400]", Err(json_error)),
+            (br#""\uD800""#, Err(json_error)),
+            (b"[] trailing", Err(json_error)),
+        ];
+        let cancel = AtomicBool::new(false);
+        for (source, expected) in cases {
+            assert_eq!(
+                original_bun_owns(source, "a", Some("alpha"), &cancel),
+                expected.map_err(str::to_owned),
+                "unexpected full-Value oracle result: {source:?}",
+            );
+            assert_bun_projection_parity(source);
+        }
+    }
+
+    #[test]
+    fn bun_projection_preserves_full_document_depth_limits() {
+        let wrappers: &[(&[u8], &[u8], usize, bool)] = &[
+            (
+                br#"{"lockfileVersion":1,"workspaces":{"a":{}},"packages":{"dep":"#,
+                b"}}",
+                2,
+                true,
+            ),
+            (
+                br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{}},"unused":"#,
+                b"}",
+                1,
+                true,
+            ),
+            (
+                br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":"#,
+                b"}}",
+                2,
+                false,
+            ),
+        ];
+        let containers: &[(&[u8], u8)] = &[(b"[", b']'), (br#"{"x":"#, b'}')];
+        let cancel = AtomicBool::new(false);
+        for (start, end) in containers {
+            for depth in [0, 1, 124, 125, 126, 127, 128, 129] {
+                let mut payload = Vec::new();
+                for _ in 0..depth {
+                    payload.extend_from_slice(start);
+                }
+                payload.push(b'0');
+                payload.resize(payload.len() + depth, *end);
+                let object_member = *end == b'}' && depth > 0;
+                for (prefix, suffix, enclosing, owned) in wrappers {
+                    let source = wrap_bun_bytes(prefix, &payload, suffix);
+                    let expected = if depth + enclosing >= 128 {
+                        Err("The Bun text lock is invalid JSON".into())
+                    } else {
+                        // An object-valued workspace is owned even when its
+                        // contents are only the synthetic nested field.
+                        Ok(*owned || object_member)
+                    };
+                    assert_eq!(
+                        original_bun_owns(&source, "a", None, &cancel),
+                        expected,
+                        "unexpected full-Value depth result: {depth} + {enclosing}",
+                    );
+                    assert_bun_projection_parity(&source);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bun_projection_preserves_normalization_and_trailing_input_errors() {
+        let valid = br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":"alpha"}}}"#;
+        let json_error = "The Bun text lock is invalid JSON";
+        let comment_error = "The Bun text lock contains an unfinished comment";
+        let cases = [
+            (wrap_bun_bytes(b"/*\xff\0*/", valid, b""), Ok(true)),
+            (wrap_bun_bytes(b"//\xff\0\n", valid, b""), Ok(true)),
+            (wrap_bun_bytes(b"// ignored\r", valid, b""), Err(json_error)),
+            (wrap_bun_bytes(b"", valid, b" trailing"), Err(json_error)),
+            (wrap_bun_bytes(b"", valid, b" /*unfinished\xff"), Err(comment_error)),
+            (b"invalid JSON /* unfinished".to_vec(), Err(comment_error)),
+            (br#"{/* comment */"lockfileVersion":1,"packages":{,},"workspaces":{"a":{"name":"alpha",},},}"#.to_vec(), Ok(true)),
+            (br#"{"lockfileVersion":1,"packages":{,,},"workspaces":{"a":{}}}"#.to_vec(), Err(json_error)),
+            (br#"{"lockfileVersion":1,"packages":{"x":"https://example.invalid/a//b/*c*/,}\\\""},"workspaces":{"a":{}}}"#.to_vec(), Ok(true)),
+        ];
+        let cancel = AtomicBool::new(false);
+        for (source, expected) in cases {
+            assert_eq!(
+                original_bun_owns(&source, "a", Some("alpha"), &cancel),
+                expected.map_err(str::to_owned),
+                "unexpected full-Value normalization result: {source:?}",
+            );
+            assert_bun_projection_parity(&source);
+        }
+    }
+
+    #[test]
+    fn bun_projection_cancellation_matches_oracle_without_mutating_cache() {
+        let valid = cacheable(
+            br#"{"lockfileVersion":1,"packages":{},"workspaces":{"a":{"name":"alpha"}}}"#,
+        );
+        let malformed = cacheable(br#"{"lockfileVersion":1,"packages":{"x":1e400}}"#);
+        let unfinished = cacheable(b"/* unfinished");
+        let cancel = AtomicBool::new(false);
+        let mut cache = BunLockCache::default();
+        assert!(
+            cache
+                .owns_captured(None, &valid, "a", Some("alpha"), &cancel)
+                .unwrap()
+        );
+        let digests: Vec<_> = cache.entries.iter().map(|entry| entry.digest).collect();
+        let retained = cache.retained_bytes;
+        cancel.store(true, Ordering::Relaxed);
+        for source in [&valid, &malformed, &unfinished] {
+            let expected = original_bun_owns(source, "a", Some("alpha"), &cancel);
+            assert_eq!(expected, Err("Cancelled".into()));
+            assert_eq!(bun_owns(source, "a", Some("alpha"), &cancel), expected);
+            assert_eq!(
+                cache.owns_captured(None, source, "a", Some("alpha"), &cancel),
+                expected,
+            );
+        }
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.digest)
+                .collect::<Vec<_>>(),
+            digests
+        );
+        assert_bun_budget(&cache);
+    }
 
     fn cacheable(source: &[u8]) -> Vec<u8> {
         let mut bytes = source.to_vec();
