@@ -47,9 +47,6 @@ service-account*.json
 /docs/local/
 *.log
 
-# Optional local soundtrack, pending documented redistribution rights.
-/site/public/save-your-mac-with-chippytea.mp3
-
 # Editor, agent and system state.
 .DS_Store
 .idea/
