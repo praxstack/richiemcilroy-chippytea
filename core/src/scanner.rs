@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::Read;
+use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -177,6 +178,7 @@ impl ContentCache {
 pub(crate) struct EvidenceCaches {
     locks: NpmLockCache,
     bun_locks: BunLockCache,
+    pnpm_locks: PnpmLockCache,
     contents: ContentCache,
 }
 
@@ -394,12 +396,13 @@ fn pnpm_workspace_patterns(bytes: &[u8]) -> Result<Vec<String>> {
     Ok(patterns)
 }
 
-fn pnpm_lock_owns(bytes: &[u8], relative: &str) -> Result<bool> {
+/// Visit every importer using the existing deliberately limited lock grammar.
+/// A match never skips later validation, including duplicate section errors.
+fn visit_pnpm_importers<'a>(bytes: &'a [u8], mut importer: impl FnMut(&'a str)) -> Result<()> {
     let text = std::str::from_utf8(bytes).map_err(|_| "The pnpm lockfile is not UTF-8")?;
     let mut version = false;
     let mut importers = false;
     let mut saw_importers = false;
-    let mut owns = false;
     let mut packages = false;
     for line in text.lines() {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
@@ -429,13 +432,204 @@ fn pnpm_lock_owns(bytes: &[u8], relative: &str) -> Result<bool> {
                 .strip_suffix(": {}")
                 .or_else(|| line.trim().strip_suffix(':'))
                 .ok_or("Complex pnpm importer evidence needs manual inspection")?;
-            owns |= yaml_scalar(key)? == if relative.is_empty() { "." } else { relative };
+            importer(yaml_scalar(key)?);
         }
     }
     if !version || !saw_importers || !packages {
         return Err("The pnpm lockfile lacks recognized importer and package evidence".into());
     }
+    Ok(())
+}
+
+fn pnpm_lock_owns(bytes: &[u8], relative: &str) -> Result<bool> {
+    let relative = if relative.is_empty() { "." } else { relative };
+    let mut owns = false;
+    visit_pnpm_importers(bytes, |key| owns |= key == relative)?;
     Ok(owns)
+}
+
+const MAX_PNPM_CACHE_ENTRIES: usize = 8;
+const MAX_PNPM_CACHE_BYTES: usize = 1024 * 1024;
+const MIN_PNPM_CACHE_BYTES: usize = 32 * 1024;
+
+struct PnpmKeyRange {
+    offset: u32,
+    length: u32,
+}
+
+struct PnpmFacts {
+    bytes: Vec<u8>,
+    keys: Vec<PnpmKeyRange>,
+}
+
+impl PnpmFacts {
+    fn capture(
+        bytes: &[u8],
+        relative: &str,
+        heap_limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<(bool, Option<Self>)> {
+        safety::cancelled(cancel)?;
+        let relative = if relative.is_empty() { "." } else { relative };
+        let mut owns = false;
+        let mut retained = Some(Vec::<&str>::new());
+        let mut byte_count = 0usize;
+        // Borrowed keys are transient and separately bounded to 1 MiB. Stop
+        // collecting if either budget is exceeded, but finish the same parser.
+        let max_keys = MAX_PNPM_CACHE_BYTES / size_of::<&str>();
+        visit_pnpm_importers(bytes, |key| {
+            owns |= key == relative;
+            let Some(keys) = retained.as_mut() else {
+                return;
+            };
+            let required = byte_count.checked_add(key.len()).and_then(|bytes| {
+                (keys.len() + 1)
+                    .checked_mul(size_of::<PnpmKeyRange>())
+                    .and_then(|ranges| bytes.checked_add(ranges))
+            });
+            if required.is_none_or(|required| required > heap_limit) || keys.len() == max_keys {
+                retained = None;
+                return;
+            }
+            if keys.len() == keys.capacity() {
+                let capacity = keys.capacity().saturating_mul(2).max(4).min(max_keys);
+                keys.reserve_exact(capacity - keys.len());
+                if keys.capacity() > max_keys {
+                    retained = None;
+                    return;
+                }
+            }
+            keys.push(key);
+            byte_count += key.len();
+        })?;
+        // Keep parse errors ahead of cancellation discovered after parsing.
+        // The original pure pnpm parser has no cancellation checkpoints.
+        safety::cancelled(cancel)?;
+        let Some(mut keys) = retained else {
+            return Ok((owns, None));
+        };
+        keys.sort_unstable();
+        keys.dedup();
+        safety::cancelled(cancel)?;
+        let byte_count = keys.iter().map(|key| key.len()).sum();
+        let mut facts = Self {
+            bytes: Vec::with_capacity(byte_count),
+            keys: Vec::with_capacity(keys.len()),
+        };
+        if facts.heap_bytes() > heap_limit {
+            return Ok((owns, None));
+        }
+        for key in keys {
+            safety::cancelled(cancel)?;
+            let (Ok(offset), Ok(length)) =
+                (u32::try_from(facts.bytes.len()), u32::try_from(key.len()))
+            else {
+                return Ok((owns, None));
+            };
+            facts.keys.push(PnpmKeyRange { offset, length });
+            facts.bytes.extend_from_slice(key.as_bytes());
+        }
+        safety::cancelled(cancel)?;
+        Ok((owns, Some(facts)))
+    }
+
+    fn owns(&self, relative: &str) -> bool {
+        let relative = if relative.is_empty() { "." } else { relative };
+        self.keys
+            .binary_search_by(|key| {
+                let start = key.offset as usize;
+                self.bytes[start..start + key.length as usize].cmp(relative.as_bytes())
+            })
+            .is_ok()
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.bytes.capacity() + self.keys.capacity() * size_of::<PnpmKeyRange>()
+    }
+}
+
+struct CachedPnpm {
+    digest: blake3::Hash,
+    facts: PnpmFacts,
+}
+
+/// Scan-local pure importer facts, never file identities or deletion permission.
+/// The cap charges actual retained capacities, including unused entry slots.
+/// Input bytes, allocator overhead and bounded temporary keys are not retained.
+struct PnpmLockCache {
+    entries: Vec<CachedPnpm>,
+    entry_limit: usize,
+    byte_limit: usize,
+    retained_bytes: usize,
+}
+
+impl Default for PnpmLockCache {
+    fn default() -> Self {
+        Self::with_limits(MAX_PNPM_CACHE_ENTRIES, MAX_PNPM_CACHE_BYTES)
+    }
+}
+
+impl PnpmLockCache {
+    fn with_limits(entry_limit: usize, byte_limit: usize) -> Self {
+        let byte_limit = byte_limit.min(MAX_PNPM_CACHE_BYTES);
+        let mut entry_limit = entry_limit
+            .min(MAX_PNPM_CACHE_ENTRIES)
+            .min(byte_limit / size_of::<CachedPnpm>());
+        let mut entries = Vec::with_capacity(entry_limit);
+        let mut retained_bytes = entries.capacity() * size_of::<CachedPnpm>();
+        if retained_bytes > byte_limit {
+            entries = Vec::new();
+            entry_limit = 0;
+            retained_bytes = 0;
+        }
+        Self {
+            entries,
+            entry_limit,
+            byte_limit,
+            retained_bytes,
+        }
+    }
+
+    /// The digest must describe these exact, freshly identity-validated bytes.
+    /// Small locks use the allocation-free ownership visitor without retention.
+    fn owns_captured(
+        &mut self,
+        digest: blake3::Hash,
+        bytes: &[u8],
+        relative: &str,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        safety::cancelled(cancel)?;
+        if self.entry_limit == 0 || bytes.len() < MIN_PNPM_CACHE_BYTES {
+            let owns = pnpm_lock_owns(bytes, relative)?;
+            safety::cancelled(cancel)?;
+            return Ok(owns);
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.digest == digest) {
+            let owns = self.entries[index].facts.owns(relative);
+            safety::cancelled(cancel)?;
+            self.entries[index..].rotate_left(1);
+            return Ok(owns);
+        }
+        let container_bytes = self.entries.capacity() * size_of::<CachedPnpm>();
+        let (owns, facts) =
+            PnpmFacts::capture(bytes, relative, self.byte_limit - container_bytes, cancel)?;
+        let Some(facts) = facts else {
+            // Oversized valid evidence answers normally and displaces nothing.
+            return Ok(owns);
+        };
+        let heap_bytes = facts.heap_bytes();
+        safety::cancelled(cancel)?;
+        while self.entries.len() == self.entry_limit
+            || heap_bytes > self.byte_limit - self.retained_bytes
+        {
+            let evicted = self.entries.remove(0);
+            self.retained_bytes -= evicted.facts.heap_bytes();
+        }
+        self.retained_bytes += heap_bytes;
+        self.entries.push(CachedPnpm { digest, facts });
+        Ok(owns)
+    }
 }
 
 fn node_lock_owns(
@@ -594,6 +788,11 @@ fn node_evidence_cached(
                     parsed.get("name").and_then(Value::as_str),
                     cancel,
                 ),
+                ("pnpm-lock.yaml", Some(caches)) => {
+                    caches
+                        .pnpm_locks
+                        .owns_captured(source.digest, &source.bytes, relative, cancel)
+                }
                 _ => node_lock_owns(name, &source.bytes, relative, &parsed, cancel),
             }?;
             recognized_lock |= owns && declares_member;
@@ -4311,6 +4510,423 @@ mod tests {
         }
     }
 
+    // Frozen pre-cache oracle. Keep its scalar rules and ownership walk
+    // independent from the shared importer visitor and fact compaction.
+    fn original_pnpm_scalar(value: &str) -> Result<&str> {
+        let value = value.trim();
+        let value = if value.len() >= 2
+            && ((value.starts_with('\'') && value.ends_with('\''))
+                || (value.starts_with('"') && value.ends_with('"')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            if value.starts_with(['*', '!']) {
+                return Err("YAML aliases and tags cannot establish workspace ownership".into());
+            }
+            value
+        };
+        if value.is_empty()
+            || value.contains(['\'', '"', '\\', '#', '&', '|', '>', '{', '}', '[', ']'])
+        {
+            return Err("Complex pnpm workspace evidence needs manual inspection".into());
+        }
+        Ok(value)
+    }
+
+    fn original_pnpm_lock_owns(bytes: &[u8], relative: &str) -> Result<bool> {
+        let text = std::str::from_utf8(bytes).map_err(|_| "The pnpm lockfile is not UTF-8")?;
+        let mut version = false;
+        let mut importers = false;
+        let mut saw_importers = false;
+        let mut owns = false;
+        let mut packages = false;
+        for line in text.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("lockfileVersion:") {
+                if version {
+                    return Err("Duplicate pnpm lockfile version is ambiguous".into());
+                }
+                if !matches!(original_pnpm_scalar(value)?, "6.0" | "9.0") {
+                    return Err("This pnpm lockfile version needs manual inspection".into());
+                }
+                version = true;
+            }
+            if !line.starts_with(' ') {
+                importers = line == "importers:";
+                if importers {
+                    if saw_importers {
+                        return Err("Duplicate pnpm importers are ambiguous".into());
+                    }
+                    saw_importers = true;
+                }
+                packages |= line == "packages:" || line == "packages: {}";
+            } else if importers && line.starts_with("  ") && !line.starts_with("   ") {
+                let key = line
+                    .trim()
+                    .strip_suffix(": {}")
+                    .or_else(|| line.trim().strip_suffix(':'))
+                    .ok_or("Complex pnpm importer evidence needs manual inspection")?;
+                owns |=
+                    original_pnpm_scalar(key)? == if relative.is_empty() { "." } else { relative };
+            }
+        }
+        if !version || !saw_importers || !packages {
+            return Err("The pnpm lockfile lacks recognized importer and package evidence".into());
+        }
+        Ok(owns)
+    }
+
+    fn pnpm_cacheable(source: &[u8]) -> Vec<u8> {
+        // Prefix an ignored blank line instead of changing the last line's
+        // exact whitespace or turning a final lone CR into a CRLF terminator.
+        let mut bytes = Vec::new();
+        if source.len() < MIN_PNPM_CACHE_BYTES {
+            bytes.resize(MIN_PNPM_CACHE_BYTES - source.len() - 1, b' ');
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(source);
+        bytes
+    }
+
+    fn pnpm_cache_document(key: &str) -> Vec<u8> {
+        pnpm_cacheable(
+            format!("lockfileVersion: '9.0'\nimporters:\n  '{key}': {{}}\npackages: {{}}\n")
+                .as_bytes(),
+        )
+    }
+
+    fn assert_pnpm_budget(cache: &PnpmLockCache) {
+        let actual = cache.entries.capacity() * size_of::<CachedPnpm>()
+            + cache
+                .entries
+                .iter()
+                .map(|entry| entry.facts.heap_bytes())
+                .sum::<usize>();
+        assert_eq!(cache.retained_bytes, actual);
+        assert!(actual <= cache.byte_limit);
+        assert!(cache.entries.len() <= cache.entry_limit);
+    }
+
+    fn assert_pnpm_parity(source: &[u8]) {
+        let cancel = AtomicBool::new(false);
+        let padded = pnpm_cacheable(source);
+        let digest = blake3::hash(&padded);
+        let mut cache = PnpmLockCache::default();
+        let mut disabled = PnpmLockCache::with_limits(0, 0);
+        for relative in [
+            "", ".", "./", "a", "b", "a/b", "a/", "é", "e\u{301}", "a\0b", "missing",
+        ] {
+            let expected = original_pnpm_lock_owns(source, relative);
+            assert_eq!(original_pnpm_lock_owns(&padded, relative), expected);
+            assert_eq!(pnpm_lock_owns(source, relative), expected);
+            assert_eq!(
+                disabled.owns_captured(digest, &padded, relative, &cancel),
+                expected,
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.owns_captured(digest, &padded, relative, &cancel),
+                    expected,
+                    "pnpm cache parity for {relative:?}: {source:?}",
+                );
+            }
+        }
+        assert_pnpm_budget(&cache);
+        assert_pnpm_budget(&disabled);
+        assert!(disabled.entries.is_empty());
+        if original_pnpm_lock_owns(source, "").is_err() {
+            assert!(cache.entries.is_empty());
+        } else {
+            assert_eq!(cache.entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn pnpm_fact_cache_preserves_original_grammar_and_error_order() {
+        let shape = "The pnpm lockfile lacks recognized importer and package evidence";
+        let scalar = "Complex pnpm workspace evidence needs manual inspection";
+        let importer = "Complex pnpm importer evidence needs manual inspection";
+        let alias = "YAML aliases and tags cannot establish workspace ownership";
+        let duplicate_version = "Duplicate pnpm lockfile version is ambiguous";
+        let duplicate_importers = "Duplicate pnpm importers are ambiguous";
+        let cases: &[(&[u8], std::result::Result<bool, &str>)] = &[
+            (b"lockfileVersion: '9.0'\nimporters:\n  .: {}\n  a: {}\npackages: {}\n", Ok(true)),
+            (b"packages:\nlockfileVersion: \"6.0\"\nimporters:\n  a:\n    dependencies: {}\n", Ok(true)),
+            (b"lockfileVersion: 9.0\r\nimporters:\r\n  a: {}\r\npackages: {}\r\n", Ok(true)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  a:\npackages: {}\npackages:\n", Ok(true)),
+            (b"lockfileVersion: 9.0\nimporters:\n  b: {}\npackages: {}\n", Ok(false)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  # preserve section\n\n  b: {}\npackages:\n", Ok(true)),
+            (b"lockfileVersion: 9.0\nimporters:\n  \ta: {}\npackages:\n", Ok(true)),
+            (b"lockfileVersion: 9.0\nimporters:\n a: {}\n   a: {}\npackages:\n", Ok(false)),
+            (b"lockfileVersion: 9.0\nimporters:\n\tother:\n  a: {}\npackages:\n", Ok(false)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\npackages:\nnot generally valid YAML: [\n", Ok(true)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n   malformed: [\npackages:\n", Ok(true)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\npackages: {}", Ok(true)),
+            (b"", Err(shape)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n", Err(shape)),
+            (b"lockfileVersion: 9.0\nimporters: \n  a: {}\npackages:\n", Err(shape)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\npackages: {} \n", Err(shape)),
+            (b"lockfileVersion: 8.0\nimporters:\n  a: {}\npackages:\n", Err("This pnpm lockfile version needs manual inspection")),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\nlockfileVersion: *broken\npackages:\n", Err(duplicate_version)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\nimporters:\npackages:\n", Err(duplicate_importers)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  *alias: {}\npackages:\n", Err(alias)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  !tag: {}\npackages:\n", Err(alias)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  '': {}\npackages:\n", Err(scalar)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  'a\\b': {}\npackages:\n", Err(scalar)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  b: null\npackages:\n", Err(importer)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  b:{}\npackages:\n", Err(importer)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  b: { }\npackages:\n", Err(importer)),
+            (b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  b: {} # inline\npackages:\n", Err(importer)),
+            (b"lockfileVersion: 8.0\nimporters:\n  a: {}\npackages:\n\xff", Err("The pnpm lockfile is not UTF-8")),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                original_pnpm_lock_owns(source, "a"),
+                expected.map_err(str::to_owned),
+                "unexpected frozen pnpm oracle result: {source:?}",
+            );
+            assert_pnpm_parity(source);
+        }
+        // Adding cache padding must not normalize unsupported final lone CRs.
+        assert_pnpm_parity(b"lockfileVersion: 9.0\nimporters:\n  a: {}\npackages:\r");
+    }
+
+    #[test]
+    fn pnpm_fact_cache_preserves_scalar_bytes_roots_and_duplicate_or_semantics() {
+        let source = concat!(
+            "lockfileVersion: 9.0\nimporters:\n",
+            "  '.': {}\n  './': {}\n  a: {}\n  a:\n",
+            "  'a/b': {}\n  'a: b': {}\n  ' padded ': {}\n",
+            "  '*literal': {}\n  '!literal': {}\n  'tab\tkey': {}\n",
+            "  'é': {}\n  'e\u{301}': {}\n  'a\0b': {}\npackages:\n",
+        );
+        let padded = pnpm_cacheable(source.as_bytes());
+        let digest = blake3::hash(&padded);
+        let cancel = AtomicBool::new(false);
+        let mut cache = PnpmLockCache::default();
+        for (relative, expected) in [
+            ("", true),
+            (".", true),
+            ("./", true),
+            ("a", true),
+            ("a/b", true),
+            ("a: b", true),
+            (" padded ", true),
+            ("padded", false),
+            ("*literal", true),
+            ("!literal", true),
+            ("tab\tkey", true),
+            ("é", true),
+            ("e\u{301}", true),
+            ("a\0b", true),
+            ("a\0", false),
+            ("a/b/c", false),
+            ("missing", false),
+        ] {
+            assert_eq!(
+                original_pnpm_lock_owns(source.as_bytes(), relative),
+                Ok(expected)
+            );
+            assert_eq!(pnpm_lock_owns(source.as_bytes(), relative), Ok(expected));
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.owns_captured(digest, &padded, relative, &cancel),
+                    Ok(expected)
+                );
+            }
+        }
+        assert_eq!(cache.entries[0].facts.keys.len(), 12);
+        assert_pnpm_budget(&cache);
+        let without_root = pnpm_cache_document("a");
+        assert!(
+            !cache
+                .owns_captured(blake3::hash(&without_root), &without_root, "", &cancel)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn pnpm_fact_cache_budgets_lru_and_oversized_evidence() {
+        let cancel = AtomicBool::new(false);
+        let [a, b, c] = ["a", "b", "c"].map(pnpm_cache_document);
+        let mut cache = PnpmLockCache::with_limits(2, 4096);
+        for (source, key) in [(&a, "a"), (&b, "b"), (&a, "a"), (&c, "c")] {
+            assert!(
+                cache
+                    .owns_captured(blake3::hash(source), source, key, &cancel)
+                    .unwrap()
+            );
+            assert_pnpm_budget(&cache);
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries[0].digest, blake3::hash(&a));
+        assert_eq!(cache.entries[1].digest, blake3::hash(&c));
+
+        let budget = 2 * size_of::<CachedPnpm>() + size_of::<PnpmKeyRange>() + 1;
+        let mut cache = PnpmLockCache::with_limits(2, budget);
+        for (source, key) in [(&a, "a"), (&b, "b")] {
+            assert!(
+                cache
+                    .owns_captured(blake3::hash(source), source, key, &cancel)
+                    .unwrap()
+            );
+            assert_pnpm_budget(&cache);
+        }
+        assert_eq!(cache.entries.len(), 1);
+        let retained = cache.retained_bytes;
+        let long = "x".repeat(2048);
+        let oversized = pnpm_cacheable(
+            format!("lockfileVersion: 9.0\nimporters:\n  {long}: {{}}\n  later: {{}}\npackages:\n")
+                .as_bytes(),
+        );
+        for relative in [long.as_str(), "later", "", "missing"] {
+            assert_eq!(
+                cache.owns_captured(blake3::hash(&oversized), &oversized, relative, &cancel),
+                original_pnpm_lock_owns(&oversized, relative),
+            );
+            assert_eq!(cache.retained_bytes, retained);
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.entries[0].digest, blake3::hash(&b));
+        }
+        let invalid = [oversized.as_slice(), b"importers:\n"].concat();
+        assert_eq!(
+            cache.owns_captured(blake3::hash(&invalid), &invalid, "later", &cancel),
+            original_pnpm_lock_owns(&invalid, "later"),
+        );
+        assert!(original_pnpm_lock_owns(&invalid, "later").is_err());
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(cache.entries[0].digest, blake3::hash(&b));
+        assert_pnpm_budget(&cache);
+    }
+
+    #[test]
+    fn pnpm_fact_cache_bounded_collection_keeps_late_members_and_errors() {
+        let cancel = AtomicBool::new(false);
+        let mut source = String::from("lockfileVersion: 9.0\nimporters:\n");
+        for _ in 0..=MAX_PNPM_CACHE_BYTES / size_of::<&str>() {
+            source.push_str("  a: {}\n");
+        }
+        source.push_str("  later: {}\npackages:\n");
+        let mut cache = PnpmLockCache::default();
+        let retained = cache.retained_bytes;
+        for relative in ["a", "later", "", "missing"] {
+            assert_eq!(
+                cache.owns_captured(
+                    blake3::hash(source.as_bytes()),
+                    source.as_bytes(),
+                    relative,
+                    &cancel
+                ),
+                original_pnpm_lock_owns(source.as_bytes(), relative),
+            );
+            assert!(cache.entries.is_empty());
+            assert_eq!(cache.retained_bytes, retained);
+        }
+        source.push_str("lockfileVersion: broken\n");
+        assert_eq!(
+            cache.owns_captured(
+                blake3::hash(source.as_bytes()),
+                source.as_bytes(),
+                "a",
+                &cancel
+            ),
+            Err("Duplicate pnpm lockfile version is ambiguous".into()),
+        );
+        assert!(cache.entries.is_empty());
+        assert_pnpm_budget(&cache);
+    }
+
+    #[test]
+    fn pnpm_fact_cache_small_inputs_disabled_budgets_and_cancellation() {
+        use std::sync::atomic::Ordering;
+        let cancel = AtomicBool::new(false);
+        let large = pnpm_cache_document("a");
+        let small = b"lockfileVersion: 9.0\nimporters:\n  a: {}\npackages:\n";
+        let mut cache = PnpmLockCache::default();
+        for source in [small.as_slice(), &large[1..]] {
+            assert!(
+                cache
+                    .owns_captured(blake3::hash(source), source, "a", &cancel)
+                    .unwrap()
+            );
+            assert!(cache.entries.is_empty());
+        }
+        assert!(
+            cache
+                .owns_captured(blake3::hash(&large), &large, "a", &cancel)
+                .unwrap()
+        );
+        let b = pnpm_cache_document("b");
+        assert!(
+            cache
+                .owns_captured(blake3::hash(&b), &b, "b", &cancel)
+                .unwrap()
+        );
+        let digests: Vec<_> = cache.entries.iter().map(|entry| entry.digest).collect();
+        let retained = cache.retained_bytes;
+        cancel.store(true, Ordering::Relaxed);
+        for source in [small.as_slice(), large.as_slice(), b.as_slice(), b"\xff"] {
+            assert_eq!(
+                cache.owns_captured(blake3::hash(source), source, "a", &cancel),
+                Err("Cancelled".into()),
+            );
+        }
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.digest)
+                .collect::<Vec<_>>(),
+            digests
+        );
+        cancel.store(false, Ordering::Relaxed);
+        assert!(
+            cache
+                .owns_captured(blake3::hash(&large), &large, "a", &cancel)
+                .unwrap()
+        );
+        assert_pnpm_budget(&cache);
+        for (entries, bytes) in [(0, 4096), (8, 0), (8, size_of::<CachedPnpm>() - 1)] {
+            let mut disabled = PnpmLockCache::with_limits(entries, bytes);
+            for source in [small.as_slice(), large.as_slice(), b"\xff"] {
+                assert_eq!(
+                    disabled.owns_captured(blake3::hash(source), source, "a", &cancel),
+                    original_pnpm_lock_owns(source, "a"),
+                );
+            }
+            assert!(disabled.entries.is_empty());
+            assert_pnpm_budget(&disabled);
+        }
+    }
+
+    #[test]
+    fn pnpm_importer_visitor_finishes_validation_after_cancellation_is_requested() {
+        use std::sync::atomic::Ordering;
+        let cancel = AtomicBool::new(false);
+        let source =
+            b"lockfileVersion: 9.0\nimporters:\n  a: {}\n  b: {}\n  invalid: null\npackages:\n";
+        let mut visited = Vec::new();
+        let result = visit_pnpm_importers(source, |key| {
+            visited.push(key);
+            cancel.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(visited, ["a", "b"]);
+        assert_eq!(result, original_pnpm_lock_owns(source, "a").map(|_| ()),);
+        assert_eq!(
+            result,
+            Err("Complex pnpm importer evidence needs manual inspection".into())
+        );
+        let mut cache = PnpmLockCache::default();
+        assert_eq!(
+            cache.owns_captured(blake3::hash(source), source, "a", &cancel),
+            Err("Cancelled".into()),
+        );
+        assert!(cache.entries.is_empty());
+    }
+
     #[test]
     fn pnpm_component_globs_require_exact_importers_and_fresh_membership() {
         let (_temp, root, owner, member) = workspace_fixture();
@@ -4392,8 +5008,19 @@ mod tests {
                 br#"{"lockfileVersion":1,"packages":{},"workspaces":{"":{"name":"fixture"},"apps/member":{"name":"member"}}}"#.as_slice(),
                 br#"{"lockfileVersion":1,"packages":{},"workspaces":{"":{"name":"fixture"},"apps/absent":{"name":"member"}}}"#.as_slice(),
             ),
+            (
+                "pnpm-lock.yaml",
+                b"lockfileVersion: 9.0\nimporters:\n  .: {}\n  apps/member: {}\npackages:\n".as_slice(),
+                b"lockfileVersion: 9.0\nimporters:\n  .: {}\n  apps/absent: {}\npackages:\n".as_slice(),
+            ),
         ] {
         let (_temp, root, owner, member) = workspace_fixture();
+        if name == "pnpm-lock.yaml" {
+            std::fs::write(
+                owner.join("pnpm-workspace.yaml"),
+                b"packages:\n  - 'apps/*'\n",
+            ).unwrap();
+        }
         let lock = owner.join(name);
         let mut bytes = original.to_vec();
         bytes.resize(32 * 1024, b' ');
@@ -4403,6 +5030,10 @@ mod tests {
         let first = node_evidence_cached(&root, &member, &cancel, Some(&mut cache))
             .unwrap()
             .unwrap();
+        if name == "pnpm-lock.yaml" {
+            assert_eq!(cache.pnpm_locks.entries.len(), 1);
+            assert_pnpm_budget(&cache.pnpm_locks);
+        }
         for project in [&owner, &member] {
             let cached = node_evidence_cached(&root, project, &cancel, Some(&mut cache))
                 .unwrap()
@@ -4438,12 +5069,16 @@ mod tests {
         );
         std::fs::write(&lock, &bytes).unwrap();
 
-        // An old content-cache hit must still use the current workspace manifest.
-        let manifest = owner.join("package.json");
-        let original_manifest = std::fs::read(&manifest).unwrap();
-        std::fs::write(&manifest, br#"{"name":"fixture","workspaces":["other/*"]}"#).unwrap();
+        // An old content-cache hit must still use the current workspace declaration.
+        let (membership, replacement_membership): (PathBuf, &[u8]) = if name == "pnpm-lock.yaml" {
+            (owner.join("pnpm-workspace.yaml"), b"packages:\n  - 'apps/*'\n  - '!apps/member'\n")
+        } else {
+            (owner.join("package.json"), br#"{"name":"fixture","workspaces":["other/*"]}"#)
+        };
+        let original_membership = std::fs::read(&membership).unwrap();
+        std::fs::write(&membership, replacement_membership).unwrap();
         assert!(node_evidence_cached(&root, &member, &cancel, Some(&mut cache)).is_err());
-        std::fs::write(&manifest, original_manifest).unwrap();
+        std::fs::write(&membership, original_membership).unwrap();
         std::fs::write(owner.join(".yarnrc.yml"), b"nodeLinker: node-modules\n").unwrap();
         let configured = node_evidence_cached(&root, &member, &cancel, Some(&mut cache))
             .unwrap()
@@ -4525,7 +5160,7 @@ mod tests {
         )
         .unwrap();
         let lock = owner.join("pnpm-lock.yaml");
-        std::fs::write(&lock, "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies: {}\n  apps/member:\n    dependencies: {}\npackages: {}\n").unwrap();
+        std::fs::write(&lock, pnpm_cacheable(b"lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies: {}\n  apps/member:\n    dependencies: {}\npackages: {}\n")).unwrap();
         let first = node_evidence(&root, &member, &AtomicBool::new(false))
             .unwrap()
             .unwrap();
