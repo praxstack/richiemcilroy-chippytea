@@ -4,6 +4,88 @@ Reproducible performance comparisons below use generated, disposable fixtures. P
 
 Measured 31 August and 1 September 2026 on an Apple M4 Max MacBook Pro (`Mac16,6`), 16 CPU cores, 128 GiB memory, arm64, macOS 27.0 build `26A5421a`, local APFS. The workstation was also in normal use; these are reproducible local measurements, not a hardware-wide promise.
 
+## Git tracking readiness
+
+This follow-up replaces an unconditional 15 ms sleep in the Git tracking subprocess loop with a bounded stdout-readiness wait. It avoids sleeping through an already completed query. It does not change which files are considered safe: a readiness event is only a wake-up hint, never ownership evidence or deletion permission.
+
+The fixed Git executable, cleared environment, literal case-insensitive path query, 256-byte nonblocking reads, rejection of any tracked-path output, successful child exit, final EOF read and current Git evidence checks remain authoritative. EOF while the child is still alive uses the original sleep to avoid a hangup spin. Interrupted, failed or unexpected polling falls back to the remaining sleep quantum. The two-second deadline still covers the child loop only; evidence capture, spawning, final reap and revalidation are outside it. Cancellation remains cooperative, not a hard real-time guarantee.
+
+### First comparison and retained controls
+
+The baseline is the **accepted manifest checkpoint below**, not the original scanner. Both optimized CLIs use Rust 1.97.1. The target is a disposable four-member pnpm workspace with a 256 KiB lockfile, a 102-byte ancestor manifest and four independently written 100 MiB artifacts. One artifact contains a synthetic Git-tracked source file and must remain excluded; the other three are eligible suggestions. These are scan decisions, not permission to bypass cleanup revalidation.
+
+Six fixtures each have a separate first pair. The Git case has twenty alternating warm pairs, small npm has twelve and the other cases have five: **116 invocations**. Every scan completed without errors. Independent raw-output checks matched every final Candidate field, non-timing terminal statistic and per-path observation history. Physical audits and the Git metadata inventory and hashes remained unchanged. The Git fixture has 35 physical entries; Suggestions prunes Git metadata contents, so its 24 examined entries are not an incomplete physical inventory claim.
+
+| Workload | Warm elapsed median, before → after | Warm CPU median, before → after | Maximum lifetime CLI RSS, before → after |
+| --- | ---: | ---: | ---: |
+| Four artifacts with Git tracking checks | 103.781 → 57.624 ms | 40 → 40 ms | 4.109 → 4.109 MiB |
+| Shared 64 KiB manifest, 512 members | 93.325 → 97.501 ms | 80 → 90 ms | 12.266 → 12.172 MiB |
+| 1,001 separate small npm projects | 156.681 → 170.205 ms | 140 → 150 ms | 3.781 → 3.750 MiB |
+| Shared 102-byte manifest, 512 members | 95.289 → 92.281 ms | 80 → 80 ms | 11.828 → 11.766 MiB |
+| Million ordinary source files | 334.143 → 336.873 ms | 320 → 320 ms | 3.188 → 3.172 MiB |
+| Directory-heavy source tree | 907.327 → 908.970 ms | 890 → 890 ms | 3.203 → 3.188 MiB |
+
+The Git target had **44.5% lower median elapsed time**, about **1.80× faster**, with nineteen of twenty warm pairs faster. Its one slower pair, 98.943 → 101.735 ms, remains included. Median CPU and maximum RSS were unchanged at the measurement resolution: this is a wait-time improvement, not an established CPU or memory reduction.
+
+The controls are mixed. Small npm was **8.6% slower** by median, with seven of twelve warm pairs slower; the shared 64 KiB manifest was **4.5% slower**, with three of five pairs slower. Both reported 10 ms more median CPU. Ordinary-file and directory medians and p95 were also slower. These results are retained, not discarded as noise.
+
+| Workload | First elapsed pair, before → after | Warm elapsed p95, before → after |
+| --- | ---: | ---: |
+| Four artifacts with Git tracking checks | 110.894 → 59.410 ms | 107.269 → 85.763 ms |
+| Shared 64 KiB manifest | 149.206 → 91.396 ms | 103.144 → 108.276 ms |
+| 1,001 separate small npm projects | 416.414 → 166.511 ms | 180.792 → 177.317 ms |
+| Shared 102-byte manifest | 147.617 → 90.265 ms | 99.844 → 96.160 ms |
+| Million ordinary source files | 349.410 → 333.146 ms | 355.277 → 365.767 ms |
+| Directory-heavy source tree | 900.047 → 926.973 ms | 928.432 → 939.226 ms |
+
+Git first-eligible p95 was 32.819 → 23.806 ms at CLI stdout. The million-file control's first-eligible p95 worsened from **9.235 → 22.540 ms**. Neither measures native rendering.
+
+### Separate same-binary diagnostic repeat
+
+After inspecting the adverse controls, a second, explicitly separate series repeated small npm and the 64 KiB manifest with twenty warm pairs each, plus five warm Git pairs and one first pair per fixture: **96 invocations**. It uses the identical source, binaries and fixtures; all full final rows, non-timing statistics and histories still match, including across series. The original 116 runs remain intact and are **not replaced or pooled** with this repeat.
+
+| Workload | Warm elapsed median, before → after | Warm CPU median, before → after | Maximum lifetime CLI RSS, before → after |
+| --- | ---: | ---: | ---: |
+| 1,001 separate small npm projects | 178.044 → 170.967 ms | 165 → 160 ms | 3.844 → 3.781 MiB |
+| Shared 64 KiB manifest, 512 members | 102.336 → 99.766 ms | 90 → 90 ms | 12.219 → 12.312 MiB |
+| Four artifacts with Git tracking checks | 89.554 → 58.646 ms | 40 → 40 ms | 4.109 → 4.094 MiB |
+
+| Workload | First elapsed pair, before → after | Warm elapsed p95, before → after |
+| --- | ---: | ---: |
+| 1,001 separate small npm projects | 410.184 → 186.281 ms | 208.053 → 181.604 ms |
+| Shared 64 KiB manifest | 235.556 → 99.296 ms | 109.541 → 105.519 ms |
+| Four artifacts with Git tracking checks | 90.199 → 59.911 ms | 90.954 → 77.341 ms |
+
+Git's median was 34.5% lower in this repeat, with all five warm pairs faster. The two control medians reversed direction, but five of twenty small-npm and eight of twenty manifest pairs were still slower. Small-npm first-eligible p95 was **32.406 → 33.267 ms**, with eleven of twenty first-eligible pairs slower. The manifest's maximum RSS increased by 96 KiB. Reversed medians do not prove that the original regressions were noise or that the common path is regression-free.
+
+Other projects' heavy build work was paused for both series. Periodic process snapshots found no named compiler overlap, satisfying the predeclared compiler rule, **not an idle or exclusive host requirement**. The first series retained normal desktop activity. The repeat recorded substantial activity from chippytea, macOS media analysis and Spotlight throughout; the timing data does not establish their cause or an idle-app CPU figure. This limits attribution for the small controls. The supported conclusion is a repeatable target-workload wait reduction under these conditions, not a universal speedup.
+
+Each invocation starts a new process and empty scan-local caches. Fixture creation and physical audits warm filesystem caches; neither first nor warm pairs establish cold-disk performance. CPU is whole-process user plus system time at Darwin `/usr/bin/time -l` resolution, not just the Git child. RSS is the maximum lifetime high-water mark across all invocations. Nearest-rank p95 is the nineteenth of twenty warm samples, or the maximum for five and twelve samples; these are not reliable population-tail estimates. The million-file case is names-first discovery, not exhaustive metadata inventory.
+
+### Correctness and reproduction
+
+The frozen candidate passed **357 Rust tests**, formatting and all-target Clippy with warnings denied under Rust 1.98.0, followed by the matched optimized build. Four new tests exercise EOF-with-live-child behavior, readable/hangup/timeout policy, error and interrupted-wait fallback, and a real nonblocking pipe without consuming bytes or taking ownership of its descriptor. Existing tracked-file, changed-Git-evidence, linked-worktree and cleanup tests remain in the suite. Functional equality on valid fixtures is not a substitute for those safety checks.
+
+Both disposable initial-native suites passed: cleanup/restore/restart and access/interaction. They link the exact candidate archive into an ad-hoc signed app using the initial native source, not the separate updater/distribution build. They do not establish a native before/after gain, cancellation latency, installed update, universal build or minimum supported macOS version. This Git follow-up adds no native timing or cancellation timing samples.
+
+The portable fixture generator creates only a new `/private/tmp/chippytea-git-*` directory, requires a 16 GiB free-space reserve, independently writes 400 MiB of payload and uses offline, cleared-environment Git commands with bounded timeouts. It refuses existing destinations and propagates traversal errors. Its saved guard summary reports 27 checks; that record is not a per-case execution transcript. A separately generated fixture produced matching complete raw scans, the exact three eligible artifacts and one tracked-file exclusion, unchanged Git evidence and four distinct single-link payloads. The independent readback verified those raw results and bounded metadata, but did not rerun the guards or the full physical walk; the saved qualification has no dedicated argv/exit-status receipt. None of this untimed qualification is pooled into the timing tables.
+
+```sh
+python3 scripts/make-git-fixture.py /private/tmp/chippytea-git-ready
+python3 scripts/benchmark-suggestions.py /private/tmp/chippytea-git-ready \
+  --baseline-cli /path/to/before/chippytea-cli \
+  --candidate-cli target/release/chippytea-cli --warm-runs 20 \
+  --output benchmarks/local/git-ready-comparison
+```
+
+Both output paths must be new. The published generator is a portable follow-up to the frozen local timing builder, not the byte-identical builder of the measured fixture. It also applies the 16 GiB floor to the initial helper's writes and makes traversal errors explicit; the original timing builder's initial helper retained its lower default floor. Existing timed fixture audits found no resulting corruption. The general benchmark checks eligible proofs and physical invariants; the private audit additionally compares all diagnostic/final fields, histories and Git metadata. Neither generator performs cleanup or constructs an installable package-manager workspace.
+
+- Baseline CLI SHA-256: `ad9f1c7f67c5299787047d860839a12834b6531900466c4f9f0d6183b87cae5e`.
+- Candidate CLI SHA-256: `aa2c1a26f6a4feba828329f7171c2815bb21e3cac09edef5422a07fb25cc9508`.
+- Candidate scanner SHA-256: `d4cd9e3c2e1260380459730cb3f65439a06d31c9a197eebd413129d3d659ece7`.
+- Portable fixture generator SHA-256: `84fc5112578abd69ee8be9cda02b69223ce249e143b4126d3f8e6567e75d37a5`.
+- Private evidence: `benchmarks/local/scan-performance-20260901/git-ready-*` and `native-git-ready*`. The `coordinated` batch is the original 116-run series; `control-repeat` is the separate 96-run diagnostic. Raw paths, process observations and source/build manifests remain ignored, not published.
+
 ## Shared ancestor-manifest workspaces
 
 The manifest follow-up avoids fully parsing the same ancestor `package.json` for every workspace member. It retains only the original ordered workspace-pattern strings, keyed by the digest of the exact, currently identity-validated bytes. Each hit evaluates those patterns again for the current relative path; it does not cache a membership answer or deletion permission. Local manifest parsing and Bun's current-name check are unchanged.
