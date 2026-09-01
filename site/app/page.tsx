@@ -44,9 +44,17 @@ export default function Page() {
               them means, and choose what to keep or remove.
             </p>
             <div className="mt-[26px]">
-              <InkBox variant="primary" href={BUILD} seed={31} className="px-6 py-3 text-[15px]">
-                Build from source
-              </InkBox>
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-3">
+                <InkBox variant="primary" href="/download" seed={31} className="px-6 py-3 text-[15px]">
+                  Download for Mac
+                </InkBox>
+                <a
+                  className="text-[13px] text-ink/80 underline underline-offset-4 hover:text-ink hover:decoration-gold hover:decoration-2"
+                  href={BUILD}
+                >
+                  Build from source
+                </a>
+              </div>
               <div className="mt-3 flex flex-col gap-[3px] text-[12.5px] text-ink-soft">
                 <span>Free &amp; open source &middot; Apple Silicon &middot; macOS 14 or later</span>
                 <span>No account, no telemetry, nothing deleted on its own.</span>
