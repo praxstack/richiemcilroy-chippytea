@@ -172,7 +172,7 @@ CARGO_TARGET_DIR="$work/cargo" \
 
 python3 -B scripts/release/release.py validate-plist \
     --plist "$app/Contents/Info.plist" --version "$version"
-lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/chippytea"
+lipo "$app/Contents/MacOS/chippytea" -verify_arch arm64 x86_64
 # Build-directory overrides also change the scanner's ownership rules. Keep
 # them, along with publishing tokens, out of disposable native test processes.
 env -u GH_TOKEN -u GITHUB_TOKEN -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
@@ -242,7 +242,7 @@ verify_app() {
     codesign --verify --deep --strict --verbose=2 "$1"
     xcrun stapler validate "$1"
     spctl --assess --type execute --verbose=2 "$1"
-    lipo -verify_arch arm64 x86_64 "$1/Contents/MacOS/chippytea"
+    lipo "$1/Contents/MacOS/chippytea" -verify_arch arm64 x86_64
     python3 -B scripts/release/release.py validate-plist \
         --plist "$1/Contents/Info.plist" --version "$version"
 }
