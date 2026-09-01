@@ -302,6 +302,129 @@ class TemporaryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
 
+class KeychainSearchListTests(TemporaryTests):
+    def setUp(self):
+        super().setUp()
+        self.snapshot = self.root / "search list.json"
+        self.original = [
+            "/Users/Fixture Publisher/Library/Keychains/login.keychain-db",
+            '/Library/Keychains/literal "quote" \\ $HOME $(id) `id`.keychain-db',
+            "/Users/Fixture Publisher/Library/Keychains/login.keychain-db",
+        ]
+        self.current = list(self.original)
+        self.calls = []
+
+    @staticmethod
+    def listing(paths):
+        return "".join(f'    "{path}"\n' for path in paths)
+
+    def fake_security(self, arguments, **kwargs):
+        self.calls.append(list(arguments))
+        self.assertEqual(arguments[:4], ["security", "list-keychains", "-d", "user"])
+        if len(arguments) > 4:
+            self.assertEqual(arguments[4], "-s")
+            self.current = arguments[5:]
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        return subprocess.CompletedProcess(arguments, 0, self.listing(self.current), "")
+
+    def invoke(self, action, keychain=None):
+        arguments = ["release.py", "keychain-search-list", action, "--snapshot", str(self.snapshot)]
+        if keychain is not None:
+            arguments.extend(["--keychain", str(keychain)])
+        with patch("sys.argv", arguments):
+            release.main()
+
+    def test_snapshot_prepend_restore_preserves_literal_paths_order_and_duplicates(self):
+        owned = self.root / "private work" / "signing.keychain-db"
+        with patch.object(release.subprocess, "run", side_effect=self.fake_security), \
+                patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.invoke("snapshot")
+            saved = self.snapshot.read_bytes()
+            self.assertEqual(json.loads(saved), {"schema": 1, "keychains": self.original})
+            self.assertEqual(stat.S_IMODE(self.snapshot.stat().st_mode), 0o600)
+            self.invoke("prepend", owned)
+            self.assertEqual(self.current, [str(owned), *self.original])
+            with self.assertRaisesRegex(release.ReleaseError, "Could not save"):
+                self.invoke("snapshot")
+            self.invoke("restore")
+            self.assertEqual(self.current, self.original)
+            self.assertEqual(self.snapshot.read_bytes(), saved)
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+        setters = [arguments for arguments in self.calls if "-s" in arguments]
+        self.assertEqual([arguments[5:] for arguments in setters],
+                         [[str(owned), *self.original], self.original])
+
+    def test_an_empty_original_list_is_restored_with_an_explicit_empty_set(self):
+        self.current = []
+        with patch.object(release.subprocess, "run", side_effect=self.fake_security):
+            self.invoke("snapshot")
+            self.invoke("prepend", self.root / "signing.keychain-db")
+            self.invoke("restore")
+        self.assertEqual(self.current, [])
+        self.assertEqual(self.calls[-2], ["security", "list-keychains", "-d", "user", "-s"])
+
+    def test_malformed_or_nonabsolute_listing_paths_are_rejected_without_echoing_them(self):
+        for output in ('private-sentinel', '"private-sentinel"', '"/private-sentinel',
+                       '"/private-sentinel" extra', '"/private-sentinel\ncontinued"',
+                       '"/private-sentinel\x00"', '"/private-sentinel\r"'):
+            with self.subTest(output=output), self.assertRaises(release.ReleaseError) as caught:
+                release.parse_keychain_search_list(output)
+            self.assertNotIn("private-sentinel", str(caught.exception))
+
+    def test_malformed_or_unreadable_snapshots_never_mutate_the_search_list(self):
+        values = ([], {}, {"schema": 2, "keychains": []}, {"schema": True, "keychains": []},
+                  {"schema": 1, "keychains": "private-sentinel"},
+                  {"schema": 1, "keychains": ["relative-private-sentinel"]},
+                  {"schema": 1, "keychains": ["/private-sentinel\nother"]},
+                  {"schema": 1, "keychains": [None]},
+                  {"schema": 1, "keychains": [], "unexpected": "private-sentinel"})
+        contents = [json.dumps(value) for value in values] + ["invalid private-sentinel JSON"]
+        for content in contents:
+            self.snapshot.write_text(content)
+            with self.subTest(content=content), patch.object(release.subprocess, "run") as invoke, \
+                    self.assertRaises(release.ReleaseError) as caught:
+                release.apply_keychain_search_list_snapshot(self.snapshot)
+            invoke.assert_not_called()
+            self.assertNotIn("private-sentinel", str(caught.exception))
+        self.snapshot.unlink()
+        with patch.object(release.subprocess, "run") as invoke, self.assertRaises(release.ReleaseError):
+            release.apply_keychain_search_list_snapshot(self.snapshot)
+        invoke.assert_not_called()
+
+    def test_query_failures_and_success_with_partial_output_do_not_create_a_snapshot(self):
+        private = "SecKeychainGetPath private-sentinel keychain-path"
+        cases = (
+            subprocess.CompletedProcess([], 1, private, private),
+            subprocess.CompletedProcess([], 0, self.listing(self.original[:1]), private),
+            OSError(private), subprocess.TimeoutExpired([private], 30, output=private),
+        )
+        for result in cases:
+            options = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with self.subTest(result=result), patch.object(release.subprocess, "run", **options), \
+                    self.assertRaises(release.ReleaseError) as caught:
+                release.snapshot_keychain_search_list(self.snapshot)
+            self.assertFalse(self.snapshot.exists())
+            self.assertNotIn("private-sentinel", str(caught.exception))
+
+    def test_set_errors_and_inexact_readback_are_not_reported_as_restored(self):
+        self.snapshot.write_text(json.dumps({"schema": 1, "keychains": self.original}))
+        private = "SecKeychainOpen private-sentinel keychain-path"
+        cases = (
+            [subprocess.CompletedProcess([], 1, private, private)],
+            [subprocess.CompletedProcess([], 0, "", private)],
+            [subprocess.CompletedProcess([], 0, "", ""),
+             subprocess.CompletedProcess([], 0, self.listing(self.original[:1]), "")],
+        )
+        for responses in cases:
+            with self.subTest(responses=responses), \
+                    patch.object(release.subprocess, "run", side_effect=responses), \
+                    self.assertRaises(release.ReleaseError) as caught:
+                release.apply_keychain_search_list_snapshot(self.snapshot)
+            self.assertNotIn("private-sentinel", str(caught.exception))
+            self.assertNotIn(self.original[0], str(caught.exception))
+
+
 class AppcastTests(TemporaryTests):
     def setUp(self):
         super().setUp()

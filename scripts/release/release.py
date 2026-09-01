@@ -139,6 +139,75 @@ def classify_signing_probe_error(output: str) -> str:
     return "UNKNOWN"
 
 
+def validate_keychain_search_list(paths: list[str]) -> list[str]:
+    require(isinstance(paths, list) and all(
+        isinstance(path, str) and path.startswith("/") and
+        not any(character in path for character in ("\x00", "\r", "\n")) for path in paths),
+        "User keychain search list contains an invalid path.")
+    return paths
+
+
+def parse_keychain_search_list(output: str) -> list[str]:
+    require("\x00" not in output and "\r" not in output,
+            "User keychain search-list output is malformed.")
+    paths = []
+    for line in output.split("\n"):
+        quoted = line.strip(" \t")
+        if not quoted:
+            continue
+        require(len(quoted) >= 2 and quoted.startswith('"') and quoted.endswith('"'),
+                "User keychain search-list output is malformed.")
+        # Apple's security wraps each path without escaping its contents.
+        # Preserve literal quotes/backslashes; subprocess arrays never eval them.
+        paths.append(quoted[1:-1])
+    return validate_keychain_search_list(paths)
+
+
+def keychain_search_list_command(paths: list[str] | None = None) -> str:
+    arguments = ["security", "list-keychains", "-d", "user"]
+    if paths is not None:
+        # An empty array deliberately sets an empty list; it is not a query.
+        arguments.extend(["-s", *validate_keychain_search_list(paths)])
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=30,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise ReleaseError("User keychain search-list command could not complete.") from None
+    require(result.returncode == 0,
+            f"User keychain search-list command failed (exit {result.returncode}).")
+    # security can report path-open/get-path errors but return success after
+    # omitting those entries. Never accept or restore a partial list silently.
+    require(not result.stderr.strip(), "User keychain search-list command reported an error.")
+    return result.stdout
+
+
+def snapshot_keychain_search_list(path: Path) -> None:
+    paths = parse_keychain_search_list(keychain_search_list_command())
+    try:
+        # Never replace the original snapshot after the search list changes.
+        with path.open("x", encoding="utf-8") as destination:
+            os.fchmod(destination.fileno(), 0o600)
+            json.dump({"schema": 1, "keychains": paths}, destination)
+    except (OSError, UnicodeError):
+        raise ReleaseError("Could not save the private keychain search-list snapshot.") from None
+
+
+def apply_keychain_search_list_snapshot(path: Path, prepend: Path | None = None) -> None:
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        raise ReleaseError("Could not read the private keychain search-list snapshot.") from None
+    require(isinstance(snapshot, dict) and set(snapshot) == {"schema", "keychains"} and
+            type(snapshot["schema"]) is int and snapshot["schema"] == 1,
+            "Invalid keychain search-list snapshot schema.")
+    paths = validate_keychain_search_list(snapshot["keychains"])
+    if prepend is not None:
+        paths = validate_keychain_search_list([str(prepend), *paths])
+    keychain_search_list_command(paths)
+    require(parse_keychain_search_list(keychain_search_list_command()) == paths,
+            "User keychain search-list update could not be verified.")
+
+
 def api(path: str, method: str = "GET", body: dict | None = None,
         missing_ok: bool = False):
     arguments = ["gh", "api", "--method", method, "-H",
@@ -635,6 +704,10 @@ def main() -> None:
     command.add_argument("--keychain", type=Path, required=True)
     command = sub.add_parser("signing-probe-error")
     command.add_argument("--log", type=Path, required=True)
+    command = sub.add_parser("keychain-search-list")
+    command.add_argument("action", choices=("snapshot", "prepend", "restore"))
+    command.add_argument("--snapshot", type=Path, required=True)
+    command.add_argument("--keychain", type=Path)
     command = sub.add_parser("prepare")
     command.add_argument("--plan", type=Path, required=True)
     command.add_argument("--archives", type=Path, required=True)
@@ -672,6 +745,13 @@ def main() -> None:
         except (OSError, UnicodeError):
             output = ""
         print(classify_signing_probe_error(output))
+    elif args.command == "keychain-search-list":
+        require((args.action == "prepend") == (args.keychain is not None),
+                "A keychain argument is required only when prepending to the search list.")
+        if args.action == "snapshot":
+            snapshot_keychain_search_list(args.snapshot)
+        else:
+            apply_keychain_search_list_snapshot(args.snapshot, args.keychain)
     elif args.command == "prepare":
         prepare(read_plan(args.plan), args.archives)
     elif args.command == "validate-zip":
