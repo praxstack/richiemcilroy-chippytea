@@ -54,6 +54,15 @@ final class EngineClient: @unchecked Sendable {
             queue.async { do { continuation.resume(returning: try self.requestSync(request)) } catch { continuation.resume(throwing: error) } }
         }
     }
+    /// Submit directly to one serial control queue to preserve lifecycle order
+    /// without waiting behind a long content check on the ordinary work queue.
+    func setInteractive(_ active: Bool) {
+        progressQueue.async {
+            // This is advisory: a rejected hint must not become a cleanup
+            // failure or enter the snapshot response decoder.
+            _ = try? self.requestSync(["action": "set_interactive", "active": active])
+        }
+    }
     /// Scan progress uses this frequently. Decode changed responses on the
     /// engine queue before returning to the main actor.
     func snapshot() async throws -> EngineSnapshot {
@@ -447,6 +456,8 @@ struct DiscoveryPresentation: Equatable {
         do {
             let directory = directory
             client = try await Task.detached(priority: .utility) { try EngineClient(database: directory.appendingPathComponent("library.sqlite")) }.value
+            // Visibility may have changed while the client was being created.
+            client?.setInteractive(visible)
             let accessRecord = await Task.detached(priority: .utility) {
                 guard let data = try? Data(contentsOf: directory.appendingPathComponent("disk-access.json")) else { return DiskAccessSetupRecord?.none }
                 return try? JSONDecoder().decode(DiskAccessSetupRecord.self, from: data)
@@ -1256,6 +1267,7 @@ struct DiscoveryPresentation: Equatable {
     }
     func windowClosed() {
         visible = false; panelVisible = false
+        client?.setInteractive(false)
         consumedCleanupPreviewID = cleanupPreview?.id
         if let id = cleanupPreview?.id { finishCleanupPreview(id) }
         presentedCleanupPreviewID = nil
@@ -1265,6 +1277,7 @@ struct DiscoveryPresentation: Equatable {
     }
     func windowOpened() {
         visible = true; panelVisible = true
+        client?.setInteractive(true)
         if snapshot.wallet.pendingCoins > 0 { destination = .coins }
         collect()
     }
