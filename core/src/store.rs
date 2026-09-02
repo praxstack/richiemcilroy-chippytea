@@ -2,6 +2,7 @@ use crate::model::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::RefCell;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 pub struct Store {
@@ -30,16 +31,22 @@ const FOREGROUND_STATE_SQL: &str = "SELECT revision,
 
 // The expression and ordering match the partial index below. SQLite can stop
 // after the visible page instead of decoding and sorting the entire disk index.
-const SUGGESTIONS_SQL: &str = "SELECT c.json FROM candidates c
+static SUGGESTIONS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT c.json FROM candidates c
     WHERE json_extract(c.json,'$.suggestion_eligible')=1
       AND json_extract(c.json,'$.blocked_reason') IS NULL
-      AND json_extract(c.json,'$.allocated_bytes')>=100000000
+      AND json_extract(c.json,'$.allocated_bytes')>={}
       AND NOT EXISTS(SELECT 1 FROM kept k WHERE c.path=k.path
           OR substr(c.path,1,length(k.path)+1)=k.path||'/'
           OR substr(k.path,1,length(c.path)+1)=c.path||'/')
-    ORDER BY CASE json_extract(c.json,'$.kind') WHEN 'cargo' THEN 0 WHEN 'node' THEN 1 WHEN 'venv' THEN 2 WHEN 'webcache' THEN 3 ELSE 4 END,
+    ORDER BY {},
              json_extract(c.json,'$.allocated_bytes') DESC, c.path
-    LIMIT 500";
+    LIMIT 500",
+        crate::recommendations::minimum_size_sql("c.json"),
+        crate::recommendations::priority_sql("c.json")
+    )
+});
 
 /// One page of the operations ledger, newest first. `?1` NULL starts at the
 /// newest receipt; a `next_before` cursor value continues strictly older ones.
@@ -69,15 +76,21 @@ impl Store {
             CREATE TABLE IF NOT EXISTS wallet(id INTEGER PRIMARY KEY CHECK(id=1), collected INTEGER NOT NULL, remainder INTEGER NOT NULL, credited INTEGER NOT NULL);
             INSERT OR IGNORE INTO wallet VALUES(1,0,0,0);
             PRAGMA user_version=2;").map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA cache_size=-8192;
-            CREATE INDEX IF NOT EXISTS candidate_paths ON candidates(root_id,path);
+        conn.execute_batch(&format!(
+            "PRAGMA cache_size=-8192;
             DROP INDEX IF EXISTS candidate_suggestions_v2;
-            CREATE INDEX IF NOT EXISTS candidate_suggestions_v3 ON candidates(
-                CASE json_extract(json,'$.kind') WHEN 'cargo' THEN 0 WHEN 'node' THEN 1 WHEN 'venv' THEN 2 WHEN 'webcache' THEN 3 ELSE 4 END,
+            DROP INDEX IF EXISTS candidate_suggestions_v3;
+            CREATE INDEX IF NOT EXISTS candidate_suggestions_v4 ON candidates(
+                {},
                 json_extract(json,'$.allocated_bytes') DESC, path)
                 WHERE json_extract(json,'$.suggestion_eligible')=1
                   AND json_extract(json,'$.blocked_reason') IS NULL
-                  AND json_extract(json,'$.allocated_bytes')>=100000000;
+                  AND json_extract(json,'$.allocated_bytes')>={};",
+            crate::recommendations::priority_sql("json"),
+            crate::recommendations::minimum_size_sql("json")
+        ))
+        .map_err(err)?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS candidate_paths ON candidates(root_id,path);
             CREATE TABLE IF NOT EXISTS index_version(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
             INSERT OR IGNORE INTO index_version VALUES(1,0);
             CREATE TABLE IF NOT EXISTS foreground_state(
@@ -830,7 +843,7 @@ impl Store {
         if let Some(cached) = self.visible_candidates.borrow().as_ref() {
             return Ok(cached.clone());
         }
-        let candidates = self.json_rows::<Candidate>(SUGGESTIONS_SQL)?;
+        let candidates = self.json_rows::<Candidate>(&SUGGESTIONS_SQL)?;
         *self.visible_candidates.borrow_mut() = Some(candidates.clone());
         Ok(candidates)
     }
@@ -2969,8 +2982,8 @@ mod tests {
                 blocked,
             ],
         );
-        // Deterministic consequence groups: recompile, reinstall, recreate,
-        // rebuild, then personal review; size orders within a group.
+        // Cleanup artifacts share the first group; size orders that group.
+        // Personal-file review cannot displace those cleanup opportunities.
         assert_eq!(
             store
                 .candidates()
@@ -2978,16 +2991,76 @@ mod tests {
                 .iter()
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>(),
-            ["cargo", "node", "venv", "webcache", "personal"]
+            ["venv", "webcache", "node", "cargo", "personal"]
         );
         store.keep("/root/cargo", true).unwrap();
         assert_eq!(store.candidates().unwrap().len(), 4);
         store.keep("/root/cargo", false).unwrap();
-        assert_eq!(store.candidates().unwrap()[0].id, "cargo");
+        assert_eq!(store.candidates().unwrap()[0].id, "venv");
         let mut changed = store.candidate("cargo").unwrap();
         changed.suggestion_eligible = false;
         save(&mut store, vec![changed]);
         assert_eq!(store.candidates().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn category_thresholds_and_priority_are_applied_by_the_indexed_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let kinds = [
+            "cache",
+            "log",
+            "crashreport",
+            "xcode",
+            "installer",
+            "archive",
+            "download",
+            "largefile",
+        ];
+        let mut rows = Vec::new();
+        for kind in kinds {
+            let minimum = crate::recommendations::minimum_bytes(kind);
+            rows.push(item(kind, &format!("/root/{kind}"), kind, minimum, true));
+            rows.push(item(
+                &format!("small-{kind}"),
+                &format!("/root/small-{kind}"),
+                kind,
+                minimum - 1,
+                true,
+            ));
+        }
+        rows.push(item(
+            "unknown",
+            "/root/unknown",
+            "unrecognized",
+            u64::MAX,
+            true,
+        ));
+        save(&mut store, rows);
+        assert_eq!(
+            store
+                .candidates()
+                .unwrap()
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "xcode",
+                "cache",
+                "log",
+                "crashreport",
+                "installer",
+                "download",
+                "archive",
+                "largefile"
+            ]
+        );
+        // The 1 MB report and 10 MB log survive the query's size filter, while
+        // a 500 MB personal file cannot displace first-group cleanup artifacts.
+        assert_eq!(
+            store.candidate("crashreport").unwrap().allocated_bytes,
+            1_000_000
+        );
     }
 
     #[test]
@@ -3115,7 +3188,7 @@ mod tests {
         let store = Store::open(&dir.path().join("db")).unwrap();
         let mut query = store
             .conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {SUGGESTIONS_SQL}"))
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", SUGGESTIONS_SQL.as_str()))
             .unwrap();
         let details = query
             .query_map([], |r| r.get::<_, String>(3))
@@ -3123,7 +3196,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(details.contains("candidate_suggestions_v3"), "{details}");
+        assert!(details.contains("candidate_suggestions_v4"), "{details}");
         assert!(!details.contains("USE TEMP B-TREE"), "{details}");
     }
     #[test]
