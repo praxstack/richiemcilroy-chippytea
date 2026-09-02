@@ -601,7 +601,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use tempfile::TempDir;
 
@@ -828,33 +828,78 @@ mod tests {
 
     #[test]
     fn stalled_response_times_out_without_waiting_for_server_completion() {
-        let server = Server::serve(|_stream| {
-            thread::sleep(Duration::from_millis(200));
+        // Prepare both endpoints before starting the read deadline.
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            drop(peer);
         });
-        let started = Instant::now();
-        let error = build_cache_with_timeout(
-            &server.path,
+        let result = read_response(
+            &mut stream,
             &AtomicBool::new(false),
-            Duration::from_millis(40),
-        )
-        .unwrap_err();
+            Instant::now() + Duration::from_millis(40),
+        );
+        let released = release_tx.send(());
+        server.join().unwrap();
+
+        released.expect("the fake daemon stopped before the read timed out");
+        let error = result.unwrap_err();
         assert!(error.contains("timed out"));
-        assert!(started.elapsed() < Duration::from_millis(180));
     }
 
     #[test]
     fn cancellation_returns_promptly_and_does_not_claim_daemon_cancellation() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_from_server = Arc::clone(&cancel);
-        let server = Server::serve(move |_stream| {
-            thread::sleep(Duration::from_millis(30));
-            cancel_from_server.store(true, Ordering::Release);
-            thread::sleep(Duration::from_millis(300));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = Server::serve(move |mut stream| {
+            ready_tx.send(()).unwrap();
+            // Keep the daemon connection open until the client has returned.
+            // This bound is a cleanup watchdog, not a performance assertion.
+            release_rx
+                .recv_timeout(TIMEOUT)
+                .expect("stalled server was not released");
+            stream.set_nonblocking(true).unwrap();
+            assert_eq!(
+                stream.read(&mut [0u8; 1]).unwrap(),
+                0,
+                "the client must close its connection without a daemon response"
+            );
         });
-        let started = Instant::now();
-        let error =
-            build_cache_with_timeout(&server.path, &cancel, Duration::from_secs(1)).unwrap_err();
-        assert!(error.contains("daemon-side accounting may still finish"));
-        assert!(started.elapsed() < Duration::from_millis(200));
+        let path = server.path.clone();
+        let client_cancel = Arc::clone(&cancel);
+        let (result_tx, result_rx) = mpsc::channel();
+        let client = thread::spawn(move || {
+            let result = build_cache(&path, &client_cancel);
+            let _ = result_tx.send(result);
+        });
+
+        let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+        if ready.is_ok() {
+            cancel.store(true, Ordering::Release);
+        }
+        // Start the watchdog after the request handshake, excluding startup.
+        // It remains well below the normal 15-second request deadline.
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        let released = release_tx.send(());
+        // Wake accept if the client failed before connecting, so cleanup cannot hang.
+        drop(UnixStream::connect(&server.path));
+        let client_joined = client.join();
+        let request = server.join();
+
+        // Release and join both threads before any assertion can unwind this test.
+        client_joined.unwrap();
+        ready.expect("the fake daemon did not receive the request");
+        released.expect("the fake daemon stopped before the client returned");
+        assert_eq!(request, REQUEST);
+        let error = result
+            .expect("the client did not return while the fake daemon was stalled")
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Docker read cancelled; daemon-side accounting may still finish"
+        );
     }
 }
