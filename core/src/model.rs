@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 pub const COIN_BYTES: u64 = 100_000_000;
 // Rebuild derived findings for category-specific everyday Mac recommendations.
-pub const RULE_VERSION: u32 = 9;
+pub const RULE_VERSION: u32 = 10;
 pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +130,28 @@ pub struct Snapshot {
     pub foreground_scan: Option<ForegroundScan>,
     pub error: Option<String>,
     pub kept_paths: Vec<String>,
+}
+
+/// The small, frequently changing part of a native snapshot. Indexed rows and
+/// reward/recovery history are deliberately absent from progress-only replies.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SnapshotProgress {
+    pub scanning: bool,
+    pub cleaning: bool,
+    pub stats: ScanStats,
+    pub foreground_scan: Option<ForegroundScan>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SnapshotUpdate {
+    pub revision: String,
+    pub content_revision: String,
+    pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Snapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<SnapshotProgress>,
 }
 
 pub fn now() -> i64 {
