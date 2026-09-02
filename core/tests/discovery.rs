@@ -2,9 +2,11 @@ use chippytea_core::{Engine, model::*};
 use serde_json::json;
 use std::{
     fs,
+    io::Write,
+    os::unix::fs::MetadataExt,
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 fn wait(engine: &Arc<Engine>) -> Snapshot {
@@ -297,20 +299,6 @@ fn mixed_commit_message_and_artifact_events_survive_restart_with_exact_scopes() 
         artifact
     }
 
-    fn indexed_candidate(db: &Path, path: &Path) -> Candidate {
-        let connection =
-            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .unwrap();
-        let encoded: String = connection
-            .query_row(
-                "SELECT json FROM candidates WHERE path=?1",
-                [path.to_str().unwrap()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        serde_json::from_str(&encoded).unwrap()
-    }
-
     let (temp, engine, root) = fixture();
     let db = temp.path().canonicalize().unwrap().join("db");
     let artifact = aged_project(&root.path.join("b"));
@@ -441,5 +429,595 @@ fn a_substituted_scope_parent_cannot_be_followed_for_absence_checks() {
     assert_eq!(
         fs::read_to_string(outside.join("preserve")).unwrap(),
         "outside grant"
+    );
+}
+
+fn indexed_candidate(db: &Path, path: &Path) -> Candidate {
+    let connection =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let encoded: String = connection
+        .query_row(
+            "SELECT json FROM candidates WHERE path=?1",
+            [path.to_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&encoded).unwrap()
+}
+
+fn allocated_file(path: &Path, bytes: u64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut file = fs::File::create(path).unwrap();
+    let block = [0x63; 64 * 1024];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let count = remaining.min(block.len() as u64) as usize;
+        file.write_all(&block[..count]).unwrap();
+        remaining -= count as u64;
+    }
+    file.sync_all().unwrap();
+    assert!(file.metadata().unwrap().blocks() * 512 >= bytes);
+}
+
+fn age_fixture_tree(path: &Path, days: u64) {
+    if path.is_dir() {
+        for child in fs::read_dir(path).unwrap() {
+            age_fixture_tree(&child.unwrap().path(), days);
+        }
+    }
+    fs::File::open(path)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(days * 86_400)),
+        )
+        .unwrap();
+}
+
+#[test]
+fn explicit_duplicate_check_verifies_contents_includes_kept_copies_and_expires_on_events() {
+    use std::io::{Seek, SeekFrom};
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let downloads = base.join("Downloads");
+    let size = 21_000_000;
+    let paths = ["keeper.dmg", "copy.dmg", "different.dmg"].map(|name| downloads.join(name));
+    for path in &paths {
+        allocated_file(path, size);
+    }
+    // Preserve the first, middle and last sample while changing real content.
+    let mut different = fs::OpenOptions::new().write(true).open(&paths[2]).unwrap();
+    different.seek(SeekFrom::Start(2 * 64 * 1024)).unwrap();
+    different.write_all(b"not actually equal").unwrap();
+    different.sync_all().unwrap();
+    drop(different);
+    age_fixture_tree(&downloads, 15);
+    let engine = Engine::open(&base.join("library.sqlite"), None).unwrap();
+    let root: Root = serde_json::from_value(
+        engine
+            .request(json!({
+                "action":"authorize", "path":downloads, "kind":"downloads"
+            }))
+            .unwrap(),
+    )
+    .unwrap();
+    engine.request(json!({"action":"scan"})).unwrap();
+    let initial = wait(&engine);
+    assert!(initial.stats.complete, "{initial:?}");
+    assert_eq!(initial.candidates.len(), 3);
+    assert!(
+        initial
+            .candidates
+            .iter()
+            .all(|file| file.kind == "installer")
+    );
+    assert!(
+        engine
+            .request(json!({"action":"duplicate_progress"}))
+            .unwrap()
+            .is_null()
+    );
+    let keeper = initial
+        .candidates
+        .iter()
+        .find(|file| file.path == paths[0])
+        .unwrap();
+    let copy = initial
+        .candidates
+        .iter()
+        .find(|file| file.path == paths[1])
+        .unwrap();
+    engine
+        .request(json!({"action":"keep", "id":keeper.id}))
+        .unwrap();
+    assert_eq!(engine.snapshot().unwrap().candidates.len(), 2);
+    let report = engine
+        .request(json!({"action":"check_duplicates"}))
+        .unwrap();
+    assert_eq!(report["indexed_files"], 3);
+    assert_eq!(report["progress"]["complete"], true, "{report}");
+    assert_eq!(report["progress"]["files_compared"], 3);
+    assert_eq!(report["progress"]["bytes_read"], 5 * size + 9 * 64 * 1024);
+    let groups = report["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{report}");
+    let files = groups[0]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(
+        files
+            .iter()
+            .any(|file| file["candidate"]["id"] == keeper.id && file["keeper_only"] == true)
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file["candidate"]["id"] == copy.id && file["keeper_only"] == false)
+    );
+    let request = json!({"action":"prepare_duplicate", "operation":"trash",
+        "report_token":report["token"], "group_id":groups[0]["id"],
+        "keeper_id":keeper.id, "copy_id":copy.id});
+    let mut permanent = request.clone();
+    permanent["operation"] = json!("permanent");
+    assert!(
+        engine
+            .request(permanent)
+            .unwrap_err()
+            .contains("Trash-only")
+    );
+    let mut reversed = request.clone();
+    reversed["keeper_id"] = json!(copy.id);
+    reversed["copy_id"] = json!(keeper.id);
+    assert!(
+        engine.request(reversed).is_err(),
+        "Keep is not permission to remove the keeper"
+    );
+    assert!(engine.request(request.clone()).unwrap()["token"].is_string());
+    // A kept file may be filtered from normal event refresh. Its raw event must
+    // still invalidate the content report before another review can be prepared.
+    engine
+        .request(json!({"action":"dirty", "root_id":root.id, "path":keeper.path}))
+        .unwrap();
+    assert!(engine.request(request).unwrap_err().contains("expired"));
+    let final_snapshot = wait(&engine);
+    assert!(final_snapshot.history.is_empty());
+    assert_eq!(final_snapshot.wallet.credited_bytes, 0);
+    assert_eq!(final_snapshot.kept_paths, [keeper.path.to_str().unwrap()]);
+    for path in &paths {
+        assert_eq!(fs::metadata(path).unwrap().len(), size);
+    }
+}
+
+#[test]
+fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let home = base.join("Home");
+    let cache = home.join("Library/Caches/com.example.fixture");
+    let cached_payload = cache.join("nested/payload");
+    let log = home.join("Library/Logs/fixture/rotated.log");
+    let report = home.join("Library/Logs/DiagnosticReports/fixture.ips");
+    let installer = home.join("Downloads/fixture.DMG");
+    for (path, bytes) in [
+        (&cached_payload, 51_000_000),
+        (&log, 11_000_000),
+        (&report, 1_100_000),
+        (&installer, 21_000_000),
+    ] {
+        allocated_file(path, bytes);
+    }
+    let protected = [
+        "Library/Application Support/fixture/state",
+        "Library/Keychains/preserve",
+        "Library/Containers/fixture/Data/Library/Caches/preserve",
+        "Library/Developer/Xcode/Archives/preserve",
+        "Library/Developer/CoreSimulator/preserve",
+        "Library/Caches/uv/preserve",
+        "Library/Caches/Homebrew/preserve",
+    ]
+    .map(|relative| home.join(relative));
+    for path in &protected {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"preserve unrelated application data").unwrap();
+    }
+    age_fixture_tree(&home, 31);
+    // Installers use their own 14-day policy, not the generic 30-day one.
+    age_fixture_tree(&installer, 15);
+    let current_log = log.with_file_name("current.log");
+    fs::write(&current_log, b"currently logging").unwrap();
+
+    let db = base.join("db");
+    let engine = Engine::open(&db, None).unwrap();
+    let root: Root = serde_json::from_value(
+        engine
+            .request(json!({"action":"authorize", "path":home, "kind":"home"}))
+            .unwrap(),
+    )
+    .unwrap();
+    engine
+        .request(json!({"action":"scan", "metadata_coverage":true}))
+        .unwrap();
+    let initial = wait(&engine);
+    assert!(initial.stats.complete, "{initial:?}");
+    let cached_review = indexed_candidate(&db, &cache);
+    assert_eq!(cached_review.kind, "cache");
+    assert!(cached_review.allocated_bytes >= 51_000_000);
+    assert!(!cached_review.provisional && !cached_review.eligible_permanent);
+    let cache_offered = cached_review.suggestion_eligible;
+    if !cache_offered {
+        // Some macOS hosts contain a live process whose executable cannot be
+        // inspected. Keep that production fail-closed policy, but still prove
+        // cache recognition and measurement; no other exclusion is accepted.
+        let activity_unavailable = if cfg!(target_os = "macos") {
+            "A running executable could not be identified; cleanup is withheld"
+        } else {
+            "Reliable activity checks are supported only by the native macOS engine"
+        };
+        assert_eq!(
+            cached_review.blocked_reason.as_deref(),
+            Some(activity_unavailable)
+        );
+    }
+    assert_eq!(
+        initial.candidates.len(),
+        3 + usize::from(cache_offered),
+        "{initial:?}"
+    );
+    for (path, kind) in [
+        (&cache, "cache"),
+        (&log, "log"),
+        (&report, "crashreport"),
+        (&installer, "installer"),
+    ] {
+        if kind == "cache" && !cache_offered {
+            continue;
+        }
+        let candidate = initial
+            .candidates
+            .iter()
+            .find(|candidate| &candidate.path == path)
+            .unwrap_or_else(|| panic!("Missing {kind} recommendation at {path:?}"));
+        assert_eq!(candidate.kind, kind);
+        assert!(candidate.suggestion_eligible && !candidate.provisional);
+        assert!(!candidate.eligible_permanent);
+        assert!(
+            engine
+                .request(json!({"action":"prepare", "operation":"trash", "items":[candidate]}))
+                .unwrap()["token"]
+                .as_str()
+                .is_some()
+        );
+        assert!(
+            engine
+                .request(json!({"action":"prepare", "operation":"permanent", "items":[candidate]}))
+                .is_err()
+        );
+    }
+    assert_eq!(initial.wallet.credited_bytes, 0);
+    assert!(initial.history.is_empty());
+
+    if cache_offered {
+        chippytea_core::scanner::revalidate(
+            &root,
+            &cached_review,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+    }
+    let cache_modified = fs::metadata(&cache).unwrap().modified().unwrap();
+    let active_payload = cache.join("nested/current");
+    fs::write(&active_payload, b"new work must remain").unwrap();
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        cache_modified,
+        "A fresh descendant must invalidate even an unchanged cache boundary"
+    );
+    assert!(
+        chippytea_core::scanner::revalidate(
+            &root,
+            &cached_review,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .is_err()
+    );
+    age_fixture_tree(&installer, 0);
+    engine
+        .request(json!({
+            "action":"dirty", "root_id":root.id,
+            "events":[
+                {"path":active_payload, "kind":"file", "recursive":false},
+                {"path":installer, "kind":"file", "recursive":false},
+                {"path":current_log, "kind":"file", "recursive":false}
+            ]
+        }))
+        .unwrap();
+    let refreshed = wait(&engine);
+    assert!(refreshed.stats.complete, "{refreshed:?}");
+    assert_eq!(refreshed.candidates.len(), 2, "{refreshed:?}");
+    assert_eq!(
+        (
+            refreshed.stats.entries - initial.stats.entries,
+            refreshed.stats.files - initial.stats.files,
+            refreshed.stats.directories - initial.stats.directories,
+        ),
+        (6, 4, 2),
+        "Refresh must visit only the four-entry cache unit and two changed files"
+    );
+    assert!(refreshed.candidates.iter().any(|row| row.path == log));
+    assert!(refreshed.candidates.iter().any(|row| row.path == report));
+    let changed_cache = indexed_candidate(&db, &cache);
+    assert!(changed_cache.modified_ns > cached_review.modified_ns);
+    assert!(
+        changed_cache.explanation.contains("30 quiet days"),
+        "Freshness must independently exclude the measured cache: {changed_cache:?}"
+    );
+    assert_eq!(fs::read(&active_payload).unwrap(), b"new work must remain");
+    assert_eq!(fs::metadata(&installer).unwrap().len(), 21_000_000);
+
+    let ignored = engine
+        .request(json!({
+            "action":"dirty", "root_id":root.id,
+            "events":protected.iter().map(|path| json!({
+                "path":path, "kind":"file", "recursive":false
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+    assert_eq!(ignored["ignored"], true);
+    let after_ignored = engine.snapshot().unwrap();
+    assert!(!after_ignored.scanning);
+    assert_eq!(after_ignored.stats.entries, refreshed.stats.entries);
+    for path in &protected {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"preserve unrelated application data"
+        );
+    }
+    assert_eq!(after_ignored.wallet.credited_bytes, 0);
+    assert!(after_ignored.history.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn live_cache_owner_blocks_discovery_and_a_prepared_cleanup_until_exit() {
+    use std::{
+        os::unix::ffi::OsStrExt,
+        process::{Child, Command, Stdio},
+        sync::atomic::AtomicBool,
+    };
+
+    // Only this test's child may be stopped. An unreaped owned child cannot
+    // have its PID reused; try_wait also avoids signalling an already reaped PID.
+    struct OwnedChild(Child);
+    impl OwnedChild {
+        fn stop(&mut self) -> std::io::Result<()> {
+            if self.0.try_wait()?.is_some() {
+                return Ok(());
+            }
+            self.0.kill()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if self.0.try_wait()?.is_some() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "The owned cache-owner fixture did not exit",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.stop();
+        }
+    }
+
+    const OWNER_RUNNING: &str =
+        "The app that owns this cache is running; close it before reviewing cleanup";
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let home = base.join("Home");
+    let bundle_id = format!("com.example.chippytea.cache-owner.{}", unique_id());
+    let cache = home.join("Library/Caches").join(&bundle_id);
+    let payload = cache.join("nested/payload");
+    allocated_file(&payload, 51_000_000);
+    age_fixture_tree(&home, 31);
+    let payload_identity = chippytea_core::safety::identity(&payload).unwrap();
+    let payload_digest = || {
+        let mut hasher = blake3::Hasher::new();
+        hasher
+            .update_reader(fs::File::open(&payload).unwrap())
+            .unwrap();
+        hasher.finalize()
+    };
+    let original_digest = payload_digest();
+
+    // Copy the existing system executable; do not compile, open, register or
+    // launch a user's app. Both its executable and cwd stay outside the cache,
+    // so only the exact bundle-ID rule can supply OWNER_RUNNING.
+    let app = base.join("Owner.app");
+    let executable = app.join("Contents/MacOS/fixture-sleep");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::copy("/bin/sleep", &executable).unwrap();
+    fs::write(
+        app.join("Contents/Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundlePackageType</key><string>APPL</string>\
+             <key>CFBundleExecutable</key><string>fixture-sleep</string>\
+             <key>CFBundleIdentifier</key><string>{bundle_id}</string>\
+             </dict></plist>"
+        ),
+    )
+    .unwrap();
+
+    let db = base.join("db");
+    // There is deliberately no Trash callback. Even if the activity guard
+    // regresses, this test cannot move anything into the user's native Trash.
+    let engine = Engine::open(&db, None).unwrap();
+    let root: Root = serde_json::from_value(
+        engine
+            .request(json!({"action":"authorize", "path":home, "kind":"home"}))
+            .unwrap(),
+    )
+    .unwrap();
+    engine.request(json!({"action":"scan"})).unwrap();
+    let idle = wait(&engine);
+    assert!(idle.stats.complete && idle.error.is_none(), "{idle:?}");
+    assert_eq!(idle.candidates.len(), 1, "{idle:?}");
+    let candidate = &idle.candidates[0];
+    assert_eq!(candidate.path, cache);
+    assert_eq!(candidate.kind, "cache");
+    assert!(candidate.suggestion_eligible && !candidate.provisional);
+    assert!(candidate.blocked_reason.is_none() && !candidate.eligible_permanent);
+    assert!(candidate.allocated_bytes >= 51_000_000);
+    chippytea_core::scanner::revalidate(&root, candidate, &AtomicBool::new(false)).unwrap();
+    let prepared = engine
+        .request(json!({"action":"prepare", "operation":"trash", "items":[candidate]}))
+        .unwrap();
+    assert!(prepared["token"].is_string());
+    assert!(idle.history.is_empty());
+    let wallet = serde_json::to_value(&idle.wallet).unwrap();
+
+    // The finite duration is a fallback if the entire test process aborts and
+    // cannot run Drop. Normal completion and panic unwinding stop/reap it early.
+    let mut child = OwnedChild(
+        Command::new(&executable)
+            .arg("60")
+            .current_dir(&base)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "The owned cache-owner fixture exited before inspection"
+        );
+        let mut path = [0u8; 4096];
+        let length = unsafe {
+            libc::proc_pidpath(
+                child.0.id() as libc::pid_t,
+                path.as_mut_ptr().cast(),
+                path.len() as u32,
+            )
+        };
+        if length > 0 {
+            let end = path.iter().position(|byte| *byte == 0).unwrap();
+            if &path[..end] == executable.as_os_str().as_bytes() {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "The owned fixture's executable path was not observable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Do not refresh the index before executing the old token: startup after
+    // prepare must be caught by fresh mutation-time activity evidence itself.
+    assert_eq!(
+        chippytea_core::scanner::revalidate(&root, candidate, &AtomicBool::new(false)).unwrap_err(),
+        OWNER_RUNNING
+    );
+    let receipts: Vec<Receipt> = serde_json::from_value(
+        engine
+            .request(json!({
+                "action":"execute", "token":prepared["token"], "confirmed":true
+            }))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0];
+    assert_eq!(receipt.outcome, "skipped");
+    assert!(receipt.detail.contains("before staging"), "{receipt:?}");
+    assert!(receipt.detail.contains(OWNER_RUNNING), "{receipt:?}");
+    assert_eq!(
+        (
+            receipt.observed_bytes,
+            receipt.credited_bytes,
+            receipt.coins
+        ),
+        (0, 0, 0)
+    );
+    assert!(receipt.trash_path.is_none() && !receipt.can_restore);
+    assert_eq!(
+        chippytea_core::safety::identity(&cache).unwrap(),
+        candidate.identity
+    );
+
+    // Mutation schedules a fresh scoped scan. Also request an ordinary scan
+    // explicitly, so positive/negative discovery uses the production mode.
+    wait(&engine);
+    engine.request(json!({"action":"scan"})).unwrap();
+    let running = wait(&engine);
+    assert!(
+        running.stats.complete && running.error.is_none(),
+        "{running:?}"
+    );
+    assert!(running.candidates.is_empty(), "{running:?}");
+    let blocked = indexed_candidate(&db, &cache);
+    assert_eq!(blocked.blocked_reason.as_deref(), Some(OWNER_RUNNING));
+    assert!(!blocked.suggestion_eligible);
+    assert!(
+        engine
+            .request(json!({"action":"prepare", "operation":"trash", "items":[blocked]}))
+            .unwrap_err()
+            .contains("ineligible")
+    );
+    // One refused execution is an audit receipt, not a removal or reward.
+    assert_eq!(running.history.len(), 1);
+    assert_eq!(running.history[0].id, receipt.id);
+    assert_eq!(serde_json::to_value(&running.wallet).unwrap(), wallet);
+    let refused_history = serde_json::to_value(&running.history).unwrap();
+    assert!(child.0.try_wait().unwrap().is_none());
+    child.stop().unwrap();
+
+    engine.request(json!({"action":"scan"})).unwrap();
+    let after_exit = wait(&engine);
+    assert!(
+        after_exit.stats.complete && after_exit.error.is_none(),
+        "{after_exit:?}"
+    );
+    assert_eq!(after_exit.candidates.len(), 1, "{after_exit:?}");
+    let available = &after_exit.candidates[0];
+    assert_eq!(available.id, candidate.id);
+    assert!(available.suggestion_eligible && available.blocked_reason.is_none());
+    assert!(!available.eligible_permanent);
+    chippytea_core::scanner::revalidate(&root, available, &AtomicBool::new(false)).unwrap();
+    assert!(
+        engine
+            .request(json!({"action":"prepare", "operation":"trash", "items":[available]}))
+            .unwrap()["token"]
+            .is_string()
+    );
+    let final_state = engine.snapshot().unwrap();
+    assert_eq!(serde_json::to_value(&final_state.wallet).unwrap(), wallet);
+    assert_eq!(
+        serde_json::to_value(&final_state.history).unwrap(),
+        refused_history
+    );
+    assert_eq!(
+        chippytea_core::safety::identity(&cache).unwrap(),
+        candidate.identity
+    );
+    assert_eq!(
+        chippytea_core::safety::identity(&payload).unwrap(),
+        payload_identity
+    );
+    assert_eq!(payload_digest(), original_digest);
+    assert!(
+        fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .all(|entry| entry.unwrap().path() == cache)
     );
 }

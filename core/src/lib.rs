@@ -1,7 +1,10 @@
 pub mod accounting;
+mod activity;
 pub mod cleanup;
+mod duplicates;
 mod lock_facts;
 pub mod model;
+mod recommendations;
 mod refresh;
 pub mod safety;
 pub mod scanner;
@@ -29,7 +32,26 @@ struct Review {
     items: Vec<(Root, Candidate)>,
     created: i64,
     cancel_generation: u64,
+    duplicate_keeper: Option<duplicates::Input>,
+    duplicate_created: Option<Instant>,
 }
+
+#[derive(Clone)]
+struct DuplicateReportState {
+    token: String,
+    groups: Vec<(String, duplicates::Group)>,
+    created: Instant,
+}
+
+#[derive(Default)]
+struct DuplicateState {
+    generation: u64,
+    active_paths: Vec<(String, PathBuf)>,
+    report: Option<DuplicateReportState>,
+    sql_active: bool,
+}
+
+const DUPLICATE_REVIEW_LIFETIME: Duration = Duration::from_secs(120);
 struct Runtime {
     stats: ScanStats,
     error: Option<String>,
@@ -75,6 +97,7 @@ enum ScanLaunch {
 }
 
 const BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(600);
+const INTERACTIVE_BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(300);
 
 impl ForegroundRequest {
     fn new(generation: u64, roots: &[Root], context: i64) -> Self {
@@ -236,6 +259,11 @@ pub struct Engine {
     reviews: Mutex<HashMap<String, Review>>,
     // Progress never takes the SQLite lock held by a cleanup operation.
     cleanup_progress: Mutex<Option<CleanupProgress>>,
+    duplicate_state: Mutex<DuplicateState>,
+    duplicate_progress: Mutex<Option<duplicates::Progress>>,
+    checking_duplicates: AtomicBool,
+    duplicate_cancel: AtomicBool,
+    sql_interrupt: rusqlite::InterruptHandle,
     busy: AtomicBool,
     scanning: AtomicBool,
     cleaning: AtomicBool,
@@ -244,6 +272,7 @@ pub struct Engine {
     mutation_cancel: AtomicBool,
     cancel_generation: AtomicU64,
     discovery_urgency: AtomicU64,
+    interactive: AtomicBool,
     pause_requested: AtomicBool,
     parked: Mutex<bool>,
     pause_changed: Condvar,
@@ -251,6 +280,8 @@ pub struct Engine {
     debounce_wait_observer: Mutex<Option<std::sync::mpsc::Sender<Instant>>>,
     #[cfg(test)]
     discovery_observer: Mutex<Option<DiscoveryObserver>>,
+    #[cfg(test)]
+    review_admission_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     trash: Option<cleanup::TrashCallback>,
     _lock: File,
 }
@@ -276,6 +307,7 @@ impl Engine {
         store.reconcile()?;
         let stats = store.latest_stats()?;
         let restored_foreground = store.load_foreground_summary()?;
+        let sql_interrupt = store.conn.get_interrupt_handle();
         store.conn.execute_batch("CREATE TABLE IF NOT EXISTS event_cursor(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL); INSERT OR IGNORE INTO event_cursor VALUES(1,0);").map_err(store::err)?;
         Ok(Arc::new(Self {
             store: Mutex::new(store),
@@ -291,6 +323,11 @@ impl Engine {
             }),
             reviews: Mutex::new(HashMap::new()),
             cleanup_progress: Mutex::new(None),
+            duplicate_state: Mutex::new(DuplicateState::default()),
+            duplicate_progress: Mutex::new(None),
+            checking_duplicates: AtomicBool::new(false),
+            duplicate_cancel: AtomicBool::new(false),
+            sql_interrupt,
             busy: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
             cleaning: AtomicBool::new(false),
@@ -299,6 +336,7 @@ impl Engine {
             mutation_cancel: AtomicBool::new(false),
             cancel_generation: AtomicU64::new(0),
             discovery_urgency: AtomicU64::new(0),
+            interactive: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             parked: Mutex::new(false),
             pause_changed: Condvar::new(),
@@ -306,6 +344,8 @@ impl Engine {
             debounce_wait_observer: Mutex::new(None),
             #[cfg(test)]
             discovery_observer: Mutex::new(None),
+            #[cfg(test)]
+            review_admission_observer: Mutex::new(None),
             trash,
             _lock: lock,
         }))
@@ -354,10 +394,37 @@ impl Engine {
             .ok_or("Missing action")?;
         match action {
             "snapshot" => serde_json::to_value(self.snapshot()?).map_err(store::err),
+            "set_interactive" => {
+                let active = request
+                    .get("active")
+                    .and_then(Value::as_bool)
+                    .ok_or("set_interactive requires a boolean active")?;
+                let was_active = self.interactive.swap(active, Ordering::AcqRel);
+                if active && !was_active {
+                    // Advisory UI state neither schedules work nor touches an
+                    // admission lock. Advancing the existing wait predicate
+                    // only wakes a background worker that was already batching.
+                    self.expedite_discovery();
+                }
+                Ok(json!({"ok":true}))
+            }
             "cleanup_progress" => {
                 serde_json::to_value(&*self.cleanup_progress.lock().map_err(store::err)?)
                     .map_err(store::err)
             }
+            "duplicate_progress" => {
+                serde_json::to_value(&*self.duplicate_progress.lock().map_err(store::err)?)
+                    .map_err(store::err)
+            }
+            "check_duplicates" => {
+                let _checking = self.begin_duplicate_check()?;
+                self.check_duplicates()
+            }
+            "cancel_duplicates" => {
+                self.cancel_duplicates();
+                Ok(json!({"ok":true}))
+            }
+            "prepare_duplicate" => self.prepare_duplicate(&request),
             "authorize" => {
                 if self.busy.load(Ordering::Acquire) {
                     return Err("Wait for the current operation before adding a folder.".into());
@@ -382,6 +449,7 @@ impl Engine {
                 runtime.recent_files.clear();
                 runtime.foreground = None;
                 runtime.restored_foreground = None;
+                self.invalidate_duplicates(None, None);
                 serde_json::to_value(root).map_err(store::err)
             }
             "forget" => {
@@ -397,6 +465,7 @@ impl Engine {
                     runtime.recent_files.clear();
                     runtime.foreground = None;
                     runtime.restored_foreground = None;
+                    self.invalidate_duplicates(Some(id), None);
                 }
                 Ok(json!({"ok":true}))
             }
@@ -414,9 +483,14 @@ impl Engine {
                         self.expedite_discovery();
                         return Ok(json!({"ok":true,"already_scanning":true}));
                     }
-                    if self.cleaning.load(Ordering::Acquire) {
-                        return Err("Wait for cleanup to finish before starting a scan.".into());
+                    if self.cleaning.load(Ordering::Acquire)
+                        || self.checking_duplicates.load(Ordering::Acquire)
+                    {
+                        return Err(
+                            "Wait for the current file operation before starting a scan.".into(),
+                        );
                     }
+                    self.invalidate_duplicates(requested, None);
                     // A cancelled request may be replaced before its worker
                     // drains. Save its terminal result here on the utility
                     // request queue, never in the synchronous cancel callback.
@@ -528,6 +602,23 @@ impl Engine {
                             .collect::<Result<Vec<_>>>()
                     })
                     .transpose()?;
+                let duplicate_paths = events
+                    .as_ref()
+                    .map(|events| {
+                        events
+                            .iter()
+                            .map(|event| event.path.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        paths.as_ref().map(|paths| {
+                            paths
+                                .iter()
+                                .map(|path| PathBuf::from(*path))
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                self.invalidate_duplicates(Some(&id), duplicate_paths.as_deref());
                 {
                     // Receipt and traversal begin share runtime→store ordering.
                     // A committed scope can never consume a hint from a later event.
@@ -589,6 +680,7 @@ impl Engine {
                 let c = s.candidate(id)?;
                 s.keep(&c.path.to_string_lossy(), true)?;
                 runtime.recent_files.clear();
+                self.invalidate_duplicates(None, None);
                 Ok(json!({"ok":true}))
             }
             "unkeep" => {
@@ -598,6 +690,7 @@ impl Engine {
                     let store = self.store.lock().map_err(store::err)?;
                     store.keep(&path.to_string_lossy(), false)?;
                     runtime.recent_files.clear();
+                    self.invalidate_duplicates(None, None);
                     store
                         .roots()?
                         .into_iter()
@@ -634,8 +727,12 @@ impl Engine {
                 Ok(json!({"receipts":receipts,"next_before":next_before,"total":total}))
             }
             "prepare" => {
-                if self.cleaning.load(Ordering::Acquire) {
-                    return Err("Wait for the current cleanup before reviewing another.".into());
+                if self.cleaning.load(Ordering::Acquire)
+                    || self.checking_duplicates.load(Ordering::Acquire)
+                {
+                    return Err(
+                        "Wait for the current file operation before reviewing another.".into(),
+                    );
                 }
                 let mode = string(&request, "operation")?;
                 if mode != "trash" && mode != "permanent" {
@@ -664,7 +761,8 @@ impl Engine {
                     }
                     if !c.suggestion_eligible
                         || c.blocked_reason.is_some()
-                        || (mode == "permanent" && !c.eligible_permanent)
+                        || (mode == "permanent"
+                            && (!c.eligible_permanent || !recommendations::permanent_kind(&c.kind)))
                     {
                         return Err("An item is ineligible for this operation.".into());
                     }
@@ -686,8 +784,30 @@ impl Engine {
                 }
                 drop(s);
                 let token = unique_id();
+                #[cfg(test)]
+                self.observe_review_admission();
                 let mut reviews = self.reviews.lock().map_err(store::err)?;
-                reviews.retain(|_, r| now() - r.created < 120);
+                // Mutation admission takes this mutex before setting cleaning.
+                // No successful review may be inserted after that cutoff.
+                if self.cleaning.load(Ordering::Acquire)
+                    || self.checking_duplicates.load(Ordering::Acquire)
+                {
+                    return Err(
+                        "Wait for the current file operation before reviewing another.".into(),
+                    );
+                }
+                reviews.retain(|_, r| {
+                    review_is_live(r)
+                        && r.cancel_generation == self.cancel_generation.load(Ordering::Acquire)
+                });
+                if items.iter().any(|(_, item)| {
+                    reviews
+                        .values()
+                        .filter_map(|review| review.duplicate_keeper.as_ref())
+                        .any(|keeper| candidates_overlap(item, &keeper.candidate))
+                }) {
+                    return Err("A selected file is reserved as the kept copy in a duplicate review. Finish or cancel that review first.".into());
+                }
                 if reviews.len() >= 64 {
                     return Err("Too many pending reviews. Close an earlier review first.".into());
                 }
@@ -698,6 +818,8 @@ impl Engine {
                         items,
                         created: now(),
                         cancel_generation: self.cancel_generation.load(Ordering::Acquire),
+                        duplicate_keeper: None,
+                        duplicate_created: None,
                     },
                 );
                 Ok(json!({"token":token}))
@@ -718,13 +840,33 @@ impl Engine {
                         "Cleanup was cancelled after review. Review again to continue.".into(),
                     );
                 }
-                if now() - review.created > 120 {
+                if !review_is_live(&review) {
                     return Err("Review expired. Review the current items again.".into());
+                }
+                {
+                    let mut reviews = self.reviews.lock().map_err(store::err)?;
+                    reviews.retain(|_, pending| {
+                        review_is_live(pending)
+                            && pending.cancel_generation
+                                == self.cancel_generation.load(Ordering::Acquire)
+                    });
+                    if review.items.iter().any(|(_, item)| {
+                        reviews
+                            .values()
+                            .filter_map(|pending| pending.duplicate_keeper.as_ref())
+                            .any(|keeper| candidates_overlap(item, &keeper.candidate))
+                    }) {
+                        return Err(
+                            "This cleanup overlaps a copy reserved by another duplicate review."
+                                .into(),
+                        );
+                    }
                 }
                 (|| {
                     let mut s = self.store.lock().map_err(store::err)?;
                     let mut receipts = Vec::new();
                     let item_count = review.items.len();
+                    let duplicate_keeper = review.duplicate_keeper;
                     for (index, (root, candidate)) in review.items.into_iter().enumerate() {
                         if self.mutation_cancel.load(Ordering::Acquire) {
                             break;
@@ -737,6 +879,15 @@ impl Engine {
                         {
                             return Err("Folder access or Keep preferences changed. Review again before cleanup.".into());
                         }
+                        if let Some(keeper) = &duplicate_keeper
+                            && (review.operation != "trash"
+                                || !same_root(&s.root(&root.id)?, &root)
+                                || !same_root(&s.root(&keeper.root.id)?, &keeper.root)
+                                || s.candidate(&keeper.candidate.id)? != keeper.candidate
+                                || candidates_overlap(&candidate, &keeper.candidate))
+                        {
+                            return Err("The kept copy or its folder access changed. Check duplicates again.".into());
+                        }
                         s.suppress_candidate(&candidate.id)?;
                         s.enqueue_scope(&root.id, &candidate.path)?;
                         *self.cleanup_progress.lock().map_err(store::err)? =
@@ -748,13 +899,14 @@ impl Engine {
                                 item_count,
                                 title: candidate.title.clone(),
                             });
-                        match cleanup::execute_with_progress(
+                        match cleanup::execute_with_duplicate_guard(
                             &mut s,
                             &root,
                             &candidate,
                             &review.operation,
                             self.trash,
                             &self.mutation_cancel,
+                            duplicate_keeper.as_ref(),
                             |phase, completed, total| {
                                 if let Ok(mut progress) = self.cleanup_progress.lock()
                                     && let Some(progress) = progress.as_mut()
@@ -824,9 +976,305 @@ impl Engine {
             _ => Err("Unknown engine action".into()),
         }
     }
+
+    fn begin_duplicate_check(self: &Arc<Self>) -> Result<DuplicateCheckGuard> {
+        let runtime = self.runtime.lock().map_err(store::err)?;
+        let reviews = self.reviews.lock().map_err(store::err)?;
+        if self.busy.load(Ordering::Acquire) {
+            return Err(
+                "Wait for scanning or cleanup to finish before checking duplicate files.".into(),
+            );
+        }
+        let generation = self.cancel_generation.load(Ordering::Acquire);
+        self.checking_duplicates.store(true, Ordering::Release);
+        self.busy.store(true, Ordering::Release);
+        self.duplicate_cancel.store(false, Ordering::Release);
+        drop(reviews);
+        drop(runtime);
+        let guard = DuplicateCheckGuard(Arc::clone(self));
+        {
+            let mut state = self.duplicate_state.lock().map_err(store::err)?;
+            state.report = None;
+            state.active_paths.clear();
+            state.generation = state.generation.wrapping_add(1);
+        }
+        *self.duplicate_progress.lock().map_err(store::err)? = Some(duplicates::Progress {
+            phase: "index".into(),
+            ..Default::default()
+        });
+        if self.cancel_generation.load(Ordering::Acquire) != generation {
+            self.duplicate_cancel.store(true, Ordering::Release);
+        }
+        safety::cancelled(&self.duplicate_cancel)?;
+        Ok(guard)
+    }
+
+    fn end_duplicate_check(self: &Arc<Self>) {
+        if let Ok(_runtime) = self.runtime.lock() {
+            // Release this check's paths before another caller can acquire a
+            // new check; an older guard must never clear its successor's set.
+            if let Ok(mut state) = self.duplicate_state.lock() {
+                state.active_paths.clear();
+            }
+            self.checking_duplicates.store(false, Ordering::Release);
+            self.busy.store(
+                self.scanning.load(Ordering::Acquire) || self.cleaning.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+        let _ = self.launch_scan(ScanLaunch::Background);
+    }
+
+    fn check_duplicates(&self) -> Result<Value> {
+        let inputs = {
+            let store = self.store.lock().map_err(store::err)?;
+            {
+                let mut state = self.duplicate_state.lock().map_err(store::err)?;
+                safety::cancelled(&self.duplicate_cancel)?;
+                state.sql_active = true;
+            }
+            let result = store.duplicate_inputs(&self.duplicate_cancel);
+            // Clear this before releasing Store. Cancellation holds the same
+            // state mutex while interrupting, so it cannot interrupt a later,
+            // unrelated query on this connection.
+            self.duplicate_state.lock().map_err(store::err)?.sql_active = false;
+            result?
+        };
+        let generation = {
+            let mut state = self.duplicate_state.lock().map_err(store::err)?;
+            state.active_paths = inputs
+                .files
+                .iter()
+                .map(|input| (input.root.id.clone(), input.candidate.path.clone()))
+                .collect();
+            state.generation
+        };
+        let mut analysis = duplicates::analyze(inputs.files, &self.duplicate_cancel, |progress| {
+            if let Ok(mut current) = self.duplicate_progress.lock() {
+                *current = Some(progress.clone());
+            }
+        })?;
+        if inputs.skipped_buckets > 0 || inputs.bucket_limit_reached {
+            analysis.progress.limited = true;
+            analysis.progress.complete = false;
+        }
+        *self.duplicate_progress.lock().map_err(store::err)? = Some(analysis.progress.clone());
+        let token = unique_id();
+        let groups: Vec<_> = analysis
+            .groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, group)| (format!("{token}-{index}"), group))
+            .collect();
+        // In-flight events and preference changes invalidate the entire report.
+        // Scanner row changes are checked too, including rows outside the UI page.
+        let store = self.store.lock().map_err(store::err)?;
+        for (_, group) in &groups {
+            for input in &group.items {
+                if !same_root(&store.root(&input.root.id)?, &input.root)
+                    || store.candidate(&input.candidate.id)? != input.candidate
+                {
+                    return Err(
+                        "An indexed file changed during the check. Refresh and check again.".into(),
+                    );
+                }
+            }
+        }
+        let mut state = self.duplicate_state.lock().map_err(store::err)?;
+        safety::cancelled(&self.duplicate_cancel)?;
+        if state.generation != generation {
+            return Err(
+                "Files or folder preferences changed during the check. Check duplicates again."
+                    .into(),
+            );
+        }
+        let value = json!({
+            "token":token,
+            "groups":groups.iter().map(|(id,group)| json!({
+                "id":id,
+                "files":group.items.iter().map(|input| json!({
+                    "candidate":input.candidate,"keeper_only":input.keeper_only
+                })).collect::<Vec<_>>()
+            })).collect::<Vec<_>>(),
+            "progress":analysis.progress,
+            "indexed_files":inputs.indexed_files,
+            "skipped_buckets":inputs.skipped_buckets,
+            "skipped_bucket_files":inputs.skipped_bucket_files,
+            "bucket_limit_reached":inputs.bucket_limit_reached,
+            "expires_in_seconds":DUPLICATE_REVIEW_LIFETIME.as_secs(),
+        });
+        // A cancelled pass is informational only, even if earlier groups matched.
+        state.report = (!analysis.progress.cancelled).then_some(DuplicateReportState {
+            token,
+            groups,
+            created: Instant::now(),
+        });
+        Ok(value)
+    }
+
+    fn prepare_duplicate(&self, request: &Value) -> Result<Value> {
+        if self.cleaning.load(Ordering::Acquire) || self.checking_duplicates.load(Ordering::Acquire)
+        {
+            return Err("Wait for the current file operation before reviewing a copy.".into());
+        }
+        if string(request, "operation")? != "trash" {
+            return Err("Verified duplicate copies are review and Trash-only.".into());
+        }
+        let report_token = string(request, "report_token")?;
+        let group_id = string(request, "group_id")?;
+        let keeper_id = string(request, "keeper_id")?;
+        let copy_id = string(request, "copy_id")?;
+        if keeper_id == copy_id {
+            return Err("Choose a different copy to keep and a copy to review.".into());
+        }
+        let (keeper, copy) = {
+            let state = self.duplicate_state.lock().map_err(store::err)?;
+            let report = state
+                .report
+                .as_ref()
+                .filter(|report| {
+                    report.token == report_token
+                        && report.created.elapsed() < DUPLICATE_REVIEW_LIFETIME
+                })
+                .ok_or("Duplicate evidence expired or changed. Check files again.")?;
+            let group = report
+                .groups
+                .iter()
+                .find(|(id, _)| id == group_id)
+                .map(|(_, group)| group)
+                .ok_or("The duplicate group is not in this report.")?;
+            let keeper = group
+                .items
+                .iter()
+                .find(|input| input.candidate.id == keeper_id)
+                .ok_or("The chosen kept copy is not in this verified group.")?
+                .clone();
+            let copy = group
+                .items
+                .iter()
+                .find(|input| input.candidate.id == copy_id && !input.keeper_only)
+                .ok_or("The chosen copy cannot be cleaned from this verified group.")?
+                .clone();
+            (keeper, copy)
+        };
+        if candidates_overlap(&keeper.candidate, &copy.candidate) {
+            return Err("The copies must be different, independent files.".into());
+        }
+        let store = self.store.lock().map_err(store::err)?;
+        for input in [&keeper, &copy] {
+            if !same_root(&store.root(&input.root.id)?, &input.root)
+                || store.candidate(&input.candidate.id)? != input.candidate
+                || safety::identity(&input.candidate.path)? != input.candidate.identity
+            {
+                return Err(
+                    "A copy or its folder access changed. Refresh and check files again.".into(),
+                );
+            }
+            safety::validate_root(&input.root)?;
+            safety::check_scope_policy(&input.root, &input.candidate.path)?;
+        }
+        if store
+            .kept()?
+            .iter()
+            .any(|path| path_overlap(&copy.candidate.path, Path::new(path)))
+        {
+            return Err("The copy selected for cleanup overlaps a path marked Keep.".into());
+        }
+        drop(store);
+        let state = self.duplicate_state.lock().map_err(store::err)?;
+        if !state.report.as_ref().is_some_and(|report| {
+            report.token == report_token && report.created.elapsed() < DUPLICATE_REVIEW_LIFETIME
+        }) {
+            return Err(
+                "Duplicate evidence changed while preparing the review. Check again.".into(),
+            );
+        }
+        #[cfg(test)]
+        self.observe_review_admission();
+        let mut reviews = self.reviews.lock().map_err(store::err)?;
+        if self.cleaning.load(Ordering::Acquire) || self.checking_duplicates.load(Ordering::Acquire)
+        {
+            return Err("Wait for the current file operation before reviewing a copy.".into());
+        }
+        reviews.retain(|_, review| {
+            review_is_live(review)
+                && review.cancel_generation == self.cancel_generation.load(Ordering::Acquire)
+        });
+        if reviews.len() >= 64 {
+            return Err("Too many pending reviews. Close an earlier review first.".into());
+        }
+        if reviews.values().any(|review| {
+            review
+                .items
+                .iter()
+                .any(|(_, item)| candidates_overlap(item, &keeper.candidate))
+                || review.duplicate_keeper.as_ref().is_some_and(|reserved| {
+                    candidates_overlap(&reserved.candidate, &copy.candidate)
+                })
+        }) {
+            return Err("One of these copies is reserved by another cleanup review. Finish or cancel that review first.".into());
+        }
+        let token = unique_id();
+        reviews.insert(
+            token.clone(),
+            Review {
+                operation: "trash".into(),
+                items: vec![(copy.root, copy.candidate)],
+                created: now(),
+                cancel_generation: self.cancel_generation.load(Ordering::Acquire),
+                duplicate_keeper: Some(keeper),
+                duplicate_created: Some(Instant::now()),
+            },
+        );
+        Ok(json!({"token":token}))
+    }
+
+    #[cfg(test)]
+    fn observe_review_admission(&self) {
+        let observer = self.review_admission_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer();
+        }
+    }
+
+    /// Receives raw event paths before ordinary recommendation filtering, so a
+    /// changed retained copy cannot leave an apparently live content report.
+    fn invalidate_duplicates(&self, root_id: Option<&str>, paths: Option<&[PathBuf]>) {
+        if let Ok(mut state) = self.duplicate_state.lock() {
+            let affected = |id: &str, path: &Path| {
+                root_id.is_none_or(|root| root == id)
+                    && paths.is_none_or(|paths| paths.iter().any(|event| path_overlap(event, path)))
+            };
+            if state
+                .active_paths
+                .iter()
+                .any(|(id, path)| affected(id, path))
+            {
+                state.generation = state.generation.wrapping_add(1);
+            }
+            if state.report.as_ref().is_some_and(|report| {
+                report.groups.iter().any(|(_, group)| {
+                    group
+                        .items
+                        .iter()
+                        .any(|input| affected(&input.root.id, &input.candidate.path))
+                })
+            }) {
+                state.report = None;
+            }
+        }
+    }
+
     fn begin_mutation(self: &Arc<Self>) -> Result<MutationGuard> {
         {
             let _runtime = self.runtime.lock().map_err(store::err)?;
+            // Both prepare paths hold reviews across their final admission
+            // check and insertion. Once cleaning is set, no new keeper promise
+            // can race past execute's reservation snapshot.
+            let _reviews = self.reviews.lock().map_err(store::err)?;
+            if self.checking_duplicates.load(Ordering::Acquire) {
+                return Err("Wait for the duplicate check before starting cleanup.".into());
+            }
             if self.cleaning.swap(true, Ordering::AcqRel) {
                 return Err("Another cleanup is in progress.".into());
             }
@@ -834,6 +1282,7 @@ impl Engine {
             self.mutation_cancel.store(false, Ordering::Release);
             self.pause_requested.store(true, Ordering::Release);
         }
+        self.invalidate_duplicates(None, None);
         let guard = MutationGuard(Arc::clone(self));
         let mut parked = self.parked.lock().map_err(store::err)?;
         // A debouncing worker sleeps on this condition too. Notify under the
@@ -925,9 +1374,11 @@ impl Engine {
         self.pause_changed.notify_all();
     }
 
-    /// The caller holds runtime, serializing urgency with worker acquisition.
-    /// Change the predicate under the wait mutex so a request before the worker
-    /// starts waiting is remembered, and a request at the wait cannot be lost.
+    /// Scan callers hold runtime while changing this predicate. The interactive
+    /// hint stays independent of long-running request locks; worker acquisition
+    /// captures urgency before the hint, so either it selects the short deadline
+    /// or this change remains visible and interrupts the wait. Change the
+    /// predicate under the wait mutex so no notification can be lost.
     fn expedite_discovery(&self) {
         let _parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         self.discovery_urgency.fetch_add(1, Ordering::AcqRel);
@@ -948,6 +1399,7 @@ impl Engine {
     pub fn cancel_scan(&self) {
         self.cancel_generation.fetch_add(1, Ordering::AcqRel);
         self.mutation_cancel.store(true, Ordering::Release);
+        self.cancel_duplicates();
         self.cancel.store(true, Ordering::Release);
         self.scan_paused.store(true, Ordering::Release);
         // Drop parked before acquiring runtime: workers and launch/mutation
@@ -969,6 +1421,19 @@ impl Engine {
         // A launch already holding runtime could have reset cancellation after
         // the first notification. Wake again after the serialized flag update.
         self.wake_discovery();
+    }
+
+    /// Stops only an explicit content comparison. Ordinary discovery, pending
+    /// reviews and scan completeness retain their own cancellation state.
+    pub fn cancel_duplicates(&self) {
+        self.duplicate_cancel.store(true, Ordering::Release);
+        if let Ok(mut state) = self.duplicate_state.lock() {
+            if state.sql_active {
+                self.sql_interrupt.interrupt();
+            }
+            state.generation = state.generation.wrapping_add(1);
+            state.report = None;
+        }
     }
 
     fn launch_scan(self: &Arc<Self>, launch: ScanLaunch) -> Result<()> {
@@ -1035,6 +1500,7 @@ impl Engine {
         runtime.stats.message = "Looking for useful opportunities…".into();
         // Capture once at worker acquisition, rather than thread startup. Later
         // event batches neither extend the deadline nor consume user urgency.
+        let debounce_urgency = self.discovery_urgency.load(Ordering::Acquire);
         let debounce = (launch == ScanLaunch::Background
             && !runtime
                 .foreground
@@ -1042,8 +1508,13 @@ impl Engine {
                 .is_some_and(|scan| scan.snapshot.active))
         .then(|| {
             (
-                Instant::now() + BACKGROUND_BATCH_DELAY,
-                self.discovery_urgency.load(Ordering::Acquire),
+                Instant::now()
+                    + if self.interactive.load(Ordering::Acquire) {
+                        INTERACTIVE_BACKGROUND_BATCH_DELAY
+                    } else {
+                        BACKGROUND_BATCH_DELAY
+                    },
+                debounce_urgency,
             )
         });
         drop(runtime);
@@ -1368,6 +1839,37 @@ impl Engine {
         }
         Ok(ScopeOutcome { stats, error })
     }
+}
+
+struct DuplicateCheckGuard(Arc<Engine>);
+impl Drop for DuplicateCheckGuard {
+    fn drop(&mut self) {
+        self.0.end_duplicate_check();
+    }
+}
+
+fn same_root(left: &Root, right: &Root) -> bool {
+    left.id == right.id
+        && left.path == right.path
+        && left.kind == right.kind
+        && left.identity == right.identity
+}
+
+fn path_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn candidates_overlap(left: &Candidate, right: &Candidate) -> bool {
+    path_overlap(&left.path, &right.path)
+        || (left.identity.device == right.identity.device
+            && left.identity.inode == right.identity.inode)
+}
+
+fn review_is_live(review: &Review) -> bool {
+    now().saturating_sub(review.created) < 120
+        && review
+            .duplicate_created
+            .is_none_or(|created| created.elapsed() < DUPLICATE_REVIEW_LIFETIME)
 }
 
 /// Always resumes discovery, including expired review tokens and unwinding.
@@ -1821,6 +2323,158 @@ mod controller_tests {
             assert!(waiting.try_recv().is_err());
             assert!(!engine.scanning.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn interactive_hint_is_required_and_inert_without_discovery_work() {
+        let (_temp, engine, _roots) = foreground_fixture(1);
+        let before = serde_json::to_value(engine.snapshot().unwrap()).unwrap();
+        let urgency = engine.discovery_urgency.load(Ordering::Acquire);
+        for request in [
+            json!({"action":"set_interactive"}),
+            json!({"action":"set_interactive","active":null}),
+            json!({"action":"set_interactive","active":"true"}),
+        ] {
+            assert_eq!(
+                engine.request(request).unwrap_err(),
+                "set_interactive requires a boolean active"
+            );
+        }
+        assert!(!engine.interactive.load(Ordering::Acquire));
+        assert_eq!(
+            engine
+                .request(json!({"action":"set_interactive","active":true}))
+                .unwrap(),
+            json!({"ok":true})
+        );
+        let opened_urgency = engine.discovery_urgency.load(Ordering::Acquire);
+        assert_ne!(opened_urgency, urgency);
+        // Repeated visibility delivery is idempotent and cannot keep changing a
+        // future worker's captured urgency.
+        engine
+            .request(json!({"action":"set_interactive","active":true}))
+            .unwrap();
+        assert_eq!(
+            engine.discovery_urgency.load(Ordering::Acquire),
+            opened_urgency
+        );
+        engine
+            .request(json!({"action":"set_interactive","active":false}))
+            .unwrap();
+        assert!(!engine.interactive.load(Ordering::Acquire));
+        assert_eq!(
+            engine.discovery_urgency.load(Ordering::Acquire),
+            opened_urgency
+        );
+        assert!(!engine.busy.load(Ordering::Acquire));
+        assert!(!engine.scanning.load(Ordering::Acquire));
+        assert!(!engine.store.lock().unwrap().has_pending_scopes().unwrap());
+        assert!(engine.runtime.lock().unwrap().foreground.is_none());
+        assert_eq!(
+            serde_json::to_value(engine.snapshot().unwrap()).unwrap(),
+            before,
+            "An advisory visibility hint must not alter grants, foreground state, findings or the ledger"
+        );
+    }
+
+    #[test]
+    fn becoming_interactive_wakes_an_existing_background_wait() {
+        let (_temp, engine, _roots) = foreground_fixture(0);
+        let before = serde_json::to_value(engine.snapshot().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (waiting, finished, worker) = debounce_worker(&engine, deadline);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            deadline
+        );
+        engine
+            .request(json!({"action":"set_interactive","active":true}))
+            .unwrap();
+        let woke = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        if !woke {
+            engine.cancel_scan();
+        }
+        worker.join().unwrap();
+        assert!(
+            woke,
+            "Opening the app must wake an existing background batch"
+        );
+        assert!(engine.interactive.load(Ordering::Acquire));
+        assert!(!engine.busy.load(Ordering::Acquire));
+        assert!(!engine.scanning.load(Ordering::Acquire));
+        assert!(!engine.store.lock().unwrap().has_pending_scopes().unwrap());
+        assert_eq!(
+            serde_json::to_value(engine.snapshot().unwrap()).unwrap(),
+            before,
+            "Waking an empty debounce must not manufacture foreground work or ledger state"
+        );
+    }
+
+    #[test]
+    fn closing_preserves_the_current_deadline_and_batches_later_workers() {
+        let (_temp, engine, roots) = foreground_fixture(1);
+        let root = &roots[0];
+        let scope = root.path.join("child");
+        engine
+            .request(json!({"action":"set_interactive","active":true}))
+            .unwrap();
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .enqueue_scope(&root.id, &scope)
+            .unwrap();
+        let (interactive_send, interactive_waiting) = std::sync::mpsc::channel();
+        *engine.debounce_wait_observer.lock().unwrap() = Some(interactive_send);
+        let interactive_started = Instant::now();
+        engine.launch_scan(ScanLaunch::Background).unwrap();
+        let interactive_deadline = interactive_waiting
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        engine
+            .request(json!({"action":"set_interactive","active":false}))
+            .unwrap();
+        engine.wake_discovery();
+        assert_eq!(
+            interactive_waiting
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            interactive_deadline,
+            "Closing must not replace or extend a deadline already captured while visible"
+        );
+        assert!(engine.scanning.load(Ordering::Acquire));
+        let interactive_window =
+            interactive_deadline.saturating_duration_since(interactive_started);
+        engine.cancel_scan();
+        wait_for_discovery_idle(&engine);
+        assert!(engine.store.lock().unwrap().has_pending_scopes().unwrap());
+
+        // Resume the still-durable scope as a later background launch, not an
+        // explicit user request that would intentionally bypass batching.
+        engine.scan_paused.store(false, Ordering::Release);
+        let (closed_send, closed_waiting) = std::sync::mpsc::channel();
+        *engine.debounce_wait_observer.lock().unwrap() = Some(closed_send);
+        let closed_started = Instant::now();
+        engine.launch_scan(ScanLaunch::Background).unwrap();
+        let closed_deadline = closed_waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let closed_window = closed_deadline.saturating_duration_since(closed_started);
+        assert!(
+            closed_window > interactive_window + Duration::from_millis(150),
+            "A later hidden worker must retain a materially longer coalescing window"
+        );
+        assert!(engine.scanning.load(Ordering::Acquire));
+        engine.cancel_scan();
+        wait_for_discovery_idle(&engine);
+        assert!(engine.runtime.lock().unwrap().foreground.is_none());
+        assert!(engine.store.lock().unwrap().has_pending_scopes().unwrap());
+        let snapshot = engine.snapshot().unwrap();
+        assert!(snapshot.history.is_empty());
+        assert_eq!(snapshot.wallet.credited_bytes, 0);
+        assert_eq!(
+            fs::read(scope.join("preserve.txt")).unwrap(),
+            b"disposable source"
+        );
     }
 
     #[test]
@@ -3947,6 +4601,190 @@ mod controller_tests {
             })
             .unwrap();
         (temp, engine, selected, kept)
+    }
+
+    // Controller-only fixture: the report is seeded directly to exercise
+    // admission without claiming that these tiny files passed discovery or
+    // content verification. End-to-end duplicate fixtures live in discovery.rs.
+    fn duplicate_review_fixture() -> (tempfile::TempDir, Arc<Engine>, [Candidate; 2], Value) {
+        let (temp, engine, roots) = foreground_fixture(1);
+        let root = &roots[0];
+        let files = ["keeper.dmg", "copy.dmg"].map(|name| {
+            let path = root.path.join("child").join(name);
+            fs::write(&path, b"disposable equal copies").unwrap();
+            Candidate {
+                id: name.into(),
+                identity: safety::identity(&path).unwrap(),
+                path,
+                blocked_reason: None,
+                suggestion_eligible: true,
+                ..indexed_fixture_source(root, name)
+            }
+        });
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .save_batch(&ScanBatch {
+                candidates: files.to_vec(),
+                stats: ScanStats::default(),
+            })
+            .unwrap();
+        engine.duplicate_state.lock().unwrap().report = Some(DuplicateReportState {
+            token: "report".into(),
+            created: Instant::now(),
+            groups: vec![(
+                "group".into(),
+                duplicates::Group {
+                    items: files
+                        .iter()
+                        .map(|candidate| duplicates::Input {
+                            root: root.clone(),
+                            candidate: candidate.clone(),
+                            keeper_only: false,
+                        })
+                        .collect(),
+                },
+            )],
+        });
+        let request = json!({"action":"prepare_duplicate", "operation":"trash",
+            "report_token":"report", "group_id":"group",
+            "keeper_id":files[0].id, "copy_id":files[1].id});
+        (temp, engine, files, request)
+    }
+
+    #[test]
+    fn duplicate_reviews_bind_choices_expiry_and_keeper_reservations() {
+        let (_temp, engine, files, request) = duplicate_review_fixture();
+        for (field, value) in [
+            ("operation", "permanent"),
+            ("report_token", "wrong"),
+            ("group_id", "wrong"),
+            ("keeper_id", "wrong"),
+            ("copy_id", "keeper.dmg"),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = json!(value);
+            assert!(engine.request(invalid).is_err(), "{field}");
+        }
+        let prepared = engine.request(request.clone()).unwrap();
+        assert!(prepared["token"].is_string());
+        let error = engine
+            .request(json!({"action":"prepare", "operation":"trash",
+            "items":[files[0]]}))
+            .unwrap_err();
+        assert!(error.contains("reserved"), "{error}");
+        let mut reversed = request.clone();
+        reversed["keeper_id"] = json!(files[1].id);
+        reversed["copy_id"] = json!(files[0].id);
+        assert!(engine.request(reversed).unwrap_err().contains("reserved"));
+        engine
+            .duplicate_state
+            .lock()
+            .unwrap()
+            .report
+            .as_mut()
+            .unwrap()
+            .created = Instant::now() - DUPLICATE_REVIEW_LIFETIME;
+        assert!(engine.request(request).unwrap_err().contains("expired"));
+        assert!(engine.snapshot().unwrap().history.is_empty());
+        for file in files {
+            assert_eq!(fs::read(file.path).unwrap(), b"disposable equal copies");
+        }
+    }
+
+    #[test]
+    fn review_admission_cannot_promise_a_keeper_after_mutation_admission() {
+        for duplicate in [false, true] {
+            let (_temp, engine, files, duplicate_request) = duplicate_review_fixture();
+            let request = if duplicate {
+                duplicate_request
+            } else {
+                json!({"action":"prepare", "operation":"trash", "items":[files[0]]})
+            };
+            let (ready_tx, ready) = std::sync::mpsc::channel();
+            let (release_tx, release) = std::sync::mpsc::channel();
+            let release = Mutex::new(release);
+            *engine.review_admission_observer.lock().unwrap() = Some(Arc::new(move || {
+                ready_tx.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }));
+            let reviewing = Arc::clone(&engine);
+            let prepare = std::thread::spawn(move || reviewing.request(request));
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mutating = Arc::clone(&engine);
+            let (finished_tx, finished) = std::sync::mpsc::channel();
+            let mutation = std::thread::spawn(move || {
+                let _guard = mutating.begin_mutation().unwrap();
+                finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !engine.cleaning.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "Mutation never crossed admission"
+                );
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+            let error = prepare.join().unwrap().unwrap_err();
+            assert!(error.contains("current file operation"), "{error}");
+            assert!(engine.reviews.lock().unwrap().is_empty());
+            finished_tx.send(()).unwrap();
+            mutation.join().unwrap();
+            assert!(!engine.cleaning.load(Ordering::Acquire));
+            assert!(files.iter().all(|file| file.path.is_file()));
+        }
+    }
+
+    #[test]
+    fn duplicate_cancellation_does_not_pause_discovery_or_cancel_other_reviews() {
+        let (_temp, engine, files, _) = duplicate_review_fixture();
+        let prepared = engine
+            .request(json!({"action":"prepare", "operation":"trash",
+            "items":[files[0]]}))
+            .unwrap();
+        let generation = engine.cancel_generation.load(Ordering::Acquire);
+        let before = engine.runtime.lock().unwrap().stats.clone();
+        let database = engine.store.lock().unwrap();
+        let checking = Arc::clone(&engine);
+        let worker =
+            std::thread::spawn(move || checking.request(json!({"action":"check_duplicates"})));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !engine.checking_duplicates.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "Duplicate check never started");
+            std::thread::yield_now();
+        }
+        engine
+            .request(json!({"action":"cancel_duplicates"}))
+            .unwrap();
+        assert!(!engine.scan_paused.load(Ordering::Acquire));
+        assert_eq!(engine.cancel_generation.load(Ordering::Acquire), generation);
+        drop(database);
+        assert!(worker.join().unwrap().is_err());
+        assert!(engine.duplicate_state.lock().unwrap().report.is_none());
+        assert!(!engine.busy.load(Ordering::Acquire));
+        assert_eq!(
+            serde_json::to_value(engine.runtime.lock().unwrap().stats.clone()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        let token = prepared["token"].as_str().unwrap();
+        let reviews = engine.reviews.lock().unwrap();
+        let review = reviews.get(token).unwrap();
+        assert_eq!(review.cancel_generation, generation);
+        assert!(review_is_live(review));
+        drop(reviews);
+        assert!(engine.request(json!({"action":"snapshot"})).is_ok());
+        // Empty-input checks also cannot publish evidence after cancellation.
+        let guard = engine.begin_duplicate_check().unwrap();
+        engine.cancel_duplicates();
+        assert!(engine.check_duplicates().is_err());
+        drop(guard);
+        assert!(engine.duplicate_state.lock().unwrap().report.is_none());
     }
 
     #[test]

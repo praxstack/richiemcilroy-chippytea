@@ -82,7 +82,7 @@ Use a deterministic, versioned rule engine. No model inference is required to sc
 
 The important optimization is doing less I/O and keeping work off the UI thread. More scanner threads are not automatically faster. Start with one utility-priority worker and measure bounded concurrency on representative disks.
 
-Exact duplicate detection is a later feature. A suitable pipeline would bucket by size, use partial hashes to narrow candidates, then full-content verification with file-stability checks. Matching content alone does not establish that either path is unnecessary, and APFS sharing complicates space estimates.
+The cleaner expansion adds an explicit, bounded duplicate check for already-indexed old/large personal-file suggestions. It selects whole same-device/size buckets independently of the visible results page, then uses samples, full digests and exact byte comparison with file-stability checks. Ordinary discovery remains metadata-only. This is not whole-drive duplicate detection: smaller, newer or otherwise unindexed files are outside its coverage. The user chooses one keeper and one copy for a Trash-only review; both are rechecked before the move. Matching content alone does not establish that either path is unnecessary, and APFS sharing complicates space estimates.
 
 ## Storage numbers and the reward
 
@@ -143,7 +143,7 @@ Measure cold and warm scans separately on Apple Silicon and an older supported M
 
 Start on macOS 14+ and Apple Silicon, with a signed/notarized release before distributing a normal installer. An OSS license is a release decision; MIT is a reasonable default for original code, with dependencies reviewed individually.
 
-The MVP does not include antivirus, RAM cleaning, generic system-cache purges, app uninstallation, browser history deletion, cloud cleanup, worktree deletion, duplicate removal or automatic background deletion. Those are separate products or later decisions, not hidden first-release requirements.
+The MVP does not include antivirus, RAM cleaning, generic system-cache purges, app uninstallation, browser history deletion, cloud cleanup, worktree deletion, whole-drive or automatic duplicate removal, or automatic background deletion. The cleaner expansion's reviewed duplicate check is limited to existing personal-file suggestions. Other capabilities remain separate decisions, not hidden first-release requirements.
 
 Validate discovery and cleanup against fixtures covering linked/shared files, changed directories, inaccessible roots, active builds, cloud placeholders, partial failure, cancellation, crash recovery, Trash renames and restore conflicts. Prove that excluded paths are not mutated. Then verify the native picker → scan → review → cleanup → history flow using disposable real files. A convincing MVP must find useful candidates, remain responsive and describe every operation honestly; a larger junk total is not the success criterion.
 

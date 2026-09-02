@@ -46,6 +46,9 @@ enum UpdateActionState: Equatable, Sendable {
     private static let suppressedArguments = [
         "--self-test", "--access-flow-test", "--energy-benchmark", "--scan-benchmark",
         "--maintenance-benchmark", "--screenshot", "--ui-benchmark", "--update-self-test",
+        // Keep normal capacity monitoring during isolated idle measurements,
+        // without allowing Sparkle to contact a feed or change the test bundle.
+        "--idle-benchmark",
     ]
 
     let model: AppModel

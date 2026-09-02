@@ -13,6 +13,7 @@ struct CleanupProgress: Decodable, Equatable, Sendable {
         switch phase {
         case "checking": return "Checking reviewed files…"
         case "preparing": return "Preparing cleanup…"
+        case "comparing": return "Verifying both copies…"
         case "removing": return "Removing files…"
         case "accounting": return "Checking recovered space…"
         default: return "Starting cleanup…"
@@ -20,6 +21,10 @@ struct CleanupProgress: Decodable, Equatable, Sendable {
     }
 
     var detail: String {
+        if phase == "comparing" {
+            return ByteCountFormatter.string(fromByteCount: Int64(clamping: completedEntries), countStyle: .file)
+                + " compared · your kept copy stays in place"
+        }
         if totalEntries > 0 {
             return "\(min(completedEntries, totalEntries).formatted()) of \(totalEntries.formatted()) entries"
         }
@@ -65,16 +70,55 @@ struct Candidate: Codable, Identifiable, Hashable {
     /// The engine's own recommendation policy. Absent from legacy indexes, where the
     /// conservative reading is "not recommended"; it never authorizes anything by itself.
     var suggestionEligible: Bool?
-    var recommended: Bool { suggestionEligible == true && blockedReason == nil }
-    /// Every kind except a personal download is a recognised developer artifact.
-    var isDeveloper: Bool { kind != "download" }
+    var recommended: Bool { suggestionEligible == true && canReviewCleanup }
+    var isDeveloper: Bool {
+        switch kind {
+        case "node", "cargo", "venv", "webcache", "xcode": return true
+        default: return false
+        }
+    }
+    var isCacheOrLog: Bool {
+        switch kind {
+        case "cache", "log", "crashreport": return true
+        default: return false
+        }
+    }
+    var isPersonalFile: Bool {
+        switch kind {
+        case "download", "installer", "archive", "largefile": return true
+        default: return false
+        }
+    }
+    var cleanupBlockedReason: String? {
+        if let blockedReason { return blockedReason }
+        return isDeveloper || isCacheOrLog || isPersonalFile
+            ? nil : "This item type is not supported by this version of chippytea."
+    }
+    var canReviewCleanup: Bool { cleanupBlockedReason == nil }
+    /// A category is not permission to delete: only the existing verified
+    /// developer kinds can opt into permanent cleanup. New kinds fail closed.
+    var canDeletePermanently: Bool {
+        guard canReviewCleanup, eligiblePermanent else { return false }
+        switch kind {
+        case "node", "cargo", "venv", "webcache": return true
+        default: return false
+        }
+    }
     var symbol: String {
         switch kind {
         case "node": return "shippingbox"
         case "cargo": return "hammer"
         case "venv": return "terminal"
         case "webcache": return "arrow.triangle.2.circlepath"
-        default: return "arrow.down.doc"
+        case "cache": return "externaldrive"
+        case "log": return "doc.text"
+        case "crashreport": return "exclamationmark.bubble"
+        case "xcode": return "hammer"
+        case "installer": return "shippingbox"
+        case "archive": return "doc.zipper"
+        case "largefile": return "doc"
+        case "download": return "arrow.down.doc"
+        default: return "questionmark.folder"
         }
     }
     var category: String {
@@ -83,10 +127,77 @@ struct Candidate: Codable, Identifiable, Hashable {
         case "cargo": return "Build artifacts"
         case "venv": return "Python environment"
         case "webcache": return "Build cache"
-        default: return "Review a download"
+        case "cache": return "App cache"
+        case "log": return "App log"
+        case "crashreport": return "Crash report"
+        case "xcode": return "Xcode build data"
+        case "installer": return "Installer"
+        case "archive": return "Archive"
+        case "largefile": return "Large personal file"
+        case "download": return "Download"
+        default: return "Review item"
         }
     }
-    var project: String { URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent }
+    /// Display only: preserve the engine's title and exact path for cleanup review.
+    /// Lexical path components need no filesystem access or ownership lookup.
+    var displayName: String {
+        let location = path as NSString
+        let name = location.lastPathComponent
+        guard !name.isEmpty else { return title }
+        switch kind {
+        case "node", "cargo", "venv", "webcache":
+            let parent = (location.deletingLastPathComponent as NSString).lastPathComponent
+            return parent.isEmpty || parent == "/" ? name : "\(parent) / \(name)"
+        default:
+            return name
+        }
+    }
+
+    func matchesSearch(_ query: String) -> Bool {
+        query.isEmpty || path.localizedCaseInsensitiveContains(query)
+            || title.localizedCaseInsensitiveContains(query)
+            || displayName.localizedCaseInsensitiveContains(query)
+    }
+}
+
+enum DiscoveryFilter: String, CaseIterable {
+    case all = "All", caches = "Caches & logs", developer = "Developer", personal = "Personal files"
+
+    func matches(_ candidate: Candidate) -> Bool {
+        switch self {
+        case .all: return true
+        case .caches: return candidate.isCacheOrLog
+        case .developer: return candidate.isDeveloper
+        case .personal: return candidate.isPersonalFile
+        }
+    }
+}
+
+enum DiscoverySort: String, CaseIterable {
+    case suggested = "Suggested first", largest = "Largest first", oldest = "Oldest first", name = "Name"
+
+    func ordered(_ candidates: [Candidate]) -> [Candidate] {
+        // The engine has already ranked recommendations. Filtering retains
+        // that order instead of replacing it with a size-only sort.
+        switch self {
+        case .suggested:
+            return candidates
+        case .largest:
+            return candidates.sorted { lhs, rhs in
+                lhs.allocatedBytes == rhs.allocatedBytes ? lhs.path < rhs.path : lhs.allocatedBytes > rhs.allocatedBytes
+            }
+        case .oldest:
+            return candidates.sorted { lhs, rhs in
+                lhs.modifiedNs == rhs.modifiedNs ? lhs.path < rhs.path : lhs.modifiedNs < rhs.modifiedNs
+            }
+        case .name:
+            // Derive each visible name once, not during every comparison.
+            return candidates.map { (candidate: $0, name: $0.displayName) }.sorted { lhs, rhs in
+                let order = lhs.name.localizedStandardCompare(rhs.name)
+                return order == .orderedSame ? lhs.candidate.path < rhs.candidate.path : order == .orderedAscending
+            }.map { $0.candidate }
+        }
+    }
 }
 
 struct ScanStats: Codable, Equatable {
@@ -172,6 +283,26 @@ struct CleanupRequest {
     let id = UUID()
     let items: [Candidate]
     let permanently: Bool
+    let duplicate: DuplicateCleanupChoice?
+
+    init(items: [Candidate], permanently: Bool, duplicate: DuplicateCleanupChoice? = nil) {
+        self.items = items
+        self.permanently = permanently
+        self.duplicate = duplicate
+    }
+}
+
+struct DuplicateCleanupChoice {
+    let reportToken: String
+    let groupID: String
+    let keeperID: String
+    let copyID: String
+    let keeper: Candidate
+
+    var prepareRequest: [String: Any] {
+        ["action": "prepare_duplicate", "operation": "trash", "report_token": reportToken,
+         "group_id": groupID, "keeper_id": keeperID, "copy_id": copyID]
+    }
 }
 
 /// One projection across all outstanding jobs applies the wallet's fractional
@@ -198,7 +329,7 @@ struct CleanupEstimate: Equatable {
             count += request.items.count
             permanent = permanent || request.permanently
             let eligible = request.permanently && !request.items.isEmpty
-                && request.items.allSatisfy { $0.eligiblePermanent && $0.blockedReason == nil }
+                && request.items.allSatisfy(\.canDeletePermanently)
             for item in request.items {
                 totalBytes = adding(totalBytes, item.allocatedBytes)
                 if eligible { eligibleBytes = adding(eligibleBytes, item.allocatedBytes) }

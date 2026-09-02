@@ -11,6 +11,11 @@ enum NativeSelfTest {
                 print("PASS native state-directory migration and interrupted recovery")
                 exit(0)
             }
+            if CommandLine.arguments.contains("--home-cleaner-regression") {
+                try await accessFlow()
+                print("PASS native Home cleaner: everyday findings, explicit duplicate verification and cancellation, Trash-only review, permission gates and preserved files")
+                exit(0)
+            }
             if CommandLine.arguments.contains("--forget-summary-regression") {
                 try await forgottenRootInvalidatesScanPresentation()
                 print("PASS native forgotten-root presentation regression")
@@ -140,6 +145,35 @@ enum NativeSelfTest {
         let source = home.appendingPathComponent("Documents/preserve.txt")
         let content = Data("Disposable access-flow fixture; preserve me.".utf8)
         try content.write(to: source)
+        let newFindingBytes = 21_000_000
+        let available = try temporary.resourceValues(forKeys: [.volumeAvailableCapacityKey]).volumeAvailableCapacity ?? 0
+        try require(available > 3 * 1024 * 1024 * 1024 + 136_000_000 + newFindingBytes,
+                    "The Home cleaner fixture requires its initial and event payloads plus a 3 GiB reserve")
+        let everyday: [(String, String, Int, Int)] = [
+            ("Library/Logs/Fixture/rotated.log", "log", 11_000_000, 31),
+            ("Library/Logs/DiagnosticReports/Fixture.ips", "crashreport", 1_100_000, 31),
+            ("Downloads/Fixture.dmg", "installer", 21_000_000, 15),
+            ("Downloads/Duplicate-A.zip", "archive", 51_000_000, 31),
+            ("Downloads/Duplicate-B.zip", "archive", 51_000_000, 31)
+        ]
+        for (relative, _, count, days) in everyday {
+            let path = home.appendingPathComponent(relative)
+            try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: path, options: .withoutOverwriting)
+            let file = try FileHandle(forWritingTo: path)
+            let block = Data(repeating: 0x63, count: 65_536)
+            var remaining = count
+            while remaining > 0 {
+                let amount = min(remaining, block.count)
+                try file.write(contentsOf: block.prefix(amount))
+                remaining -= amount
+            }
+            try file.synchronize(); try file.close()
+            var info = stat()
+            try require(lstat(path.path, &info) == 0 && info.st_blocks * 512 >= count,
+                        "The Home cleaner fixture must have real local allocation")
+            try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-Double(days) * 86_400)], ofItemAtPath: path.path)
+        }
         let record = data.appendingPathComponent("disk-access.json")
         try JSONEncoder().encode("waiting").write(to: record)
         func stored() -> String? {
@@ -194,12 +228,263 @@ enum NativeSelfTest {
         try require(model!.snapshot.roots[0].path == home.path, "Only the injected disposable home is authorized")
         try require(model!.snapshot.roots[0].kind == "home", "Home authorization must carry its restricted media policy")
         try require(try Data(contentsOf: source) == content, "Scan must preserve files")
+        try require(Set(model!.snapshot.candidates.map(\.kind)) == Set(everyday.map { $0.1 }),
+                    "The native Home scan must deliver the exact real everyday fixture findings")
+        for (relative, kind, count, _) in everyday {
+            let path = home.appendingPathComponent(relative).path
+            guard let item = model!.snapshot.candidates.first(where: { $0.path == path }) else {
+                throw EngineError.message("Missing native \(kind) finding")
+            }
+            try require(item.kind == kind && item.recommended && item.canReviewCleanup && !item.canDeletePermanently,
+                        "Real everyday findings must remain review/Trash-only after native decoding")
+            model!.reviewOne(item)
+            try require(model!.showReview && model!.reviewItems.map(\.id) == [item.id],
+                        "Everyday findings must open an explicit review")
+            model!.clean(permanently: true)
+            try require(!model!.hasCleanupWork && model!.showReview && model!.snapshot.history.isEmpty,
+                        "Native permanent-cleanup entry must refuse a review-only finding")
+            model!.showReview = false; model!.reviewItems = []; model!.selection = []
+            var info = stat()
+            try require(lstat(path, &info) == 0 && info.st_size == count,
+                        "Review and rejected permanent cleanup must preserve fixture files")
+        }
+        model!.openDuplicates()
+        try require(model!.showDuplicates && model!.duplicateChoice == nil && model!.duplicateReport == nil,
+                    "Duplicate review must start with no inferred choices or content report")
+        model!.checkDuplicates()
+        try await until("Native duplicate verification did not finish") { !model!.duplicateChecking && !model!.busy }
+        guard let duplicateReport = model!.duplicateReport, let duplicateGroup = duplicateReport.groups.first else {
+            throw EngineError.message("Missing native duplicate report: \(model!.errorMessage ?? "no error")")
+        }
+        let duplicatePaths = Set(["Downloads/Duplicate-A.zip", "Downloads/Duplicate-B.zip"].map {
+            home.appendingPathComponent($0).path
+        })
+        try require(duplicateReport.progress.complete && duplicateReport.groups.count == 1
+                    && Set(duplicateGroup.files.map { $0.candidate.path }) == duplicatePaths
+                    && duplicateGroup.files.allSatisfy { !$0.keeperOnly },
+                    "Native duplicate decoding must retain the exact, complete verified group")
+        try require(!model!.showReview && model!.duplicateChoice == nil,
+                    "Finding equal bytes must not select a file for cleanup")
+        let keeper = duplicateGroup.files[0].candidate
+        let copy = duplicateGroup.files[1].candidate
+        model!.reviewDuplicate(report: duplicateReport, groupID: duplicateGroup.id, keeperID: keeper.id, copyID: keeper.id)
+        try require(!model!.showReview, "One file cannot be both the keeper and cleanup copy")
+        model!.reviewDuplicate(report: duplicateReport, groupID: duplicateGroup.id, keeperID: keeper.id, copyID: copy.id)
+        try require(model!.showReview && model!.duplicateReviewIsCurrent
+                    && model!.reviewItems == [copy] && model!.duplicateChoice?.keeper == keeper,
+                    "Explicit duplicate review must bind exactly one kept copy and one removable copy")
+        model!.clean(permanently: true)
+        try require(!model!.hasCleanupWork && model!.showReview && model!.snapshot.history.isEmpty,
+                    "Duplicate cleanup must reject permanent removal before queuing work")
+        model!.showReview = false; model!.reviewItems = []
+        model!.closeDuplicates()
+        model!.openDuplicates()
+        model!.checkDuplicates()
+        model!.cancel()
+        try await until("Native duplicate cancellation did not settle") { !model!.duplicateChecking && !model!.busy }
+        try require(model!.duplicateReport == nil && model!.snapshot.stats.complete && !model!.snapshot.stats.cancelled
+                    && model!.errorMessage?.contains("cancelled") == true,
+                    "Cancelling duplicate verification must not pause ordinary scanning or keep stale evidence")
+        model!.reviewDuplicate(report: duplicateReport, groupID: duplicateGroup.id, keeperID: keeper.id, copyID: copy.id)
+        try require(!model!.showReview && !model!.hasCleanupWork,
+                    "A cancelled report cannot authorize a later duplicate review")
+        model!.closeDuplicates()
+        for path in duplicatePaths {
+            var info = stat()
+            try require(lstat(path, &info) == 0 && info.st_size == 51_000_000,
+                        "Duplicate verification and review must preserve both copies")
+        }
+        try require(model!.snapshot.history.isEmpty && model!.snapshot.wallet.pendingCoins == 0,
+                    "Duplicate verification and cancellation cannot create cleanup receipts or coins")
+        print("Native duplicate check: exact_group=true explicit_choices=true permanent_refused=true cancellation_isolated=true files_preserved=true bytes_read=\(duplicateReport.progress.bytesRead)")
+        // Permission changes above can arrive as delayed recursive Documents
+        // events. Wait for a later sentinel's durable receipt and the pending
+        // work to settle before measuring unrelated Home-file noise.
+        do {
+            let barrier = home.appendingPathComponent(".quiet-test-barrier")
+            var barrierCursor: UInt64?
+            let observer = FolderWatcher(paths: [home.path], since: 0) { events, last, _ in
+                if events.contains(where: { $0.path == barrier.path }) {
+                    Task { @MainActor in barrierCursor = last }
+                }
+            }
+            defer { withExtendedLifetime(observer) {} }
+            try require(observer.isRunning, "The disposable event barrier must be observable")
+            try Data("Disposable event ordering barrier".utf8).write(to: barrier)
+            try await until("The fixture event barrier was not delivered") { barrierCursor != nil }
+            let deadline = Date().addingTimeInterval(10)
+            while true {
+                let response = try await model!.client!.request(["action": "cursor"])
+                let cursor = try EngineClient.decode([String: UInt64].self, response)["cursor"] ?? 0
+                await model!.reload()
+                if cursor >= barrierCursor! && !model!.snapshot.scanning && !model!.busy { break }
+                try require(Date() < deadline, "Fixture permission events did not settle")
+                try await Task.sleep(for: .milliseconds(20))
+            }
+
+            // Create the payload only after the initial scan and its event
+            // barrier have settled. Until the atomic rename below, this owned
+            // sibling is outside the authorized Home and cannot be an indexed
+            // row, provisional or otherwise.
+            let incoming = base.appendingPathComponent("Incoming")
+            let stagedFinding = incoming.appendingPathComponent("New-Finding.dmg")
+            let newFinding = home.appendingPathComponent("Downloads/New-Finding.dmg")
+            try fm.createDirectory(at: incoming, withIntermediateDirectories: false)
+            try Data().write(to: stagedFinding, options: .withoutOverwriting)
+            let stagedHandle = try FileHandle(forWritingTo: stagedFinding)
+            let stagedBlock = Data(repeating: 0x6e, count: 65_536)
+            var stagedRemaining = newFindingBytes
+            while stagedRemaining > 0 {
+                let amount = min(stagedRemaining, stagedBlock.count)
+                try stagedHandle.write(contentsOf: stagedBlock.prefix(amount))
+                stagedRemaining -= amount
+            }
+            try stagedHandle.synchronize(); try stagedHandle.close()
+            try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-15 * 86_400)],
+                                 ofItemAtPath: stagedFinding.path)
+
+            func fixtureMetadata(_ path: URL) throws -> stat {
+                var value = stat()
+                try require(lstat(path.path, &value) == 0 && value.st_uid == geteuid()
+                            && value.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+                            && value.st_nlink == 1 && value.st_size >= 0,
+                            "Cannot validate owned fixture file \(path.lastPathComponent)")
+                return value
+            }
+            func sameMetadata(_ lhs: stat, _ rhs: stat) -> Bool {
+                lhs.st_dev == rhs.st_dev && lhs.st_ino == rhs.st_ino && lhs.st_mode == rhs.st_mode
+                    && lhs.st_size == rhs.st_size && lhs.st_uid == rhs.st_uid && lhs.st_nlink == rhs.st_nlink
+                    && lhs.st_flags == rhs.st_flags && lhs.st_blocks == rhs.st_blocks
+                    && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+                    && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+                    && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec
+                    && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+            }
+
+            let stagedMetadata = try fixtureMetadata(stagedFinding)
+            var downloadsMetadata = stat()
+            try require(lstat(newFinding.deletingLastPathComponent().path, &downloadsMetadata) == 0
+                        && downloadsMetadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+                        && downloadsMetadata.st_dev == stagedMetadata.st_dev,
+                        "The new finding fixture must support a same-volume atomic rename")
+            let stagedModification = Date(timeIntervalSince1970: TimeInterval(stagedMetadata.st_mtimespec.tv_sec))
+            try require(stagedMetadata.st_size == newFindingBytes && stagedMetadata.st_blocks * 512 >= newFindingBytes
+                        && stagedModification <= Date().addingTimeInterval(-14 * 86_400),
+                        "The staged installer must be fully allocated, closed and old enough to recommend")
+
+            let beforeFinding = model!.snapshot
+            let beforePresentation = model!.discoveryPresentation
+            let beforeCandidates = Dictionary(uniqueKeysWithValues: beforeFinding.candidates.map { ($0.id, $0) })
+            let preservedPaths = [source] + everyday.map { home.appendingPathComponent($0.0) }
+            let preservedMetadata = try Dictionary(uniqueKeysWithValues: preservedPaths.map { ($0.path, try fixtureMetadata($0)) })
+            try require(!fm.fileExists(atPath: newFinding.path)
+                        && beforeFinding.candidates.allSatisfy { $0.path != newFinding.path && $0.path != stagedFinding.path },
+                        "The event benchmark must begin without any row for the new finding")
+
+            let cursorResponse = try await model!.client!.request(["action": "cursor"])
+            let cursorBeforeFinding = try EngineClient.decode([String: UInt64].self, cursorResponse)["cursor"] ?? 0
+            var publishedFinding: Candidate?
+            var publishedAt: TimeInterval?
+            let findingPublication = model!.snapshots.sink { value in
+                guard publishedAt == nil,
+                      let candidate = value.candidates.first(where: {
+                          $0.path == newFinding.path && $0.kind == "installer" && $0.recommended
+                              && $0.canReviewCleanup && !$0.canDeletePermanently
+                      }) else { return }
+                publishedFinding = candidate
+                publishedAt = ProcessInfo.processInfo.systemUptime
+            }
+            model!.windowOpened()
+            model!.destination = .discover
+            defer {
+                findingPublication.cancel()
+                model!.windowClosed()
+            }
+
+            let findingStarted = ProcessInfo.processInfo.systemUptime
+            try require(rename(stagedFinding.path, newFinding.path) == 0,
+                        "Cannot atomically publish the staged installer into Downloads")
+            let findingDeadline = findingStarted + 15
+            // Observe the production publication path without adding cursor
+            // requests to the serial engine queue during the timed interval.
+            while publishedAt == nil {
+                try require(ProcessInfo.processInfo.systemUptime < findingDeadline,
+                            "The new installer did not reach the native presentation model")
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            var durableCursor = cursorBeforeFinding
+            while true {
+                let response = try await model!.client!.request(["action": "cursor"])
+                durableCursor = try EngineClient.decode([String: UInt64].self, response)["cursor"] ?? 0
+                if publishedAt != nil && durableCursor > cursorBeforeFinding
+                    && !model!.snapshot.scanning && !model!.snapshot.cleaning && model!.snapshot.stats.complete
+                    && !model!.discoveryPresentation.isRequestPending && !model!.busy,
+                   model!.displayedCandidates.contains(where: {
+                       $0.path == newFinding.path && $0.kind == "installer" && $0.recommended
+                           && $0.canReviewCleanup && !$0.canDeletePermanently
+                   }) {
+                    break
+                }
+                try require(ProcessInfo.processInfo.systemUptime < findingDeadline,
+                            "The new installer did not reach the visible native model after its durable event")
+                try await Task.sleep(for: .milliseconds(20))
+            }
+
+            guard let publishedFinding, let publishedAt,
+                  let displayedFinding = model!.displayedCandidates.first(where: { $0.path == newFinding.path }) else {
+                throw EngineError.message("The new installer was not published as a visible native finding")
+            }
+            let afterFinding = model!.snapshot
+            let currentFindingMetadata = try fixtureMetadata(newFinding)
+            let retainedCandidates = Dictionary(uniqueKeysWithValues: afterFinding.candidates.compactMap {
+                beforeCandidates[$0.id] == nil ? nil : ($0.id, $0)
+            })
+            try require(publishedAt >= findingStarted && publishedFinding == displayedFinding
+                        && model!.visible && model!.destination == .discover
+                        && beforeCandidates[displayedFinding.id] == nil
+                        && displayedFinding.logicalBytes == UInt64(newFindingBytes)
+                        && displayedFinding.allocatedBytes >= UInt64(newFindingBytes) && displayedFinding.fileCount == 1
+                        && displayedFinding.identity.device == UInt64(currentFindingMetadata.st_dev)
+                        && displayedFinding.identity.inode == UInt64(currentFindingMetadata.st_ino)
+                        && displayedFinding.identity.size == UInt64(currentFindingMetadata.st_size),
+                        "The measured publication must be the new complete Trash-only installer finding")
+            try require(afterFinding.candidates.count == beforeFinding.candidates.count + 1
+                        && retainedCandidates == beforeCandidates,
+                        "The filesystem event must add one new row without changing a preexisting candidate")
+            try require(afterFinding.roots == beforeFinding.roots
+                        && afterFinding.foregroundScan == beforeFinding.foregroundScan
+                        && afterFinding.wallet == beforeFinding.wallet && afterFinding.history == beforeFinding.history
+                        && afterFinding.keptPaths == beforeFinding.keptPaths && afterFinding.error == beforeFinding.error
+                        && model!.discoveryPresentation == beforePresentation && !afterFinding.cleaning,
+                        "The new finding must preserve authorization, foreground presentation and the ledger")
+            try require(currentFindingMetadata.st_dev == stagedMetadata.st_dev
+                        && currentFindingMetadata.st_ino == stagedMetadata.st_ino
+                        && currentFindingMetadata.st_mode == stagedMetadata.st_mode
+                        && currentFindingMetadata.st_size == stagedMetadata.st_size
+                        && currentFindingMetadata.st_uid == stagedMetadata.st_uid
+                        && currentFindingMetadata.st_nlink == stagedMetadata.st_nlink
+                        && currentFindingMetadata.st_flags == stagedMetadata.st_flags
+                        && currentFindingMetadata.st_blocks == stagedMetadata.st_blocks
+                        && currentFindingMetadata.st_mtimespec.tv_sec == stagedMetadata.st_mtimespec.tv_sec
+                        && currentFindingMetadata.st_mtimespec.tv_nsec == stagedMetadata.st_mtimespec.tv_nsec,
+                        "The same-volume rename must preserve the staged file object and review evidence")
+            for path in preservedPaths {
+                let expected = preservedMetadata[path.path]!
+                try require(sameMetadata(try fixtureMetadata(path), expected),
+                            "Publishing a new finding changed preexisting fixture metadata")
+            }
+            try require(try Data(contentsOf: source) == content,
+                        "Publishing a new finding changed preserved fixture contents")
+            let findingMilliseconds = Int(((publishedAt - findingStarted) * 1_000).rounded())
+            print("Native new-finding latency: milliseconds=\(findingMilliseconds) provenance=filesystem event to native presentation-model publication new_row=true native_model_visible=true durable_cursor_advanced=\(durableCursor > cursorBeforeFinding) engine_idle=true preexisting_rows_unchanged=true files_preserved=true ledger_unchanged=true")
+            try fm.removeItem(at: barrier)
+        }
         let checkedBeforeNoise = model!.snapshot.stats.entries
         let history = home.appendingPathComponent(".zsh_history")
         for _ in 0..<10 { try Data("Disposable shell history".utf8).write(to: history) }
         try await Task.sleep(for: .milliseconds(900))
         await model!.reload()
-        try require(!model!.snapshot.scanning && model!.snapshot.stats.entries == checkedBeforeNoise, "Ordinary Home file events must not trigger another scan")
+        try require(!model!.snapshot.scanning && model!.snapshot.stats.entries == checkedBeforeNoise, "Ordinary Home file events must not trigger another scan: before=\(checkedBeforeNoise) after=\(model!.snapshot.stats.entries) scanning=\(model!.snapshot.scanning) stats=\(model!.snapshot.stats)")
         try fm.removeItem(at: history)
         try await Task.sleep(for: .milliseconds(700))
         await model!.reload()
@@ -505,6 +790,7 @@ enum NativeSelfTest {
                                   explanation: "Synthetic review", consequence: "Reinstall dependencies",
                                   eligiblePermanent: true, blockedReason: nil, identity: identity,
                                   fingerprint: "contents", evidence: "ownership", suggestionEligible: true)
+        try candidatePresentation(candidate)
         let receipt = Receipt(id: "receipt", path: candidate.path, title: candidate.title, operation: "trash",
                               outcome: "trashed", detail: "Synthetic history", createdAt: 0,
                               reportedBytes: 100_000_000, observedBytes: 0, creditedBytes: 0, coins: 0,
@@ -550,6 +836,103 @@ enum NativeSelfTest {
         try require(uiNotifications == beforeUI + 1,
                     "Other @Published properties must retain the same synthesized objectWillChange publisher")
         print("Native snapshot publication: background_ui=0 background_raw=20 control_edges=true raw_timing=preserved")
+    }
+
+    @MainActor private static func candidatePresentation(_ fixture: Candidate) throws {
+        let names: [(String, String, String, String)] = [
+            ("webcache", "/Projects/Cap/apps/web/.next", "web build cache", "web / .next"),
+            ("webcache", "/Projects/Cap/apps/web/.turbo", "web build cache", "web / .turbo"),
+            ("webcache", "/Projects/site/.nuxt", "Web build cache", "site / .nuxt"),
+            ("webcache", "/Projects/site/.parcel-cache", "site build cache", "site / .parcel-cache"),
+            ("node", "/Projects/Plum/node_modules", "Plum dependencies", "Plum / node_modules"),
+            ("cargo", "/Projects/service/target", "service build artifacts", "service / target"),
+            ("venv", "/Projects/api/.venv", "api Python environment", "api / .venv"),
+            ("cache", "/Library/Caches/com.example.Editor", "com.example.Editor cache", "com.example.Editor"),
+            ("xcode", "/Library/Developer/Xcode/DerivedData/App-abc123", "App-abc123 Xcode data", "App-abc123"),
+            ("archive", "/Downloads/Archive.zip", "Archive.zip", "Archive.zip"),
+            ("log", "/Library/Logs/Editor/rotated.log", "rotated.log", "rotated.log"),
+            ("largefile", "/report.pdf", "report.pdf", "report.pdf"),
+            ("webcache", "/.next", "Web build cache", ".next"),
+            ("webcache", "/Projects/site/.yarn/cache", "Legacy cache", ".yarn / cache"),
+            ("webcache", "/Projects/Tea 🍵/ウェブ/.next", "Web build cache", "ウェブ / .next")
+        ]
+        for (kind, path, title, expected) in names {
+            var item = fixture
+            item.kind = kind; item.path = path; item.title = title
+            try require(item.displayName == expected,
+                        "\(kind) must identify its concrete folder/file without repeating its cleanup type")
+            try require(item.matchesSearch(expected), "Visible folder/file names must remain searchable")
+            let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(item)) as? [String: Any]
+            try require(encoded?["title"] as? String == title && encoded?["path"] as? String == path
+                        && encoded?["displayName"] == nil,
+                        "Display labels must not alter the engine's reviewed candidate or add request fields")
+        }
+        var emptyPath = fixture
+        emptyPath.path = ""
+        try require(emptyPath.displayName == fixture.title, "A missing legacy path must retain its diagnostic title")
+
+        let categories: [(String, String, DiscoveryFilter, Bool)] = [
+            ("node", "Dependencies", .developer, true), ("cargo", "Build artifacts", .developer, true),
+            ("venv", "Python environment", .developer, true), ("webcache", "Build cache", .developer, true),
+            ("xcode", "Xcode build data", .developer, false), ("cache", "App cache", .caches, false),
+            ("log", "App log", .caches, false), ("crashreport", "Crash report", .caches, false),
+            ("installer", "Installer", .personal, false), ("archive", "Archive", .personal, false),
+            ("largefile", "Large personal file", .personal, false), ("download", "Download", .personal, false)
+        ]
+        for (kind, category, filter, permanent) in categories {
+            var item = fixture
+            item.kind = kind
+            try require(item.category == category && DiscoveryFilter.all.matches(item)
+                        && DiscoveryFilter.allCases.filter { $0 != .all && $0.matches(item) } == [filter],
+                        "\(kind) must have its own category and exactly one matching discovery group")
+            // The fixture deliberately claims engine eligibility, including for
+            // review-only kinds: the native boundary must still refuse permanence.
+            try require(item.canReviewCleanup && item.recommended && item.canDeletePermanently == permanent,
+                        "\(kind) must not inherit permanent cleanup from its display category")
+            if !permanent {
+                try require(CleanupPreview(items: [item], wallet: Wallet(), permanently: true).estimatedCoins == 0,
+                            "Review-only \(kind) must never promise permanent-cleanup chips")
+            }
+        }
+        var unknown = fixture
+        unknown.kind = "future-kind"
+        try require(!unknown.isDeveloper && !unknown.isPersonalFile && !unknown.isCacheOrLog
+                    && !unknown.recommended && !unknown.canReviewCleanup && !unknown.canDeletePermanently
+                    && unknown.cleanupBlockedReason != nil
+                    && CleanupPreview(items: [unknown], wallet: Wallet(), permanently: true).estimatedCoins == 0,
+                    "Unknown kinds must stay visible but fail closed for recommendations, cleanup and chips")
+        var blocked = fixture
+        blocked.blockedReason = "Fixture is in use"
+        try require(!blocked.recommended && !blocked.canReviewCleanup && !blocked.canDeletePermanently,
+                    "A blocked known kind must not become actionable")
+        var legacy = fixture
+        legacy.suggestionEligible = nil
+        legacy.eligiblePermanent = false
+        try require(!legacy.recommended && !legacy.canDeletePermanently && legacy.canReviewCleanup,
+                    "Native presentation must not invent missing engine recommendation or deletion eligibility")
+
+        var first = fixture
+        first.id = "first"; first.title = "A first"; first.path = "/Projects/Zeta/node_modules"
+        first.allocatedBytes = 100; first.modifiedNs = 20
+        var second = fixture
+        second.id = "second"; second.title = "Z second"; second.path = "/Projects/Alpha/node_modules"
+        second.allocatedBytes = 900; second.modifiedNs = 30
+        var third = fixture
+        third.id = "third"; third.title = "M third"; third.path = "/Projects/Middle/node_modules"
+        third.allocatedBytes = 200; third.modifiedNs = 10
+        let ranked = [first, second, third]
+        try require(DiscoverySort.suggested.ordered(ranked).map(\.id) == ["first", "second", "third"],
+                    "Suggested first must preserve engine rank instead of re-sorting by size")
+        try require(DiscoverySort.largest.ordered(ranked).map(\.id) == ["second", "third", "first"]
+                    && DiscoverySort.oldest.ordered(ranked).map(\.id) == ["third", "first", "second"]
+                    && DiscoverySort.name.ordered(ranked).map(\.id) == ["second", "third", "first"],
+                    "Explicit name ordering must use visible folder names, not the engine's generic titles")
+        var otherRoot = first
+        otherRoot.id = "other-root"; otherRoot.path = "/Another/Zeta/node_modules"
+        try require(otherRoot.displayName == first.displayName && otherRoot.path != first.path
+                    && DiscoverySort.name.ordered([first, otherRoot]).map(\.id) == ["other-root", "first"],
+                    "Matching folder names must retain exact distinct locations and deterministic path ordering")
+        print("PASS native cleanup categories: concrete folder names, unchanged review payloads, visible-name sorting, explicit groups and permanence guards")
     }
 
     @MainActor private static func foregroundSummarySurvivesRestart() async throws {
