@@ -16,16 +16,23 @@ pub(crate) fn permanent_kind(kind: &str) -> bool {
     matches!(kind, "cargo" | "node" | "venv" | "webcache")
 }
 
+pub(crate) fn review_project_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "swiftpm" | "dotnet" | "gradle" | "dart" | "flutter" | "zig"
+    )
+}
+
 pub(crate) fn developer_measurement(kind: &str) -> bool {
-    permanent_kind(kind) || kind == "xcode"
+    permanent_kind(kind) || review_project_kind(kind) || kind == "xcode"
 }
 
 pub(crate) fn checks_git(kind: &str) -> bool {
-    permanent_kind(kind) || kind == "largefile"
+    permanent_kind(kind) || review_project_kind(kind) || kind == "largefile"
 }
 
 pub(crate) fn checks_activity(kind: &str) -> bool {
-    permanent_kind(kind) || matches!(kind, "cache" | "xcode")
+    permanent_kind(kind) || review_project_kind(kind) || matches!(kind, "cache" | "xcode")
 }
 
 pub(crate) fn minimum_bytes(kind: &str) -> u64 {
@@ -37,6 +44,7 @@ pub(crate) fn minimum_bytes(kind: &str) -> u64 {
         "xcode" => 250_000_000,
         "largefile" => 500_000_000,
         "cargo" | "node" | "venv" | "webcache" | "download" => 100_000_000,
+        kind if review_project_kind(kind) => 100_000_000,
         _ => u64::MAX,
     }
 }
@@ -44,13 +52,14 @@ pub(crate) fn minimum_bytes(kind: &str) -> u64 {
 pub(crate) fn quiet_days(kind: &str) -> i64 {
     match kind {
         "cargo" | "node" | "venv" | "webcache" => 7,
+        kind if review_project_kind(kind) => 7,
         "installer" | "xcode" => 14,
         "largefile" => 90,
         _ => 30,
     }
 }
 
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 18] = [
     "cache",
     "log",
     "crashreport",
@@ -63,6 +72,12 @@ const KINDS: [&str; 12] = [
     "archive",
     "download",
     "largefile",
+    "swiftpm",
+    "dotnet",
+    "gradle",
+    "dart",
+    "flutter",
+    "zig",
 ];
 
 /// These SQL expressions are built once per query/index, from the same policy
@@ -79,8 +94,18 @@ pub(crate) fn minimum_size_sql(column: &str) -> String {
 }
 
 pub(crate) fn priority_sql(column: &str) -> String {
+    // Prefer lower recreation cost before bytes. This is a conservative policy
+    // class, not an invented estimate of rebuild time or network consumption.
+    // Personal files remain explicit review decisions after generated data.
     format!(
-        "CASE json_extract({column},'$.kind') WHEN 'installer' THEN 1 WHEN 'archive' THEN 2 WHEN 'download' THEN 2 WHEN 'largefile' THEN 3 ELSE 0 END"
+        "CASE json_extract({column},'$.kind') \
+        WHEN 'log' THEN 0 WHEN 'crashreport' THEN 0 \
+        WHEN 'cache' THEN 1 WHEN 'webcache' THEN 1 WHEN 'dart' THEN 1 \
+        WHEN 'cargo' THEN 2 WHEN 'xcode' THEN 2 WHEN 'zig' THEN 2 \
+        WHEN 'dotnet' THEN 2 WHEN 'flutter' THEN 2 WHEN 'gradle' THEN 2 \
+        WHEN 'swiftpm' THEN 3 WHEN 'node' THEN 3 WHEN 'venv' THEN 3 \
+        WHEN 'installer' THEN 4 WHEN 'archive' THEN 5 WHEN 'download' THEN 5 \
+        WHEN 'largefile' THEN 6 ELSE 7 END"
     )
 }
 
