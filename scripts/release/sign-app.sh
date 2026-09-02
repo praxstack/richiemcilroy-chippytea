@@ -34,6 +34,14 @@ for component in \
 done
 printf 'Signing Sparkle framework…\n'
 codesign "${sign[@]}" "$framework"
+scan_helper="$app/Contents/Helpers/chippytea-scan-helper"
+if [[ ! -f "$scan_helper" || -L "$scan_helper" ]]; then
+    printf 'The read-only scan helper is missing or redirected.\n' >&2
+    exit 1
+fi
+printf 'Signing read-only scan helper…\n'
+codesign "${sign[@]}" "$scan_helper"
+codesign --verify --strict --verbose=2 "$scan_helper"
 printf 'Signing application bundle…\n'
 codesign "${sign[@]}" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
