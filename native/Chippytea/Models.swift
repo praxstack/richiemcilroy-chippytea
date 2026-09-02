@@ -13,6 +13,7 @@ struct CleanupProgress: Decodable, Equatable, Sendable {
         switch phase {
         case "checking": return "Checking reviewed files…"
         case "preparing": return "Preparing cleanup…"
+        case "comparing": return "Verifying both copies…"
         case "removing": return "Removing files…"
         case "accounting": return "Checking recovered space…"
         default: return "Starting cleanup…"
@@ -20,6 +21,10 @@ struct CleanupProgress: Decodable, Equatable, Sendable {
     }
 
     var detail: String {
+        if phase == "comparing" {
+            return ByteCountFormatter.string(fromByteCount: Int64(clamping: completedEntries), countStyle: .file)
+                + " compared · your kept copy stays in place"
+        }
         if totalEntries > 0 {
             return "\(min(completedEntries, totalEntries).formatted()) of \(totalEntries.formatted()) entries"
         }
@@ -278,6 +283,26 @@ struct CleanupRequest {
     let id = UUID()
     let items: [Candidate]
     let permanently: Bool
+    let duplicate: DuplicateCleanupChoice?
+
+    init(items: [Candidate], permanently: Bool, duplicate: DuplicateCleanupChoice? = nil) {
+        self.items = items
+        self.permanently = permanently
+        self.duplicate = duplicate
+    }
+}
+
+struct DuplicateCleanupChoice {
+    let reportToken: String
+    let groupID: String
+    let keeperID: String
+    let copyID: String
+    let keeper: Candidate
+
+    var prepareRequest: [String: Any] {
+        ["action": "prepare_duplicate", "operation": "trash", "report_token": reportToken,
+         "group_id": groupID, "keeper_id": keeperID, "copy_id": copyID]
+    }
 }
 
 /// One projection across all outstanding jobs applies the wallet's fractional

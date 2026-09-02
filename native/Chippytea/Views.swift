@@ -33,8 +33,19 @@ struct RootView: View {
                               findingCount: model.displayedCandidates.count)
                         .equatable()
                 }
+                .accessibilityHidden(model.showDuplicates || model.showReview || model.showDiskAccess)
+                .allowsHitTesting(!model.showDuplicates && !model.showReview && !model.showDiskAccess)
+                if model.showDuplicates {
+                    DuplicateReviewPage(model: model)
+                        .accessibilityHidden(model.showReview || model.showDiskAccess)
+                        .allowsHitTesting(!model.showReview && !model.showDiskAccess)
+                        .modifier(UpdateInteractionGuard(updates: updates))
+                        .transition(.opacity)
+                }
                 if model.showReview {
                     ReviewTakeover(model: model)
+                        .accessibilityHidden(model.showDiskAccess)
+                        .allowsHitTesting(!model.showDiskAccess)
                         .modifier(UpdateInteractionGuard(updates: updates))
                         .transition(reduced ? AnyTransition.opacity : AnyTransition.move(edge: .trailing).combined(with: .opacity))
                 }
@@ -1002,6 +1013,11 @@ private struct DiscoveryPage: View {
         HStack(spacing: 6) {
             ScreenTitle(text: "Find space", seed: 251)
             Spacer(minLength: 0)
+            Button { model.openDuplicates() } label: { Image(systemName: "doc.on.doc") }
+                .buttonStyle(InkIconButtonStyle(seed: 252))
+                .disabled(changing || model.hasCleanupWork || model.snapshot.roots.isEmpty)
+                .help("Check indexed personal files for identical contents")
+                .accessibilityLabel("Check duplicate files")
             Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(InkIconButtonStyle(seed: 253))
                 .disabled(model.busy || model.snapshot.cleaning || model.discoveryPresentation.isForeground
@@ -1323,10 +1339,11 @@ private struct ReviewTakeover: View {
     @ObservedObject var model: AppModel
     @State private var dontAskAgain = false
 
-    private var trashEligible: Bool { !model.reviewItems.isEmpty && model.reviewItems.allSatisfy { $0.blockedReason == nil } }
-    private var permanentEligible: Bool { !model.reviewItems.isEmpty && model.reviewItems.allSatisfy(permanentCleanupEligible) }
+    private var trashEligible: Bool { !model.reviewItems.isEmpty && model.reviewItems.allSatisfy(\.canReviewCleanup) }
+    private var permanentEligible: Bool { model.duplicateChoice == nil && !model.reviewItems.isEmpty && model.reviewItems.allSatisfy(permanentCleanupEligible) }
     private var estimatedBytes: UInt64 { model.reviewItems.reduce(0) { $0 &+ $1.allocatedBytes } }
     private var reviewIsCurrent: Bool {
+        if model.duplicateChoice != nil { return model.duplicateReviewIsCurrent }
         let current = Set(model.displayedCandidates)
         let authorized = Set(model.snapshot.roots.map(\.id))
         return !model.reviewItems.isEmpty && model.reviewItems.allSatisfy { current.contains($0) && authorized.contains($0.rootId) }
@@ -1338,6 +1355,19 @@ private struct ReviewTakeover: View {
             header
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
+                    if let keeper = model.duplicateChoice?.keeper {
+                        InkCard(padding: 10, seed: 320, fill: TeaTheme.card) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Label("Keep this copy in place", systemImage: "checkmark.shield")
+                                    .font(TeaFont.bodySemibold)
+                                Text(keeper.path).font(TeaFont.caption).textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text("Both files are compared again before Trash. Matching contents do not mean both paths are unnecessary, and shared disk blocks may limit space recovered.")
+                                    .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
                     ForEach(Array(model.reviewItems.enumerated()), id: \.element.id) { index, item in
                         ReviewItemCard(item: item, seed: 321 + index * 6)
                     }
