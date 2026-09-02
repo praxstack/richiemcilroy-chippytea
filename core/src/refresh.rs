@@ -1,6 +1,6 @@
 //! Bounded filesystem-event work. Event receipt is purely lexical; filesystem
 //! probes and index reconciliation belong to the discovery worker.
-use crate::{model::*, safety};
+use crate::{model::*, recommendations, safety};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -172,6 +172,21 @@ pub(crate) fn event_scope_with_kind(
     if safety::excluded_home_media(root, path) {
         return Ok(None);
     }
+    if recommendations::library_corridor(root, path) {
+        // Structural events for these corridors expand only into the three
+        // fixed cleanup routes, never an unrestricted Library walk.
+        return Ok((kind != EventKind::Directory || recursive).then(|| path.to_path_buf()));
+    }
+    if recommendations::library_area(root, path).is_some() {
+        if kind == EventKind::Directory && !recursive {
+            return Ok(None);
+        }
+        // A newly protected descendant can invalidate an existing whole-cache
+        // or DerivedData suggestion. Collapse to its allowed cleanup unit
+        // before checking the suffix; this is lexical and never probes it.
+        return Ok(recommendations::library_event_scope(root, path)
+            .filter(|scope| safety::check_scope_policy(root, scope).is_ok()));
+    }
     let mut current = root.path.clone();
     for component in relative.components() {
         let name = component.as_os_str();
@@ -233,7 +248,16 @@ pub(crate) fn event_scope_with_kind(
         return Ok(path.parent().map(Path::to_path_buf));
     }
     match kind {
-        EventKind::File if !recursive && !in_downloads(root, path) => return Ok(None),
+        EventKind::File
+            if !recursive
+                && !in_downloads(root, path)
+                && !(recommendations::personal_scope(root, path)
+                    && path
+                        .file_name()
+                        .is_some_and(recommendations::personal_file_name)) =>
+        {
+            return Ok(None);
+        }
         // FileEvents reports children individually. A directory metadata-only
         // notification does not require revisiting all of those descendants.
         EventKind::Directory if !recursive => return Ok(None),
@@ -281,12 +305,7 @@ fn ownership_evidence(name: &OsStr) -> bool {
 }
 
 fn in_downloads(root: &Root, path: &Path) -> bool {
-    match root.kind.as_str() {
-        "downloads" => true,
-        "folder" if root.path.file_name() == Some(OsStr::new("Downloads")) => true,
-        "folder" | "home" => path.starts_with(root.path.join("Downloads")),
-        _ => false,
-    }
+    recommendations::downloads_boundary(root).is_some_and(|boundary| path.starts_with(boundary))
 }
 
 pub(crate) fn resolve_scope(root: &Root, path: &Path, indexed: Option<PathBuf>) -> Result<PathBuf> {
@@ -305,6 +324,9 @@ pub(crate) fn resolve_scope(root: &Root, path: &Path, indexed: Option<PathBuf>) 
     if safety::check_scope_policy(root, path).is_err() {
         return Ok(path.to_path_buf());
     }
+    if let Some(scope) = recommendations::library_event_scope(root, path) {
+        return Ok(scope);
+    }
     normalize_scope(root, indexed.as_deref().unwrap_or(path))
 }
 
@@ -318,6 +340,9 @@ pub(crate) fn normalize_scope(root: &Root, path: &Path) -> Result<PathBuf> {
     }
     if safety::check_scope_policy(root, path).is_err() {
         return Ok(path.to_path_buf());
+    }
+    if let Some(scope) = recommendations::library_event_scope(root, path) {
+        return Ok(scope);
     }
     let selected = path
         .ancestors()
@@ -621,6 +646,108 @@ mod tests {
             )
             .unwrap(),
             Some("/Users/test/Downloads/archive.zip".into())
+        );
+    }
+
+    #[test]
+    fn library_events_refresh_only_their_cleanup_unit_even_for_protected_descendants() {
+        let mut root = root();
+        root.kind = "home".into();
+        for (relative, expected) in [
+            (
+                "Library/Caches/com.example.browser/deep/payload",
+                "Library/Caches/com.example.browser",
+            ),
+            (
+                "Library/Caches/com.example.browser/.git/index",
+                "Library/Caches/com.example.browser",
+            ),
+            (
+                "Library/Caches/com.example.browser/Dropbox/payload",
+                "Library/Caches/com.example.browser",
+            ),
+            (
+                "Library/Caches/com.example.browser/Generated.app/binary",
+                "Library/Caches/com.example.browser",
+            ),
+            (
+                "Library/Developer/Xcode/DerivedData/Project/.git/index",
+                "Library/Developer/Xcode/DerivedData/Project",
+            ),
+            ("Library/Logs/app/old.log", "Library/Logs/app/old.log"),
+            (
+                "Library/Logs/DiagnosticReports/report.ips",
+                "Library/Logs/DiagnosticReports/report.ips",
+            ),
+        ] {
+            let scope =
+                event_scope_with_kind(&root, &root.path.join(relative), EventKind::File, false)
+                    .unwrap();
+            assert_eq!(scope, Some(root.path.join(expected)), "{relative}");
+            let scope = scope.unwrap();
+            assert_eq!(normalize_scope(&root, &scope).unwrap(), scope);
+        }
+        for relative in [
+            "Library/Application Support/app/state",
+            "Library/Caches/uv/item",
+            "Library/Caches/Homebrew/item",
+            "Library/Caches/.git/index",
+            "Library/Logs/Dropbox/report.log",
+            "Library/Developer/Xcode/Archives/project",
+            "Library/Developer/CoreSimulator/device",
+        ] {
+            assert_eq!(
+                event_scope_with_kind(&root, &root.path.join(relative), EventKind::File, false)
+                    .unwrap(),
+                None,
+                "{relative}"
+            );
+        }
+        let library = root.path.join("Library");
+        assert_eq!(
+            event_scope_with_kind(&root, &library, EventKind::Directory, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            event_scope_with_kind(&root, &library, EventKind::Directory, true).unwrap(),
+            Some(library)
+        );
+    }
+
+    #[test]
+    fn personal_file_events_require_the_authorized_scope_and_a_relevant_name() {
+        let mut root = root();
+        let arbitrary = root.path.join("Downloads/private.bin");
+        assert_eq!(
+            event_scope_with_kind(&root, &arbitrary, EventKind::File, false).unwrap(),
+            None
+        );
+        let document = root.path.join("Exports/recording.MOV");
+        assert_eq!(
+            event_scope_with_kind(&root, &document, EventKind::File, false).unwrap(),
+            Some(document)
+        );
+        root.kind = "home".into();
+        assert_eq!(
+            event_scope_with_kind(&root, &arbitrary, EventKind::File, false).unwrap(),
+            Some(arbitrary)
+        );
+        for relative in [
+            "Projects/private.pdf",
+            "Documents/source.rs",
+            "Documents/.hidden/movie.mov",
+        ] {
+            assert_eq!(
+                event_scope_with_kind(&root, &root.path.join(relative), EventKind::File, false)
+                    .unwrap(),
+                None,
+                "{relative}"
+            );
+        }
+        let personal = root.path.join("Documents/report.pdf");
+        assert_eq!(
+            event_scope_with_kind(&root, &personal, EventKind::File, false).unwrap(),
+            Some(personal)
         );
     }
 
