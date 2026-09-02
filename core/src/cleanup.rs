@@ -26,6 +26,7 @@ pub type TrashCallback =
 pub enum CleanupPhase {
     Checking,
     Preparing,
+    Comparing,
     Removing,
     Accounting,
 }
@@ -727,6 +728,24 @@ pub fn execute_with_progress(
     operation: &str,
     trash: Option<TrashCallback>,
     cancel: &AtomicBool,
+    callback: impl FnMut(CleanupPhase, u64, u64),
+) -> Result<Receipt> {
+    execute_with_duplicate_guard(
+        store, root, candidate, operation, trash, cancel, None, callback,
+    )
+}
+
+/// Duplicate review adds a retained-file guard; it never changes the ordinary
+/// single-path scanner evidence or grants permanent-deletion eligibility.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_duplicate_guard(
+    store: &mut Store,
+    root: &Root,
+    candidate: &Candidate,
+    operation: &str,
+    trash: Option<TrashCallback>,
+    cancel: &AtomicBool,
+    duplicate_keeper: Option<&crate::duplicates::Input>,
     mut callback: impl FnMut(CleanupPhase, u64, u64),
 ) -> Result<Receipt> {
     let _local_io = safety::LocalOnlyIo::new()?;
@@ -739,12 +758,14 @@ pub fn execute_with_progress(
         operation,
         trash,
         cancel,
+        duplicate_keeper,
         &mut progress,
     );
     progress.finish();
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_inner(
     store: &mut Store,
     root: &Root,
@@ -752,13 +773,20 @@ fn execute_inner(
     operation: &str,
     trash: Option<TrashCallback>,
     cancel: &AtomicBool,
+    duplicate_keeper: Option<&crate::duplicates::Input>,
     progress: &mut Progress<'_>,
 ) -> Result<Receipt> {
     cancelled(cancel)?;
     if operation != "trash" && operation != "permanent" {
         return Err("Unsupported cleanup operation.".into());
     }
-    if operation == "permanent" && !candidate.eligible_permanent {
+    if duplicate_keeper.is_some() && operation != "trash" {
+        return Err("Duplicate review permits only Move to Trash.".into());
+    }
+    if operation == "permanent"
+        && (!candidate.eligible_permanent
+            || !crate::recommendations::permanent_kind(&candidate.kind))
+    {
         return Err("Permanent cleanup is restricted to recognized developer artifacts.".into());
     }
     if candidate.blocked_reason.is_some() {
@@ -891,7 +919,7 @@ fn execute_inner(
         return Ok(receipt);
     }
     progress.start(CleanupPhase::Checking, entries);
-    let staged_safe = (|| -> Result<LinkRemovals> {
+    let staged_safe = (|| -> Result<(LinkRemovals, Option<crate::duplicates::RetainedFile>)> {
         store
             .conn
             .execute("UPDATE operations SET state='mutating' WHERE id=?1", [&id])
@@ -917,9 +945,25 @@ fn execute_inner(
         {
             return Err("The staged artifact no longer matches the reviewed contents.".into());
         }
-        LinkRemovals::from_closure(links)
+        let retained = if let Some(keeper) = duplicate_keeper {
+            progress.start(
+                CleanupPhase::Comparing,
+                candidate.logical_bytes.saturating_mul(2),
+            );
+            Some(crate::duplicates::verify_staged(
+                root,
+                candidate,
+                &stage,
+                keeper,
+                cancel,
+                |bytes| progress.update(bytes),
+            )?)
+        } else {
+            None
+        };
+        Ok((LinkRemovals::from_closure(links)?, retained))
     })();
-    let links = match staged_safe {
+    let (links, retained) = match staged_safe {
         Ok(links) => links,
         Err(reason) => {
             let restored =
@@ -952,6 +996,10 @@ fn execute_inner(
                 .ok_or("Native Trash is unavailable. Permanent deletion was not attempted.")?;
             let input = cstr(stage.as_os_str())?;
             let mut output = vec![0i8; 16384];
+            cancelled(cancel)?;
+            if let Some(keeper) = &retained {
+                keeper.validate(cancel)?;
+            }
             let status = unsafe { callback(input.as_ptr(), output.as_mut_ptr(), output.len()) };
             let message = unsafe { CStr::from_ptr(output.as_ptr()) }
                 .to_string_lossy()
@@ -1211,16 +1259,23 @@ fn restore_hook(parent: RawFd, name: &CStr) {
 // Staging renames the artifact root. Its validated kind, not the temporary
 // filename, selects the same traversal policy used for review fingerprints.
 fn measurement_policy(candidate: &Candidate) -> safety::MeasurementPolicy {
-    match candidate.kind.as_str() {
-        "node" | "cargo" | "venv" | "webcache" => safety::MeasurementPolicy::Developer,
-        _ => safety::MeasurementPolicy::Strict,
+    if crate::recommendations::developer_measurement(&candidate.kind) {
+        safety::MeasurementPolicy::Developer
+    } else {
+        safety::MeasurementPolicy::Strict
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, io::Write, os::unix::fs::PermissionsExt, rc::Rc, sync::Arc};
+    use std::{
+        cell::RefCell,
+        io::{Read, Write},
+        os::unix::fs::PermissionsExt,
+        rc::Rc,
+        sync::Arc,
+    };
 
     struct RestoreFixture {
         store: Store,
@@ -2016,6 +2071,310 @@ mod tests {
         }
         let store = Store::open(&base.join("ledger.sqlite")).unwrap();
         (temp, store, root, candidate)
+    }
+
+    #[cfg(target_os = "macos")]
+    struct FakeTrashState {
+        destination: PathBuf,
+        calls: usize,
+    }
+
+    #[cfg(target_os = "macos")]
+    thread_local! {
+        static FAKE_TRASH_STATE: RefCell<Option<FakeTrashState>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "macos")]
+    struct FakeTrashGuard;
+
+    #[cfg(target_os = "macos")]
+    impl Drop for FakeTrashGuard {
+        fn drop(&mut self) {
+            FAKE_TRASH_STATE.with(|state| *state.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn install_fake_trash(destination: PathBuf) -> FakeTrashGuard {
+        FAKE_TRASH_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            assert!(
+                state.is_none(),
+                "A fake Trash destination is already installed"
+            );
+            *state = Some(FakeTrashState {
+                destination,
+                calls: 0,
+            });
+        });
+        FakeTrashGuard
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_trash_calls() -> usize {
+        FAKE_TRASH_STATE.with(|state| state.borrow().as_ref().map_or(0, |state| state.calls))
+    }
+
+    /// Test Trash never invokes AppKit or touches the user's Trash. It only
+    /// moves the staged file to a preconfigured sibling inside the temp fixture.
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" fn fake_trash(
+        input: *const libc::c_char,
+        output: *mut libc::c_char,
+        output_len: usize,
+    ) -> libc::c_int {
+        if input.is_null() || output.is_null() {
+            return 1;
+        }
+        let source = PathBuf::from(OsStr::from_bytes(unsafe {
+            CStr::from_ptr(input).to_bytes()
+        }));
+        FAKE_TRASH_STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(state) = slot.as_mut() else {
+                return 2;
+            };
+            state.calls += 1;
+            let bytes = state.destination.as_os_str().as_bytes();
+            if bytes.len().saturating_add(1) > output_len {
+                return 3;
+            }
+            if std::fs::rename(&source, &state.destination).is_err() {
+                return 4;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), output.cast(), bytes.len());
+                *output.add(bytes.len()) = 0;
+            }
+            0
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    struct DuplicateCleanupFixture {
+        store: Store,
+        root: Root,
+        copy: Candidate,
+        keeper: crate::duplicates::Input,
+        fake_trash: PathBuf,
+        _temp: tempfile::TempDir,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_old_installer(path: &Path) {
+        let mut file = File::create(path).unwrap();
+        let block = vec![0x5a; 1024 * 1024];
+        for _ in 0..20 {
+            file.write_all(&block).unwrap();
+        }
+        drop(file);
+        File::open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(16 * 86_400)),
+            )
+            .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn duplicate_cleanup_fixture() -> DuplicateCleanupFixture {
+        let temp = tempfile::Builder::new()
+            .prefix("chippytea-duplicate-cleanup-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        // macOS exposes /var through /private/var. Authorize and retain only the
+        // canonical path so root identity and later cleanup ancestry agree.
+        let base = temp.path().canonicalize().unwrap();
+        let downloads = base.join("Downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let copy_path = downloads.join("disposable-copy.dmg");
+        let keeper_path = downloads.join("retained-keeper.dmg");
+        write_old_installer(&copy_path);
+        write_old_installer(&keeper_path);
+        let root = safety::authorize(&downloads, "downloads").unwrap();
+        let mut candidates = std::collections::HashMap::new();
+        let stats = scanner::scan(&root, None, &AtomicBool::new(false), |batch| {
+            for candidate in batch.candidates {
+                if !candidate.provisional
+                    && (candidate.path == copy_path || candidate.path == keeper_path)
+                {
+                    candidates.insert(candidate.path.clone(), candidate);
+                }
+            }
+        })
+        .unwrap();
+        assert!(stats.complete && stats.errors == 0, "{}", stats.message);
+        let copy = candidates
+            .remove(&copy_path)
+            .expect("The old disposable DMG was indexed");
+        let keeper = candidates
+            .remove(&keeper_path)
+            .expect("The independent old keeper DMG was indexed");
+        for candidate in [&copy, &keeper] {
+            assert_eq!(candidate.kind, "installer");
+            assert!(candidate.suggestion_eligible, "{candidate:?}");
+            assert!(candidate.blocked_reason.is_none(), "{candidate:?}");
+            assert!(!candidate.eligible_permanent);
+            assert_eq!(candidate.file_count, 1);
+        }
+        assert_ne!(
+            (copy.identity.device, copy.identity.inode),
+            (keeper.identity.device, keeper.identity.inode),
+            "The retained file must be an independent copy"
+        );
+        let fake_trash = base.join("fake-trash-item.dmg");
+        let store = Store::open(&base.join("ledger.sqlite")).unwrap();
+        DuplicateCleanupFixture {
+            store,
+            root: root.clone(),
+            copy,
+            keeper: crate::duplicates::Input {
+                root,
+                candidate: keeper,
+                keeper_only: false,
+            },
+            fake_trash,
+            _temp: temp,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_prefix(path: &Path) -> [u8; 8] {
+        let mut prefix = [0; 8];
+        File::open(path).unwrap().read_exact(&mut prefix).unwrap();
+        prefix
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_no_cleanup_credit(store: &Store, receipt: &Receipt) {
+        assert_eq!((receipt.credited_bytes, receipt.coins), (0, 0));
+        let wallet = store.wallet().unwrap();
+        assert_eq!(
+            (
+                wallet.collected_coins,
+                wallet.pending_coins,
+                wallet.fractional_bytes,
+                wallet.credited_bytes,
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_guard_restores_copy_when_keeper_changes_after_staging() {
+        let mut fixture = duplicate_cleanup_fixture();
+        let _trash = install_fake_trash(fixture.fake_trash.clone());
+        let keeper_path = fixture.keeper.candidate.path.clone();
+        let copy_path = fixture.copy.path.clone();
+        let mut changed = false;
+        let receipt = execute_with_duplicate_guard(
+            &mut fixture.store,
+            &fixture.root,
+            &fixture.copy,
+            "trash",
+            Some(fake_trash),
+            &AtomicBool::new(false),
+            Some(&fixture.keeper),
+            |phase, completed, _| {
+                if phase == CleanupPhase::Comparing && completed == 0 && !changed {
+                    assert!(!copy_path.exists(), "The copy must already be staged");
+                    let mut keeper = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&keeper_path)
+                        .unwrap();
+                    keeper.write_all(b"changed!").unwrap();
+                    changed = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(receipt.outcome, "skipped", "{}", receipt.detail);
+        assert_eq!(read_prefix(&fixture.copy.path), [0x5a; 8]);
+        assert_eq!(read_prefix(&keeper_path), *b"changed!");
+        assert_eq!(fake_trash_calls(), 0);
+        assert!(!fixture.fake_trash.exists());
+        assert!(
+            !fixture
+                .copy
+                .path
+                .parent()
+                .unwrap()
+                .join(format!(".chippytea-{}", receipt.id))
+                .exists()
+        );
+        assert_no_cleanup_credit(&fixture.store, &receipt);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_guard_restores_copy_when_cancelled_after_staging() {
+        let mut fixture = duplicate_cleanup_fixture();
+        let _trash = install_fake_trash(fixture.fake_trash.clone());
+        let cancel = AtomicBool::new(false);
+        let copy_path = fixture.copy.path.clone();
+        let mut cancelled_after_stage = false;
+        let receipt = execute_with_duplicate_guard(
+            &mut fixture.store,
+            &fixture.root,
+            &fixture.copy,
+            "trash",
+            Some(fake_trash),
+            &cancel,
+            Some(&fixture.keeper),
+            |phase, completed, _| {
+                if phase == CleanupPhase::Comparing && completed == 0 && !cancelled_after_stage {
+                    assert!(!copy_path.exists(), "The copy must already be staged");
+                    cancel.store(true, Ordering::Relaxed);
+                    cancelled_after_stage = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(cancelled_after_stage);
+        assert_eq!(receipt.outcome, "cancelled", "{}", receipt.detail);
+        assert_eq!(read_prefix(&fixture.copy.path), [0x5a; 8]);
+        assert_eq!(read_prefix(&fixture.keeper.candidate.path), [0x5a; 8]);
+        assert_eq!(fake_trash_calls(), 0);
+        assert!(!fixture.fake_trash.exists());
+        assert!(
+            !fixture
+                .copy
+                .path
+                .parent()
+                .unwrap()
+                .join(format!(".chippytea-{}", receipt.id))
+                .exists()
+        );
+        assert_no_cleanup_credit(&fixture.store, &receipt);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_guard_fake_trash_preserves_the_verified_keeper() {
+        let mut fixture = duplicate_cleanup_fixture();
+        let _trash = install_fake_trash(fixture.fake_trash.clone());
+        let receipt = execute_with_duplicate_guard(
+            &mut fixture.store,
+            &fixture.root,
+            &fixture.copy,
+            "trash",
+            Some(fake_trash),
+            &AtomicBool::new(false),
+            Some(&fixture.keeper),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(receipt.outcome, "trashed", "{}", receipt.detail);
+        assert_eq!(receipt.trash_path.as_deref(), fixture.fake_trash.to_str());
+        assert!(receipt.can_restore);
+        assert!(!fixture.copy.path.exists());
+        assert_eq!(read_prefix(&fixture.fake_trash), [0x5a; 8]);
+        assert_eq!(read_prefix(&fixture.keeper.candidate.path), [0x5a; 8]);
+        assert_eq!(fake_trash_calls(), 1);
+        assert_no_cleanup_credit(&fixture.store, &receipt);
     }
 
     /// A recognized Python environment holding internal symbolic links, the
