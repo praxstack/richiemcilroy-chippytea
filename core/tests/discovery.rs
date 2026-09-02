@@ -2,12 +2,16 @@ use chippytea_core::{Engine, model::*};
 use serde_json::json;
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     os::unix::fs::MetadataExt,
-    path::Path,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
+
+mod support;
 
 fn wait(engine: &Arc<Engine>) -> Snapshot {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -20,6 +24,85 @@ fn wait(engine: &Arc<Engine>) -> Snapshot {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+const FD_ADMISSION_CHILD: &str = "CHIPPYTEA_DISCOVERY_FD_ADMISSION_CHILD";
+const FD_ADMISSION_ROOT: &str = "CHIPPYTEA_DISCOVERY_FD_ADMISSION_ROOT";
+const FD_ADMISSION_DB: &str = "CHIPPYTEA_DISCOVERY_FD_ADMISSION_DB";
+
+fn descriptor_limits() -> libc::rlimit {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+        0
+    );
+    limits
+}
+
+fn descriptor_counts(db: &Path) -> (i64, i64, i64, i64) {
+    let connection =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM active_scopes),
+                    (SELECT count(*) FROM pending_scopes),
+                    (SELECT count(*) FROM refreshes),
+                    (SELECT count(*) FROM incomplete_roots)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+fn run_fd_admission_child(mode: &str, root: &Path, db: &Path, restrict_hard_limit: bool) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "helper_fd_admission_is_process_local_and_failed_scans_resume",
+            "--nocapture",
+        ])
+        .env(FD_ADMISSION_CHILD, mode)
+        .env(FD_ADMISSION_ROOT, root)
+        .env(FD_ADMISSION_DB, db)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut limits = descriptor_limits();
+    limits.rlim_cur = 256;
+    if restrict_hard_limit {
+        limits.rlim_max = 256;
+    }
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut timed_out = false;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !timed_out && output.status.success(),
+        "FD admission child {mode} failed (timed out: {timed_out}):\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn fixture() -> (tempfile::TempDir, Arc<Engine>, Root) {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
@@ -45,7 +128,161 @@ fn fixture() -> (tempfile::TempDir, Arc<Engine>, Root) {
 }
 
 #[test]
+fn helper_fd_admission_is_process_local_and_failed_scans_resume() {
+    if let Ok(mode) = std::env::var(FD_ADMISSION_CHILD) {
+        let _engine_guard = support::engine_guard();
+        let root = PathBuf::from(std::env::var_os(FD_ADMISSION_ROOT).unwrap());
+        let db = PathBuf::from(std::env::var_os(FD_ADMISSION_DB).unwrap());
+        let before = descriptor_limits();
+        match mode.as_str() {
+            "restricted" => {
+                assert_eq!(before.rlim_cur, 256);
+                assert_eq!(before.rlim_max, 256);
+                let engine = Engine::open(&db, None).unwrap();
+                let _: Root = serde_json::from_value(
+                    engine
+                        .request(json!({
+                            "action": "authorize",
+                            "path": root,
+                            "kind": "projects"
+                        }))
+                        .unwrap(),
+                )
+                .unwrap();
+                engine.request(json!({"action":"scan"})).unwrap();
+                let failed = wait(&engine);
+                assert!(!failed.scanning);
+                assert!(!failed.stats.complete, "{failed:?}");
+                assert!(
+                    failed.error.as_deref().is_some_and(|error| {
+                        error.contains("file-descriptor budget") && error.contains("hard limit")
+                    }),
+                    "{failed:?}"
+                );
+                assert_eq!(failed.stats.entries, 0);
+                assert!(!failed.stats.cancelled);
+                assert!(failed.candidates.is_empty());
+                assert!(failed.history.is_empty());
+                assert_eq!(failed.wallet.credited_bytes, 0);
+                let foreground = failed.foreground_scan.unwrap();
+                assert!(!foreground.active);
+                assert!(
+                    foreground
+                        .stats
+                        .message
+                        .contains("pending scopes remain for Resume")
+                );
+                let durable = descriptor_counts(&db);
+                assert_eq!(durable, (0, 1, 0, 1));
+
+                // A failed admission must stop the coordinator, leaving one
+                // replayable claim rather than repeatedly retrying the same
+                // impossible helper launch.
+                std::thread::sleep(Duration::from_millis(100));
+                let stable = engine.snapshot().unwrap();
+                assert!(!stable.scanning);
+                assert!(!stable.stats.complete);
+                assert_eq!(descriptor_counts(&db), durable);
+                let after = descriptor_limits();
+                assert_eq!(after.rlim_cur, before.rlim_cur);
+                assert_eq!(after.rlim_max, before.rlim_max);
+            }
+            "resume" => {
+                assert_eq!(before.rlim_cur, 256);
+                let engine = Engine::open(&db, None).unwrap();
+                assert_eq!(descriptor_counts(&db), (0, 1, 0, 1));
+                engine.request(json!({"action":"resume"})).unwrap();
+                let complete = wait(&engine);
+                assert!(!complete.scanning);
+                assert!(complete.stats.complete, "{complete:?}");
+                assert!(complete.stats.entries >= 69);
+                assert!(complete.error.is_none(), "{complete:?}");
+                assert!(!complete.foreground_scan.unwrap().active);
+                assert!(complete.history.is_empty());
+                assert_eq!(complete.wallet.credited_bytes, 0);
+                assert_eq!(descriptor_counts(&db), (0, 0, 0, 0));
+                let after = descriptor_limits();
+                assert_eq!(after.rlim_cur, before.rlim_cur);
+                assert_eq!(after.rlim_max, before.rlim_max);
+            }
+            "success" => {
+                assert_eq!(before.rlim_cur, 256);
+                let engine = Engine::open(&db, None).unwrap();
+                let _: Root = serde_json::from_value(
+                    engine
+                        .request(json!({
+                            "action": "authorize",
+                            "path": root,
+                            "kind": "projects"
+                        }))
+                        .unwrap(),
+                )
+                .unwrap();
+                engine.request(json!({"action":"scan"})).unwrap();
+                let complete = wait(&engine);
+                assert!(!complete.scanning);
+                assert!(complete.stats.complete, "{complete:?}");
+                assert!(complete.stats.entries >= 69);
+                assert!(complete.error.is_none(), "{complete:?}");
+                assert!(complete.history.is_empty());
+                assert_eq!(complete.wallet.credited_bytes, 0);
+                assert_eq!(descriptor_counts(&db), (0, 0, 0, 0));
+                let after = descriptor_limits();
+                assert_eq!(after.rlim_cur, before.rlim_cur);
+                assert_eq!(after.rlim_max, before.rlim_max);
+            }
+            _ => panic!("unknown descriptor admission child mode: {mode}"),
+        }
+        return;
+    }
+
+    let _engine_guard = support::engine_guard();
+    let host_limits = descriptor_limits();
+    assert!(
+        host_limits.rlim_max >= 864,
+        "the real helper admission test requires a hard descriptor limit of at least 864"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let projects = base.join("Projects");
+    fs::create_dir(&projects).unwrap();
+    for (name, files) in [("a", 2), ("b", 3), ("unrelated", 64)] {
+        let dir = projects.join(name);
+        fs::create_dir(&dir).unwrap();
+        for index in 0..files {
+            fs::write(dir.join(format!("file-{index}")), b"preserve fixture").unwrap();
+        }
+    }
+    let failed_db = base.join("failed.sqlite");
+    let successful_db = base.join("successful.sqlite");
+
+    run_fd_admission_child("restricted", &projects, &failed_db, true);
+    assert_eq!(descriptor_counts(&failed_db), (0, 1, 0, 1));
+    assert_eq!(descriptor_limits().rlim_cur, host_limits.rlim_cur);
+    assert_eq!(descriptor_limits().rlim_max, host_limits.rlim_max);
+
+    // The restart path reopens the same durable database, proving the child-only
+    // failure left a replayable claim rather than an in-memory retry.
+    run_fd_admission_child("resume", &projects, &failed_db, false);
+    run_fd_admission_child("success", &projects, &successful_db, false);
+    assert_eq!(fs::read_dir(&projects).unwrap().count(), 3);
+    for (name, files) in [("a", 2), ("b", 3), ("unrelated", 64)] {
+        let directory = projects.join(name);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), files);
+        for index in 0..files {
+            assert_eq!(
+                fs::read(directory.join(format!("file-{index}"))).unwrap(),
+                b"preserve fixture"
+            );
+        }
+    }
+    assert_eq!(descriptor_limits().rlim_cur, host_limits.rlim_cur);
+    assert_eq!(descriptor_limits().rlim_max, host_limits.rlim_max);
+}
+
+#[test]
 fn a_broader_explicit_grant_replaces_scopes_without_touching_files() {
+    let _engine_guard = support::engine_guard();
     let (temp, engine, root) = fixture();
     let broader = temp.path().canonicalize().unwrap();
     assert!(
@@ -77,6 +314,7 @@ fn a_broader_explicit_grant_replaces_scopes_without_touching_files() {
 
 #[test]
 fn sibling_events_refresh_only_their_scopes_and_ignored_churn_stays_idle() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     let initial = engine.snapshot().unwrap().stats.entries;
     for path in [
@@ -107,6 +345,7 @@ fn sibling_events_refresh_only_their_scopes_and_ignored_churn_stays_idle() {
 
 #[test]
 fn cancellation_defers_work_but_durably_received_events_can_be_acknowledged() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     engine
         .request(json!({"action":"dirty","root_id":root.id,"path":root.path.join("a")}))
@@ -138,6 +377,7 @@ fn cancellation_defers_work_but_durably_received_events_can_be_acknowledged() {
 
 #[test]
 fn failed_scope_remains_incomplete_until_a_full_reconciliation() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     let moved = root.path.with_file_name("Moved");
     fs::rename(&root.path, &moved).unwrap();
@@ -174,6 +414,7 @@ fn failed_scope_remains_incomplete_until_a_full_reconciliation() {
 
 #[test]
 fn unkeep_schedules_fresh_discovery_without_mutating_files() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     let before = engine.snapshot().unwrap().stats.entries;
     engine
@@ -186,6 +427,7 @@ fn unkeep_schedules_fresh_discovery_without_mutating_files() {
 
 #[test]
 fn concurrent_event_submission_cannot_resume_a_cancelled_scan() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let events = Arc::clone(&engine);
@@ -214,6 +456,7 @@ fn concurrent_event_submission_cannot_resume_a_cancelled_scan() {
 
 #[test]
 fn received_scopes_survive_restart_without_repeating_the_full_scan() {
+    let _engine_guard = support::engine_guard();
     let (temp, engine, root) = fixture();
     engine.cancel_scan();
     engine
@@ -236,6 +479,7 @@ fn received_scopes_survive_restart_without_repeating_the_full_scan() {
 
 #[test]
 fn commit_message_churn_stays_idle_after_cursor_acknowledgment_and_restart() {
+    let _engine_guard = support::engine_guard();
     let (temp, engine, root) = fixture();
     let before = engine.snapshot().unwrap().stats.entries;
     let metadata = root.path.join("a/.git");
@@ -274,6 +518,7 @@ fn commit_message_churn_stays_idle_after_cursor_acknowledgment_and_restart() {
 
 #[test]
 fn mixed_commit_message_and_artifact_events_survive_restart_with_exact_scopes() {
+    let _engine_guard = support::engine_guard();
     fn aged_project(project: &Path) -> std::path::PathBuf {
         let artifact = project.join("node_modules");
         fs::create_dir_all(&artifact).unwrap();
@@ -381,6 +626,7 @@ fn mixed_commit_message_and_artifact_events_survive_restart_with_exact_scopes() 
 
 #[test]
 fn ordinary_home_files_and_removed_transients_never_restart_discovery() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     let before = engine.snapshot().unwrap().stats.entries;
     let path = root.path.join(".zsh_history");
@@ -402,6 +648,7 @@ fn ordinary_home_files_and_removed_transients_never_restart_discovery() {
 
 #[test]
 fn a_removed_subtree_reconciles_without_reading_its_siblings() {
+    let _engine_guard = support::engine_guard();
     let (_temp, engine, root) = fixture();
     let before = engine.snapshot().unwrap().stats.entries;
     fs::remove_dir_all(root.path.join("a")).unwrap(); // disposable fixture only
@@ -414,6 +661,7 @@ fn a_removed_subtree_reconciles_without_reading_its_siblings() {
 
 #[test]
 fn a_substituted_scope_parent_cannot_be_followed_for_absence_checks() {
+    let _engine_guard = support::engine_guard();
     let (temp, engine, root) = fixture();
     let outside = temp.path().canonicalize().unwrap().join("outside");
     fs::create_dir(&outside).unwrap();
@@ -477,6 +725,7 @@ fn age_fixture_tree(path: &Path, days: u64) {
 
 #[test]
 fn explicit_duplicate_check_verifies_contents_includes_kept_copies_and_expires_on_events() {
+    let _engine_guard = support::engine_guard();
     use std::io::{Seek, SeekFrom};
 
     let temp = tempfile::tempdir().unwrap();
@@ -590,6 +839,7 @@ fn explicit_duplicate_check_verifies_contents_includes_kept_copies_and_expires_o
 
 #[test]
 fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
+    let _engine_guard = support::engine_guard();
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
     let home = base.join("Home");
@@ -779,6 +1029,7 @@ fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
 #[cfg(target_os = "macos")]
 #[test]
 fn live_cache_owner_blocks_discovery_and_a_prepared_cleanup_until_exit() {
+    let _engine_guard = support::engine_guard();
     use std::{
         os::unix::ffi::OsStrExt,
         process::{Child, Command, Stdio},
