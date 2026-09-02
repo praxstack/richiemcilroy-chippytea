@@ -156,11 +156,15 @@ export function roundedRectSamples(
   return points;
 }
 
-/// "1.2 GB" / "300 MB" — decimal units, the way the app writes sizes.
+/// "85.43 GB" / "66.5 MB" / "580 KB" — space() from Models.swift, verbatim.
 export function space(bytes: number): string {
-  if (bytes >= 1e9) {
-    const gb = bytes / 1e9;
-    return `${gb >= 10 ? Math.round(gb) : Math.round(gb * 10) / 10} GB`;
-  }
-  return `${Math.round(bytes / 1e6)} MB`;
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`;
+  return `${Math.floor(bytes)} B`;
+}
+
+/// chipsPhrase() from Models.swift: how the interface says plain chip counts.
+export function chipsPhrase(total: number): string {
+  return `${total.toLocaleString("en-US")} ${total === 1 ? "chip" : "chips"}`;
 }
