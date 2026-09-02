@@ -129,6 +129,8 @@ enum NativeSelfTest {
 
     @MainActor private static func accessFlow() async throws {
         try snapshotResponseDecoding()
+        try managedProviderReviewDecoding()
+        try storageFootprintUsageDecoding()
         try discoveryPresentation()
         try snapshotPublication()
         let fm = FileManager.default
@@ -1627,6 +1629,100 @@ enum NativeSelfTest {
         }
         defer { withExtendedLifetime(delivery) {} }
         let event = FolderEvent(path: "/disposable/source.rs", kind: "file", recursive: false)
+        func work(_ paths: [String], last: UInt64, revision: Int = 1, lost: Bool = false) -> FolderEventWork {
+            let events = paths.map { FolderEvent(path: $0, kind: "file", recursive: false) }
+            return FolderEventWork(batch: FolderEventBatch(events: events, last: last, historyLost: lost), revision: revision)
+        }
+        do {
+            let limits = FolderEventIngressLimits(maximumBatchEvents: 3, maximumBatchBytes: 256,
+                                                   maximumQueuedBatches: 4, maximumQueuedBytes: 1280)
+            var ingress = BoundedFolderEventIngress(limits: limits)
+            try require(ingress.enqueue(work(["/disposable/a"], last: 1)) == .accepted,
+                        "The bounded ingress must accept its first batch")
+            try require(ingress.enqueue(work(["/disposable/b"], last: 2)) == .coalesced,
+                        "Adjacent same-generation batches must coalesce")
+            guard let active = ingress.startNext() else { throw EngineError.message("Missing bounded ingress work") }
+            try require(active.batch.events.count == 2 && active.batch.last == 2 && ingress.count == 1,
+                        "Coalesced work must retain FIFO order and its cursor watermark")
+            for index in 0..<3 {
+                try require(ingress.enqueue(work((0..<3).map { "/disposable/q\(index)-\($0)" }, last: UInt64(index + 10))) == .accepted,
+                            "The bounded ingress must fill its pending FIFO")
+            }
+            try require(ingress.enqueue(work(["/disposable/overflow"], last: 99)) == .overflow,
+                        "A full ingress must report overflow")
+            ingress.finishActive()
+            guard let barrier = ingress.startNext() else { throw EngineError.message("Missing overflow barrier") }
+            try require(barrier.batch.historyLost && barrier.batch.events.isEmpty && barrier.batch.last == 99,
+                        "Overflow must replace discarded work with an exact-cursor loss barrier")
+            ingress.finishActive()
+            try require(ingress.enqueue(work(["/disposable/post-loss"], last: 3)) == .accepted,
+                        "Post-loss work must remain admissible")
+            guard let postLoss = ingress.startNext() else { throw EngineError.message("Missing post-loss work") }
+            try require(!postLoss.batch.historyLost && postLoss.batch.last == 3,
+                        "A post-loss cursor must not inherit the discarded epoch maximum")
+            ingress.finishActive()
+
+            var wrapped = BoundedFolderEventIngress(limits: limits)
+            _ = wrapped.enqueue(work(["/disposable/pending"], last: 50))
+            try require(wrapped.enqueue(work([], last: 0, lost: true)) == .lossBarrier,
+                        "Native history loss must replace pending ordinary work")
+            guard let loss = wrapped.startNext() else { throw EngineError.message("Missing native loss barrier") }
+            try require(loss.batch.historyLost && loss.batch.last == 0,
+                        "Native history loss must preserve its exact wrapped cursor")
+            wrapped.finishActive()
+
+            let countOverflow = work(["/disposable/1", "/disposable/2", "/disposable/3", "/disposable/4"], last: 7)
+            try require(ingress.enqueue(countOverflow) == .overflow,
+                        "A single batch above the event-count limit must become a loss barrier")
+            var byteIngress = BoundedFolderEventIngress(limits: FolderEventIngressLimits(
+                maximumBatchEvents: 8, maximumBatchBytes: 100, maximumQueuedBatches: 2, maximumQueuedBytes: 200))
+            try require(byteIngress.enqueue(work([String(repeating: "x", count: 50)], last: 8)) == .overflow,
+                        "A single batch above the byte limit must become a loss barrier")
+            guard let byteLoss = byteIngress.startNext() else { throw EngineError.message("Missing byte loss barrier") }
+            try require(byteLoss.batch.historyLost && byteLoss.batch.last == 8,
+                        "Byte overflow must retain the triggering cursor for reconciliation")
+
+            let mailbox = FolderEventMailbox(limits: limits)
+            mailbox.activate(revision: 1)
+            var scheduledTasks = 0
+            for id in 1...20_000 {
+                if mailbox.enqueue(work(["/disposable/event-\(id)"], last: UInt64(id))) { scheduledTasks += 1 }
+                let retained = mailbox.retainedWork
+                try require(retained.batches <= limits.maximumQueuedBatches
+                            && retained.bytes <= limits.maximumQueuedBytes,
+                            "The producer-side mailbox must remain bounded while its consumer is stalled")
+            }
+            try require(scheduledTasks == 1 && mailbox.invalidationRevision == 20_000,
+                        "A stalled main actor must have one scheduled task, not one per callback")
+            var reconciledThrough: UInt64 = 0
+            while let next = mailbox.startNext() {
+                reconciledThrough = next.batch.last
+                mailbox.finishActive()
+            }
+            try require(reconciledThrough == 20_000 && mailbox.retainedWork.batches == 0,
+                        "The bounded mailbox must preserve a reconciliation boundary for all dropped payloads")
+            try require(mailbox.enqueue(work([], last: 20_001)),
+                        "A fully drained mailbox must permit exactly one new wakeup")
+
+            let generations = FolderEventMailbox(limits: limits)
+            generations.activate(revision: 2)
+            try require(generations.enqueue(work(["/current/copy"], last: 10, revision: 2)),
+                        "A current watcher must schedule the drain")
+            _ = generations.enqueue(work([], last: 99, revision: 1, lost: true))
+            _ = generations.enqueue(work([String(repeating: "x", count: 1000)], last: 100, revision: 1))
+            try require(generations.retainedWork.events == 1
+                        && generations.containsChanges(overlapping: ["/current/copy"])
+                        && !generations.containsChanges(overlapping: ["/unrelated/copy"]),
+                        "Stale loss/overflow callbacks must not erase current work; unrelated paths must not invalidate a report")
+            guard let current = generations.startNext() else { throw EngineError.message("Missing current-generation event") }
+            try require(current.revision == 2 && current.batch.events.first?.path == "/current/copy",
+                        "The current event must reach durable reconciliation despite stale callbacks")
+            try require(generations.containsChanges(overlapping: ["/current/copy"]),
+                        "An active event must fence duplicate review until its durable write finishes")
+            generations.finishActive()
+            try require(!generations.containsChanges(overlapping: ["/current/copy"]),
+                        "A completed event must not leave a permanent stale-review fence")
+        }
         func fireTimer() throws {
             try require(timers.count == 1, "Cursor coalescing must keep exactly one scheduled timer")
             let action = timers.removeFirst()
@@ -1728,13 +1824,14 @@ enum NativeSelfTest {
         let historyDone = Flags(kFSEventStreamEventFlagHistoryDone)
 
         func decode(_ paths: [Any], flags: [Flags]? = nil, ids: [UInt64]? = nil,
-                    roots: [String]? = nil) -> FolderEventBatch? {
+                    roots: [String]? = nil,
+                    limits: FolderEventIngressLimits = .production) -> FolderEventBatch? {
             let flags = flags ?? Array(repeating: file, count: paths.count)
             let ids = ids ?? paths.indices.map { UInt64($0 + 1) }
             let decoder = FolderEventDecoder(paths: roots ?? [root], excluding: [state])
             return flags.withUnsafeBufferPointer { flagBuffer in
                 ids.withUnsafeBufferPointer { idBuffer in
-                    decoder.decode(paths: paths as NSArray, flags: flagBuffer, ids: idBuffer)
+                    decoder.decode(paths: paths as NSArray, flags: flagBuffer, ids: idBuffer, limits: limits)
                 }
             }
         }
@@ -1756,6 +1853,12 @@ enum NativeSelfTest {
                         "A meaningful or ambiguous event must reach Rust unchanged: \(path)")
         }
         let explicit = root + "/.chippytea-authorized"
+        for boundary in [".build", ".dart_tool", ".zig-cache", "build", ".gradle", "bin", "obj",
+                         ".venv", "venv", ".next", ".nuxt", ".turbo", ".parcel-cache"] {
+            let path = root + "/Project/" + boundary + "/.chippytea-log/leaf"
+            try require(decode([path])?.events.first?.path == path,
+                        "Every possible artifact boundary must retain ownership invalidation: \(boundary)")
+        }
         for roots in [[explicit], [root, explicit], [explicit, root]] {
             for path in [explicit, explicit + "/source.rs", explicit + "/target/leaf"] {
                 try require(decode([path], roots: roots)?.events.first?.path == path,
@@ -1789,7 +1892,8 @@ enum NativeSelfTest {
             try require(decode([123], flags: [Flags(loss) | historyDone])?.historyLost == true,
                         "HistoryDone must not hide a loss flag")
             let mixedLoss = decode([ordinary, staged], flags: [file, Flags(loss) | file], ids: [80, 70])
-            try require(mixedLoss?.historyLost == true && mixedLoss?.last == 80 && mixedLoss?.events.isEmpty == true,
+            let expectedCursor: UInt64 = loss == kFSEventStreamEventFlagEventIdsWrapped ? 70 : 80
+            try require(mixedLoss?.historyLost == true && mixedLoss?.last == expectedCursor && mixedLoss?.events.isEmpty == true,
                         "A later loss flag must replace a mixed batch with full reconciliation")
         }
         try require(decode([ordinary], flags: [], ids: [90])?.historyLost == true,
@@ -1807,6 +1911,14 @@ enum NativeSelfTest {
         let burstBatch = decode(burst)
         try require(burstBatch?.events.map(\.path) == [ordinary] && burstBatch?.last == UInt64(burst.count),
                     "A cleanup burst must not retain its per-file payload or hide a real change")
+        let bounded = FolderEventIngressLimits(maximumBatchEvents: 2, maximumBatchBytes: 256,
+                                                maximumQueuedBatches: 2, maximumQueuedBytes: 512)
+        let countLoss = decode([ordinary, ordinary, ordinary], ids: [7, 8, 9], limits: bounded)
+        try require(countLoss?.events.isEmpty == true && countLoss?.historyLost == true && countLoss?.last == 9,
+                    "Decoder count overflow must produce a full-reconciliation barrier")
+        let byteLoss = decode([root + "/" + String(repeating: "x", count: 300)], ids: [10], limits: bounded)
+        try require(byteLoss?.events.isEmpty == true && byteLoss?.historyLost == true && byteLoss?.last == 10,
+                    "Decoder byte overflow must produce a full-reconciliation barrier")
         print("Native watcher decoding: root_relative=true cursor_preserved=true loss_preserved=true cleanup_paths_filtered=2048")
     }
 
@@ -3574,6 +3686,88 @@ enum NativeSelfTest {
             try require(actual == message, "Error envelopes must preserve the engine message before decoding data")
         }
     }
+    private static func managedProviderReviewDecoding() throws {
+        // Keep these bytes as JSON text so the decoder, rather than an
+        // intermediate NSNumber/Double representation, proves UInt64 fidelity.
+        let preciseBytes: UInt64 = 9_007_199_254_740_993
+        func fixture(provider: String = "Homebrew", state: String = "Complete",
+                     cleanupAuthority: String = "ReviewOnly") -> Data {
+            Data("""
+            {"provider":"\(provider)","state":"\(state)","observations":[{"id":"cache-1","description":"Disposable UTF-8 cache café 🪙","logical_bytes":9007199254740993,"host_bytes":null,"reclaimable":true,"evidence":[{"source":"fixture","detail":"bounded owner evidence","verified":true}]}],"logical_recovery_bytes":9007199254740993,"host_recovery_bytes":null,"evidence":[],"consequence":"The owner can recreate this observation.","owner_followup":"Use the installed owner tool to review it.","cleanup_authority":"\(cleanupAuthority)"}
+            """.utf8)
+        }
+
+        let complete = try ManagedProviderReviewDTO.decode(fixture(), expectedProvider: .homebrew)
+        try require(complete.state == .complete
+                    && complete.cleanupAuthority == .reviewOnly
+                    && complete.logicalRecoveryBytes == preciseBytes
+                    && complete.hostRecoveryBytes == nil
+                    && complete.observations.count == 1
+                    && complete.observations[0].logicalBytes == preciseBytes
+                    && complete.observations[0].hostBytes == nil
+                    && complete.observations[0].description.contains("café 🪙"),
+                    "Managed owner review decoding must preserve state, UTF-8, UInt64 values and null host bytes")
+
+        let partial = try ManagedProviderReviewDTO.decode(fixture(state: "Partial"), expectedProvider: .homebrew)
+        try require(partial.state == .partial && partial.logicalRecoveryBytes == preciseBytes,
+                    "Partial owner review state must remain explicit")
+        let unknown = try ManagedProviderReviewDTO.decode(fixture(state: "Unknown"), expectedProvider: .homebrew)
+        try require(unknown.state == .unknown && unknown.hostRecoveryBytes == nil,
+                    "Unknown owner review state and unavailable host bytes must not become false zeroes")
+
+        let providers: [(ManagedProviderID, String)] = [
+            (.homebrew, "Homebrew"), (.uv, "Uv"), (.pnpm, "Pnpm"), (.docker, "DockerBuildKit"),
+            (.vscodeExtensions, "VsCodeExtensions"), (.cursorExtensions, "CursorExtensions")
+        ]
+        for (expected, wireValue) in providers {
+            let decoded = try ManagedProviderReviewDTO.decode(fixture(provider: wireValue), expectedProvider: expected)
+            try require(decoded.provider == expected.responseProvider,
+                        "Managed owner review provider mapping must remain fixed for \(expected.rawValue)")
+        }
+
+        let invalidFixtures = [
+            ("wrong provider", fixture(provider: "Uv"), ManagedProviderID.homebrew),
+            ("unknown state", fixture(state: "Running"), ManagedProviderID.homebrew),
+            ("unsafe cleanup authority", fixture(cleanupAuthority: "Delete"), ManagedProviderID.homebrew),
+            ("unknown provider", fixture(provider: "VisualStudioCode"), ManagedProviderID.homebrew),
+        ]
+        for (label, data, expectedProvider) in invalidFixtures {
+            var rejected = false
+            do { _ = try ManagedProviderReviewDTO.decode(data, expectedProvider: expectedProvider) }
+            catch { rejected = true }
+            try require(rejected, "Malformed managed owner response must fail closed: \(label)")
+        }
+        print("Native managed owner review decoding: states=true provider_mapping=true review_only=true uint64_precision=true null_host=true malformed_rejected=true")
+    }
+    private static func storageFootprintUsageDecoding() throws {
+        let preciseRows: UInt64 = 9_007_199_254_740_993
+        let valid = Data("""
+        {"candidate_rows":9007199254740993,"candidate_payload_bytes":33554432,"database_bytes":9007199254740995,"wal_bytes":4096,"wal_shm_bytes":8192,"wal_frames":12,"wal_checkpointed":10,"wal_busy":false}
+        """.utf8)
+        let usage = try EngineClient.decode(StorageFootprintUsageDTO.self, valid)
+        try require(usage.candidateRows == preciseRows
+                    && usage.candidatePayloadBytes == 33_554_432
+                    && usage.databaseBytes == preciseRows + 2
+                    && usage.walBytes == 4_096
+                    && usage.walShmBytes == 8_192
+                    && usage.walFrames == 12
+                    && usage.walCheckpointed == 10
+                    && !usage.walBusy,
+                    "Storage footprint decoding must preserve O(1) counters and WAL telemetry exactly")
+
+        let malformed = [
+            "{}",
+            "{\"candidate_rows\":9007199254740993,\"candidate_payload_bytes\":33554432,\"database_bytes\":9007199254740995,\"wal_bytes\":4096,\"wal_shm_bytes\":8192,\"wal_frames\":12,\"wal_checkpointed\":10}",
+            "{\"candidate_rows\":\"9007199254740993\",\"candidate_payload_bytes\":33554432,\"database_bytes\":9007199254740995,\"wal_bytes\":4096,\"wal_shm_bytes\":8192,\"wal_frames\":12,\"wal_checkpointed\":10,\"wal_busy\":false}",
+        ]
+        for text in malformed {
+            var rejected = false
+            do { _ = try EngineClient.decode(StorageFootprintUsageDTO.self, Data(text.utf8)) }
+            catch { rejected = true }
+            try require(rejected, "Malformed storage footprint response must not become a false zero: \(text)")
+        }
+        print("Native storage footprint decoding: uint64_precision=true wal_fields=true malformed_rejected=true")
+    }
     private static func snapshotResponseReuse() throws {
         var first = EngineSnapshot()
         first.stats.entries = 9_007_199_254_740_993
@@ -3629,9 +3823,135 @@ enum NativeSelfTest {
         decoder.clear()
         try require(try decoder.decode(original) == first, "Clearing the decoder must allow fresh reads")
     }
+    private static func conditionalSnapshotDecoding() throws {
+        struct Progress: Encodable {
+            let scanning: Bool
+            let cleaning: Bool
+            let stats: ScanStats
+            let foregroundScan: ForegroundScan?
+            let error: String?
+            let includesForegroundScan: Bool
+            let includesError: Bool
+
+            private enum CodingKeys: String, CodingKey { case scanning, cleaning, stats, foregroundScan, error }
+
+            func encode(to encoder: Encoder) throws {
+                var values = encoder.container(keyedBy: CodingKeys.self)
+                try values.encode(scanning, forKey: .scanning)
+                try values.encode(cleaning, forKey: .cleaning)
+                try values.encode(stats, forKey: .stats)
+                if includesForegroundScan {
+                    try values.encode(foregroundScan, forKey: .foregroundScan)
+                }
+                if includesError {
+                    try values.encode(error, forKey: .error)
+                }
+            }
+        }
+        struct Payload: Encodable {
+            let revision: String
+            let contentRevision: String
+            let changed: Bool
+            let snapshot: EngineSnapshot?
+            let progress: Progress?
+        }
+        struct Response: Encodable {
+            let ok: Bool
+            let data: Payload?
+            let error: String?
+        }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        func response(revision: String, content: String, changed: Bool,
+                      snapshot: EngineSnapshot? = nil, progress: Progress? = nil,
+                      ok: Bool = true, error: String? = nil) throws -> Data {
+            try encoder.encode(Response(ok: ok,
+                                        data: Payload(revision: revision, contentRevision: content,
+                                                      changed: changed, snapshot: snapshot, progress: progress),
+                                        error: error))
+        }
+        let identity = EngineIdentity(device: 1, inode: 2, mode: 0o100600, size: 3, modifiedNs: 4, changedNs: 5)
+        let candidate = Candidate(id: "candidate", rootId: "root", path: "/disposable/item.bin", title: "Item",
+                                  kind: "download", logicalBytes: 3, allocatedBytes: 3, fileCount: 1,
+                                  modifiedNs: 4, explanation: "Disposable", consequence: "Recreate", eligiblePermanent: false,
+                                  blockedReason: nil, identity: identity, fingerprint: "fingerprint", evidence: "evidence",
+                                  suggestionEligible: false)
+        var first = EngineSnapshot()
+        first.roots = [ScanRoot(id: "root", path: "/disposable", kind: "folder", identity: identity)]
+        first.candidates = [candidate]
+        first.keptPaths = ["/disposable/keep"]
+        first.wallet = Wallet(collectedCoins: 2, pendingCoins: 3, fractionalBytes: 4, creditedBytes: 5)
+        first.stats = ScanStats(entries: 6, files: 7, directories: 8, logicalBytes: 9, allocatedBytes: 10,
+                                skipped: 11, excludedArtifacts: 12, errors: 0, candidates: 1, elapsedMs: 13,
+                                firstFindingMs: 14, cancelled: false, complete: true, message: "ready")
+        first.foregroundScan = ForegroundScan(active: true, stats: first.stats)
+        first.error = "old error"
+        var decoder = ConditionalSnapshotDecoder()
+        try require(try decoder.decode(response(revision: "r1", content: "c1", changed: true, snapshot: first)) == first,
+                    "A cold conditional full snapshot must seed its cache")
+        try require((decoder.requestTokens?["after_revision"] as? String) == "r1"
+                    && (decoder.requestTokens?["after_content_revision"] as? String) == "c1",
+                    "A seeded conditional snapshot must expose both opaque revision tokens")
+        try require(try decoder.decode(response(revision: "r1", content: "c1", changed: false)) == first,
+                    "An unchanged conditional snapshot must reuse the cached full model")
+
+        var progressStats = first.stats
+        progressStats.entries = 20
+        progressStats.complete = false
+        let progress = Progress(scanning: true, cleaning: false, stats: progressStats,
+                                foregroundScan: ForegroundScan(active: false, stats: progressStats),
+                                error: "new error", includesForegroundScan: true, includesError: true)
+        let progressed = try decoder.decode(response(revision: "r2", content: "c1", changed: true, progress: progress))
+        try require(progressed.roots == first.roots && progressed.candidates == first.candidates
+                    && progressed.history == first.history && progressed.wallet == first.wallet
+                    && progressed.keptPaths == first.keptPaths && progressed.scanning
+                    && !progressed.cleaning && progressed.stats == progressStats
+                    && progressed.foregroundScan?.active == false
+                    && progressed.error == "new error",
+                    "Progress-only responses must update only the five progress fields")
+
+        let missingOptional = Progress(scanning: false, cleaning: true, stats: first.stats,
+                                       foregroundScan: nil, error: nil,
+                                       includesForegroundScan: false, includesError: false)
+        let retained = try decoder.decode(response(revision: "r3", content: "c1", changed: true, progress: missingOptional))
+        try require(retained.foregroundScan?.active == false && retained.error == "new error",
+                    "Missing optional progress keys must not erase cached fields")
+        let completed = Progress(scanning: false, cleaning: false, stats: first.stats,
+                                 foregroundScan: ForegroundScan(active: false, stats: first.stats),
+                                 error: nil, includesForegroundScan: true, includesError: true)
+        let finished = try decoder.decode(response(revision: "r4", content: "c1", changed: true, progress: completed))
+        try require(finished.foregroundScan?.active == false && finished.error == nil,
+                    "Progress responses must preserve foreground completion and explicit null errors")
+
+        var rejected = false
+        do { _ = try decoder.decode(response(revision: "r5", content: "c2", changed: true, progress: completed)) }
+        catch { rejected = true }
+        try require(rejected && decoder.snapshot == nil && decoder.requestTokens == nil,
+                    "A stale content revision must clear the conditional cache and request tokens")
+
+        let invalidResponses = [
+            try response(revision: String(repeating: "x", count: 129), content: "c1", changed: true, snapshot: first),
+            try response(revision: "r1", content: "c1", changed: true, snapshot: first, progress: completed),
+            try response(revision: "r1", content: "c1", changed: true),
+            try response(revision: "r1", content: "c1", changed: false, snapshot: first),
+            try response(revision: "r1", content: "c1", changed: false, ok: false, error: "failed"),
+        ]
+        for invalid in invalidResponses {
+            var fresh = ConditionalSnapshotDecoder()
+            _ = try? fresh.decode(response(revision: "seed", content: "content", changed: true, snapshot: first))
+            var failed = false
+            do { _ = try fresh.decode(invalid) } catch { failed = true }
+            try require(failed && fresh.snapshot == nil && fresh.requestTokens == nil,
+                        "Invalid conditional protocol responses must clear cached state")
+        }
+        print("Native conditional snapshots: cold=true unchanged=true progress_only=true retained_fields=true optional_keys=true stale_content_rejected=true malformed_rejected=true")
+    }
     private static func test() throws {
         try snapshotResponseDecoding()
+        try managedProviderReviewDecoding()
+        try storageFootprintUsageDecoding()
         try snapshotResponseReuse()
+        try conditionalSnapshotDecoding()
         let fm = FileManager.default
         guard let physicalTemp = realpath(fm.temporaryDirectory.path, nil) else { throw EngineError.message("Cannot resolve the disposable test directory") }
         let temporaryRoot = URL(fileURLWithPath: String(cString: physicalTemp)); free(physicalTemp)
