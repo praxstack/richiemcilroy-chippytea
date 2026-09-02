@@ -1,4 +1,4 @@
-use chippytea_core::{Engine, model::*, safety, scanner};
+use chippytea_core::{Engine, model::*, safety, scan_worker, scanner};
 use serde_json::json;
 use std::{
     path::Path,
@@ -49,6 +49,7 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&stats).unwrap());
         }
         "scan" => {
+            scan_worker::prepare_scan_process()?;
             let path = path
                 .ok_or("Expected authorized path")?
                 .canonicalize()
