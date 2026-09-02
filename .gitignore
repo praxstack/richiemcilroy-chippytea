@@ -47,6 +47,13 @@ service-account*.json
 /docs/local/
 *.log
 
+# Internal architecture, planning, and research notes stay local.
+/MVP.md
+/docs/ARCHITECTURE.md
+/docs/DESIGN.md
+/docs/PERFORMANCE.md
+/docs/REFERENCE-STUDY.md
+
 # Editor, agent and system state.
 .DS_Store
 .idea/

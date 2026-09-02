@@ -4,7 +4,7 @@ The app is SwiftUI and AppKit over a Rust library. The landing page in `site/` i
 
 ## Requirements
 
-- macOS 14 or later. The native measurements currently documented in this repo are from Apple Silicon; they do not establish Intel compatibility.
+- macOS 14 or later. Native performance validation has used Apple Silicon; it does not establish Intel performance.
 - Xcode command-line tools with a Swift 6 toolchain.
 - A current stable Rust toolchain, including `rustfmt` and `clippy`.
 - Python 3 for the native build and benchmark helpers. Release checks need Python 3.12 or later.
@@ -105,10 +105,6 @@ Use `bun run build` for the production build check. See [the site README](../sit
 
 ## Further reading
 
-- [Engine architecture](ARCHITECTURE.md): traversal, scheduling, mutation and persistence.
 - [Recommendation policy](SUGGESTIONS.md): eligibility, exclusions and coverage limits.
-- [Interface design](DESIGN.md): visual language and interaction.
-- [Performance notes](PERFORMANCE.md): measurements and reproduction commands. Keep private raw output local.
+- [Disk access](DISK-ACCESS.md): authorized folders, Full Disk Access and native consent.
 - [Releasing chippytea](RELEASING.md): signing, notarization, publishing and verifying in-app updates.
-
-`MVP.md` is an earlier design proposal, not a list of shipped features. Use the source and current policy documents when describing behavior.

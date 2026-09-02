@@ -83,10 +83,10 @@ Working on the landing page? See [site/README.md](site/README.md).
 | [Landing page](site) | The same drawing paths and chip-shop style, built with Next.js |
 | [Tests and benchmarks](scripts) | Disposable fixtures, native integration checks, and reproducible performance tools |
 
-[Architecture](docs/ARCHITECTURE.md) · [Design](docs/DESIGN.md) · [Disk access](docs/DISK-ACCESS.md) · [Performance](docs/PERFORMANCE.md)
+[Cleanup policy](docs/SUGGESTIONS.md) · [Disk access](docs/DISK-ACCESS.md) · [Development](docs/development.md) · [Releasing](docs/RELEASING.md)
 
 ## Contributing
 
 Bug reports, careful safety tests, clearer docs, and small fixes are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing cleanup behaviour. Please keep personal paths, logs, and credentials out of public issues. Security problems belong in a [private report](https://github.com/richiemcilroy/chippytea/security/advisories/new).
 
-[MIT licensed](LICENSE). Built with lessons from [Kondo, dua, and dust](docs/REFERENCE-STUDY.md).
+[MIT licensed](LICENSE). Built with lessons from [Kondo](https://github.com/tbillington/kondo), [dua](https://github.com/Byron/dua-cli), and [dust](https://github.com/bootandy/dust).

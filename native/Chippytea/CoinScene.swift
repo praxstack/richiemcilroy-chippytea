@@ -4,7 +4,7 @@ import SwiftUI
 // MARK: - Tokens
 
 /// The single source of colour, type, spacing and drawn chrome for the notebook panel.
-/// Documented in `docs/DESIGN.md`; nothing in the UI may introduce a value outside this set.
+/// Nothing in the UI may introduce a value outside this set.
 enum TeaTheme {
     // Notebook stock
     static let paper = Color(red: 0.980, green: 0.961, blue: 0.918)      // #FAF5EA
