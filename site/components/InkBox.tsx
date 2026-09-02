@@ -7,7 +7,7 @@
 import { useLayoutEffect, useMemo, useRef, useState, useId } from "react";
 import { tea, inkA, goldDeepA, inkSoftA, inkNoise, handPathD, roundedRectSamples } from "@/lib/ink";
 
-type Variant = "primary" | "quiet" | "card";
+type Variant = "primary" | "quiet" | "destructive" | "card" | "well";
 
 interface Props {
   /** "div" renders a plain drawn card — no pointer chrome, valid around nested buttons. */
@@ -68,8 +68,8 @@ export function InkBox({
   const drawn = size.w > 4 && size.h > 4;
   const art = useMemo(() => {
     if (!drawn) return null;
-    const step = variant === "card" ? 11 : 9;
-    const amplitude = variant === "card" ? 1.0 : 0.9;
+    const step = variant === "card" ? 11 : variant === "well" ? 12 : 9;
+    const amplitude = variant === "card" ? 1.0 : variant === "well" ? 0.7 : 0.9;
     const d = handPathD(
       roundedRectSamples(0.8, 0.8, size.w - 1.6, size.h - 1.6, radius, step),
       true,
@@ -81,9 +81,14 @@ export function InkBox({
 
   const line = disabled
     ? inkSoftA(0.35)
-    : variant === "quiet" && !hover
-      ? inkA(0.8)
-      : tea.ink;
+    : variant === "destructive"
+      ? tea.rust
+      : variant === "well"
+        ? inkA(0.28)
+        : variant === "quiet" && !hover
+          ? inkA(0.8)
+          : tea.ink;
+  const lineWidth = variant === "well" ? 1.1 : 1.4;
   const fill =
     variant === "primary"
       ? disabled
@@ -91,9 +96,15 @@ export function InkBox({
         : tea.gold
       : variant === "card"
         ? tea.card
-        : hover && !disabled
-          ? tea.paperDeep
-          : "rgba(255, 253, 246, 0.9)";
+        : variant === "well"
+          ? "rgba(241, 234, 219, 0.7)"
+          : variant === "destructive"
+            ? hover && !disabled
+              ? "rgba(180, 85, 61, 0.10)"
+              : "rgba(255, 253, 246, 0.9)"
+            : hover && !disabled
+              ? tea.paperDeep
+              : "rgba(255, 253, 246, 0.9)";
 
   const svg = art ? (
     <svg className="pointer-events-none absolute inset-0" width={size.w} height={size.h} aria-hidden="true">
@@ -112,13 +123,14 @@ export function InkBox({
           />
         </>
       )}
-      <path d={art.d} stroke={line} strokeWidth={1.4} fill="none" strokeLinecap="round" strokeLinejoin="round" />
+      <path d={art.d} stroke={line} strokeWidth={lineWidth} fill="none" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   ) : null;
 
   const shared = {
     className: [
-      "relative inline-flex cursor-pointer items-center justify-center border-none bg-transparent p-0 font-semibold text-ink no-underline transition-transform duration-100 ease-out",
+      "relative inline-flex cursor-pointer items-center justify-center border-none bg-transparent p-0 font-semibold no-underline transition-transform duration-100 ease-out",
+      variant === "destructive" ? "text-rust" : "text-ink",
       "active:scale-[0.98] disabled:cursor-default disabled:text-ink-soft/50",
       drawn ? "" : "rounded-[9px] border-[1.4px] border-solid border-ink/80",
       className,
