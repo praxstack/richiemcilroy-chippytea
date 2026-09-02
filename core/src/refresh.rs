@@ -1,7 +1,7 @@
 //! Bounded filesystem-event work. Event receipt is purely lexical; filesystem
 //! probes and index reconciliation belong to the discovery worker.
 use crate::{model::*, recommendations, safety};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ const RECENT_FILE_HINTS_MAX_COUNT: usize = 64;
 // bounded by MAX_COUNT. No file contents or filesystem observations are cached.
 const RECENT_FILE_HINTS_MAX_BYTES: usize = 64 * 1024;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct RecentFileHint {
     root_id: String,
     artifact: PathBuf,
@@ -44,11 +44,62 @@ struct RecentFileHint {
 /// Event receipt and successful discovery can supply paths, never observations.
 /// A worker edits a bounded clone and returns it only if no later receipt or
 /// invalidation changed the runtime pool. Every hit needs fresh validation.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize)]
 pub(crate) struct RecentFileHints {
     entries: VecDeque<RecentFileHint>,
     bytes: usize,
     revision: u64,
+}
+
+impl<'de> Deserialize<'de> for RecentFileHints {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            entries: VecDeque<RecentFileHint>,
+            bytes: usize,
+            revision: u64,
+        }
+        let value = Wire::deserialize(decoder)?;
+        let invalid = || serde::de::Error::custom("Invalid bounded recent-file hints");
+        if value.entries.len() > RECENT_FILE_HINTS_MAX_COUNT {
+            return Err(invalid());
+        }
+        let mut bytes = 0usize;
+        for hint in &value.entries {
+            let weight = hint
+                .root_id
+                .len()
+                .checked_add(hint.artifact.as_os_str().len())
+                .and_then(|weight| weight.checked_add(hint.leaf.as_os_str().len()))
+                .ok_or_else(invalid)?;
+            if weight != hint.bytes
+                || hint.root_id.is_empty()
+                || hint.root_id.len() > 128
+                || hint.leaf == hint.artifact
+                || !hint.leaf.starts_with(&hint.artifact)
+                || safety::absolute_components(&hint.artifact).is_err()
+                || safety::absolute_components(&hint.leaf).is_err()
+                || !hint
+                    .artifact
+                    .file_name()
+                    .is_some_and(crate::scanner::artifact_component)
+            {
+                return Err(invalid());
+            }
+            bytes = bytes.checked_add(weight).ok_or_else(invalid)?;
+            if bytes > RECENT_FILE_HINTS_MAX_BYTES {
+                return Err(invalid());
+            }
+        }
+        if bytes != value.bytes {
+            return Err(invalid());
+        }
+        Ok(Self {
+            entries: value.entries,
+            bytes,
+            revision: value.revision,
+        })
+    }
 }
 
 impl RecentFileHints {
@@ -300,8 +351,26 @@ fn ownership_evidence(name: &OsStr) -> bool {
                 | "Cargo.toml"
                 | "Cargo.lock"
                 | "pyvenv.cfg"
+                | "Package.swift"
+                | "Package.resolved"
+                | "pubspec.yaml"
+                | "pubspec.lock"
+                | "pubspec_overrides.yaml"
+                | ".metadata"
+                | "build.zig"
+                | "build.zig.zon"
+                | "settings.gradle"
+                | "settings.gradle.kts"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "Directory.Build.props"
+                | "Directory.Build.targets"
         )
-    )
+    ) || name.to_str().is_some_and(|name| {
+        [".csproj", ".fsproj", ".vbproj"]
+            .iter()
+            .any(|extension| name.ends_with(extension))
+    })
 }
 
 fn in_downloads(root: &Root, path: &Path) -> bool {
@@ -383,6 +452,37 @@ mod tests {
             kind: EventKind::File,
             recursive: false,
         }
+    }
+
+    #[test]
+    fn recent_hint_wire_format_rechecks_its_count_and_byte_invariants() {
+        let root = root();
+        let artifact = root.path.join("Project/.build");
+        let mut hints = RecentFileHints::default();
+        hints.remember(&root, &artifact, &artifact.join("fresh"));
+        let valid = serde_json::to_value(&hints).unwrap();
+        let roundtrip: RecentFileHints = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(
+            roundtrip.get(&root.id, &artifact),
+            hints.get(&root.id, &artifact)
+        );
+        for (key, value) in [
+            ("bytes", serde_json::json!(0)),
+            ("entries", serde_json::json!([])),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[key] = value;
+            assert!(serde_json::from_value::<RecentFileHints>(malformed).is_err());
+        }
+        let mut escaped = valid.clone();
+        escaped["entries"][0]["leaf"] = serde_json::json!("/outside");
+        assert!(serde_json::from_value::<RecentFileHints>(escaped).is_err());
+        let mut too_many = valid.clone();
+        too_many["entries"] = serde_json::json!(vec![
+            valid["entries"][0].clone();
+            RECENT_FILE_HINTS_MAX_COUNT + 1
+        ]);
+        assert!(serde_json::from_value::<RecentFileHints>(too_many).is_err());
     }
 
     #[test]
