@@ -1,12 +1,19 @@
 pub mod accounting;
 mod activity;
 pub mod cleanup;
+mod docker_read;
 mod duplicates;
+mod editor_review;
 mod lock_facts;
+mod managed_providers;
 pub mod model;
+mod probe;
+mod project_providers;
 mod recommendations;
 mod refresh;
 pub mod safety;
+#[doc(hidden)]
+pub mod scan_worker;
 pub mod scanner;
 pub mod store;
 
@@ -84,9 +91,44 @@ struct ForegroundTicket {
     root_id: String,
 }
 
+#[cfg(test)]
 struct ScopeOutcome {
     stats: ScanStats,
     error: Option<String>,
+}
+
+struct IsolatedScope {
+    root: Root,
+    resolved: PathBuf,
+    cargo_lock: bool,
+    ticket: Option<ForegroundTicket>,
+    refresh: store::ScopeRefresh,
+    handle: scan_worker::Handle,
+    stats: ScanStats,
+    hints_revision: Option<u64>,
+    epoch: u64,
+    resolved_received: bool,
+    started: Instant,
+}
+
+fn candidate_in_read_scope(root: &Root, resolved: &Path, cargo_lock: bool, path: &Path) -> bool {
+    if path == root.path
+        || !path.starts_with(&root.path)
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if cargo_lock {
+        path == resolved
+            || refresh::cargo_lock_target(root, resolved)
+                .ok()
+                .flatten()
+                .is_some_and(|target| path == target)
+    } else {
+        path.starts_with(resolved)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,6 +297,7 @@ struct CleanupProgress {
 }
 pub struct Engine {
     store: Mutex<Store>,
+    snapshot_epoch: String,
     runtime: Mutex<Runtime>,
     reviews: Mutex<HashMap<String, Review>>,
     // Progress never takes the SQLite lock held by a cleanup operation.
@@ -263,6 +306,7 @@ pub struct Engine {
     duplicate_progress: Mutex<Option<duplicates::Progress>>,
     checking_duplicates: AtomicBool,
     duplicate_cancel: AtomicBool,
+    managed_review: Mutex<ManagedReviewState>,
     sql_interrupt: rusqlite::InterruptHandle,
     busy: AtomicBool,
     scanning: AtomicBool,
@@ -271,6 +315,7 @@ pub struct Engine {
     scan_paused: AtomicBool,
     mutation_cancel: AtomicBool,
     cancel_generation: AtomicU64,
+    read_epoch: AtomicU64,
     discovery_urgency: AtomicU64,
     interactive: AtomicBool,
     pause_requested: AtomicBool,
@@ -280,6 +325,8 @@ pub struct Engine {
     debounce_wait_observer: Mutex<Option<std::sync::mpsc::Sender<Instant>>>,
     #[cfg(test)]
     discovery_observer: Mutex<Option<DiscoveryObserver>>,
+    #[cfg(test)]
+    scan_helper_fixture: Mutex<Option<PathBuf>>,
     #[cfg(test)]
     review_admission_observer: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     trash: Option<cleanup::TrashCallback>,
@@ -305,12 +352,17 @@ impl Engine {
         }
         let mut store = Store::open(path)?;
         store.reconcile()?;
+        // The library is exclusively owned and no reviews exist during open.
+        // Keep migration work bounded; admission prevents further growth even
+        // when a legacy index needs more than one idle maintenance slice.
+        store.maintain_derived(&[])?;
         let stats = store.latest_stats()?;
         let restored_foreground = store.load_foreground_summary()?;
         let sql_interrupt = store.conn.get_interrupt_handle();
         store.conn.execute_batch("CREATE TABLE IF NOT EXISTS event_cursor(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL); INSERT OR IGNORE INTO event_cursor VALUES(1,0);").map_err(store::err)?;
         Ok(Arc::new(Self {
             store: Mutex::new(store),
+            snapshot_epoch: unique_id(),
             runtime: Mutex::new(Runtime {
                 stats,
                 error: None,
@@ -327,6 +379,7 @@ impl Engine {
             duplicate_progress: Mutex::new(None),
             checking_duplicates: AtomicBool::new(false),
             duplicate_cancel: AtomicBool::new(false),
+            managed_review: Mutex::new(ManagedReviewState::default()),
             sql_interrupt,
             busy: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
@@ -335,6 +388,7 @@ impl Engine {
             scan_paused: AtomicBool::new(false),
             mutation_cancel: AtomicBool::new(false),
             cancel_generation: AtomicU64::new(0),
+            read_epoch: AtomicU64::new(0),
             discovery_urgency: AtomicU64::new(0),
             interactive: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
@@ -345,46 +399,93 @@ impl Engine {
             #[cfg(test)]
             discovery_observer: Mutex::new(None),
             #[cfg(test)]
+            scan_helper_fixture: Mutex::new(None),
+            #[cfg(test)]
             review_admission_observer: Mutex::new(None),
             trash,
             _lock: lock,
         }))
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_update(None, None)?
+            .snapshot
+            .ok_or_else(|| "A full snapshot was not returned".into())
+    }
+
+    fn snapshot_update(
+        &self,
+        after_revision: Option<&str>,
+        after_content_revision: Option<&str>,
+    ) -> Result<SnapshotUpdate> {
         let runtime = self.runtime.lock().map_err(store::err)?;
         // Capture grants and their presentation under the same lock boundary.
         // Release runtime before decoding indexed rows, keeping cancellation
         // independent of the snapshot's potentially larger serialization work.
         let store = self.store.lock().map_err(store::err)?;
-        let (mut stats, foreground_scan, error, scanning, cleaning) = {
+        let mut progress = {
             // Worker transitions use this lock too. Reading flags later could
             // pair an idle worker with the preceding incomplete statistics and
             // make the native client stop polling before its final update.
-            (
-                runtime.stats.clone(),
-                runtime
+            SnapshotProgress {
+                stats: runtime.stats.clone(),
+                foreground_scan: runtime
                     .foreground
                     .as_ref()
                     .map(|request| request.snapshot.clone())
                     .or_else(|| runtime.restored_foreground.clone()),
-                runtime.error.clone(),
-                self.scanning.load(Ordering::Acquire),
-                self.cleaning.load(Ordering::Acquire),
-            )
+                error: runtime.error.clone(),
+                scanning: self.scanning.load(Ordering::Acquire),
+                cleaning: self.cleaning.load(Ordering::Acquire),
+            }
         };
+        // SQLite owns every persistent snapshot field. The process epoch stops
+        // an old client token being reused after a connection/library restart.
+        // This counter may invalidate conservatively for journal writes, but
+        // cannot miss a wallet, history, grant, Keep or candidate write.
+        let content_revision = format!("{}:{}", self.snapshot_epoch, store.conn.total_changes());
+        let revision =
+            blake3::hash(&serde_json::to_vec(&(&content_revision, &progress)).map_err(store::err)?)
+                .to_hex()
+                .to_string();
         drop(runtime);
-        store.apply_coverage(&mut stats)?;
-        Ok(Snapshot {
+        let content_unchanged = after_content_revision == Some(content_revision.as_str());
+        if content_unchanged && after_revision == Some(revision.as_str()) {
+            return Ok(SnapshotUpdate {
+                revision,
+                content_revision,
+                changed: false,
+                snapshot: None,
+                progress: None,
+            });
+        }
+        store.apply_coverage(&mut progress.stats)?;
+        if content_unchanged {
+            return Ok(SnapshotUpdate {
+                revision,
+                content_revision,
+                changed: true,
+                snapshot: None,
+                progress: Some(progress),
+            });
+        }
+        let snapshot = Snapshot {
             roots: store.roots()?,
             candidates: store.candidates()?,
             history: store.history()?,
             wallet: store.wallet()?,
-            scanning,
-            cleaning,
-            stats,
-            foreground_scan,
-            error,
+            scanning: progress.scanning,
+            cleaning: progress.cleaning,
+            stats: progress.stats,
+            foreground_scan: progress.foreground_scan,
+            error: progress.error,
             kept_paths: store.kept()?,
+        };
+        Ok(SnapshotUpdate {
+            revision,
+            content_revision,
+            changed: true,
+            snapshot: Some(snapshot),
+            progress: None,
         })
     }
     pub fn request(self: &Arc<Self>, request: Value) -> Result<Value> {
@@ -394,6 +495,64 @@ impl Engine {
             .ok_or("Missing action")?;
         match action {
             "snapshot" => serde_json::to_value(self.snapshot()?).map_err(store::err),
+            "snapshot_if_changed" => serde_json::to_value(
+                self.snapshot_update(
+                    request.get("after_revision").and_then(Value::as_str),
+                    request
+                        .get("after_content_revision")
+                        .and_then(Value::as_str),
+                )?,
+            )
+            .map_err(store::err),
+            "storage_usage" => {
+                serde_json::to_value(self.store.lock().map_err(store::err)?.derived_usage()?)
+                    .map_err(store::err)
+            }
+            "maintain_storage" => {
+                serde_json::to_value(self.maintain_idle_storage(true)?.ok_or(
+                    "Storage maintenance waits for discovery and file operations to finish.",
+                )?)
+                .map_err(store::err)
+            }
+            "managed_review" => {
+                if request.get("confirmed_read_only").and_then(Value::as_bool) != Some(true) {
+                    return Err("Confirm the installed tool's read-only review first.".into());
+                }
+                let provider = request
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .ok_or("Choose an installed cache provider")?;
+                let request_id = managed_request_id(&request)?;
+                let cancel = Arc::new(AtomicBool::new(false));
+                {
+                    let mut state = self.managed_review.lock().map_err(store::err)?;
+                    if state.active.is_some() {
+                        return Err("An installed-tool review is already running.".into());
+                    }
+                    if state.cancelled.as_deref() == Some(request_id) {
+                        return Err("The installed-tool review was cancelled.".into());
+                    }
+                    state.active = Some((request_id.to_owned(), Arc::clone(&cancel)));
+                }
+                let _review = ManagedReviewGuard(&self.managed_review);
+                // No runtime, index, cleanup, or reward lock is held while a
+                // bounded, write-restricted owner tool produces its evidence.
+                serde_json::to_value(managed_providers::review_installed(provider, &cancel)?)
+                    .map_err(store::err)
+            }
+            "cancel_managed_review" => {
+                let request_id = managed_request_id(&request)?;
+                let mut state = self.managed_review.lock().map_err(store::err)?;
+                if let Some((id, cancel)) = &state.active
+                    && id == request_id
+                {
+                    cancel.store(true, Ordering::Release);
+                }
+                // At most one native request can be queued. Remember its
+                // early cancellation without an unbounded tombstone set.
+                state.cancelled = Some(request_id.to_owned());
+                Ok(json!({"cancelled":true}))
+            }
             "set_interactive" => {
                 let active = request
                     .get("active")
@@ -953,6 +1112,21 @@ impl Engine {
                         .and_then(|r| serde_json::to_value(r).map_err(store::err))
                 })()
             }
+            "reconcile_events" => {
+                let cursor = request
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .ok_or("Event reconciliation requires a cursor")?;
+                self.invalidate_duplicates(None, None);
+                {
+                    let mut runtime = self.runtime.lock().map_err(store::err)?;
+                    let mut store = self.store.lock().map_err(store::err)?;
+                    store.reconcile_events(cursor)?;
+                    runtime.recent_files.clear();
+                }
+                self.launch_scan(ScanLaunch::Background)?;
+                Ok(json!({"cursor": cursor}))
+            }
             "cursor" => {
                 let s = self.store.lock().map_err(store::err)?;
                 if let Some(value) = request.get("value").and_then(Value::as_u64) {
@@ -1281,6 +1455,10 @@ impl Engine {
             self.busy.store(true, Ordering::Release);
             self.mutation_cancel.store(false, Ordering::Release);
             self.pause_requested.store(true, Ordering::Release);
+            // No observation from a preceding read epoch may be published
+            // after this mutation admission, even if a killed helper reports
+            // late output. The coordinator acknowledges the fence, not reap.
+            self.read_epoch.fetch_add(1, Ordering::AcqRel);
         }
         self.invalidate_duplicates(None, None);
         let guard = MutationGuard(Arc::clone(self));
@@ -1394,6 +1572,50 @@ impl Engine {
         self.pause_changed.notify_all();
     }
 
+    /// One bounded derived-index slice and a non-waiting WAL checkpoint. The
+    /// durable cleanup, recovery and reward ledgers are never quota-evicted.
+    /// Try-locking avoids queuing maintenance behind foreground work; retaining
+    /// the admission/review locks keeps a newly prepared review protected too.
+    fn maintain_idle_storage(&self, truncate: bool) -> Result<Option<store::DerivedUsage>> {
+        let Ok(_runtime) = self.runtime.try_lock() else {
+            return Ok(None);
+        };
+        if self.busy.load(Ordering::Acquire)
+            || self.scanning.load(Ordering::Acquire)
+            || self.cleaning.load(Ordering::Acquire)
+            || self.checking_duplicates.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let Ok(reviews) = self.reviews.try_lock() else {
+            return Ok(None);
+        };
+        let protected: Vec<String> = reviews
+            .values()
+            .flat_map(|review| {
+                review.items.iter().map(|(_, item)| item.id.clone()).chain(
+                    review
+                        .duplicate_keeper
+                        .iter()
+                        .map(|keeper| keeper.candidate.id.clone()),
+                )
+            })
+            .collect();
+        let Ok(mut store) = self.store.try_lock() else {
+            return Ok(None);
+        };
+        let usage = store.maintain_derived(&protected)?;
+        // TRUNCATE uses a zero busy timeout. Busy readers leave the WAL intact;
+        // they are not waited for or evicted to satisfy a physical-size claim.
+        Ok(Some(if truncate || usage.wal_bytes > 4 * 1024 * 1024 {
+            store.truncate_wal()?
+        } else {
+            // Reuse a small WAL instead of creating/truncating it after every
+            // ordinary event burst. The size threshold is a hint, not a cap.
+            store.passive_checkpoint()?
+        }))
+    }
+
     /// Cancellation pauses event refreshes until an explicit Scan or Resume.
     /// Pending scopes stay in SQLite, independently of the event receipt cursor.
     pub fn cancel_scan(&self) {
@@ -1448,7 +1670,13 @@ impl Engine {
         }
         {
             let store = self.store.lock().map_err(store::err)?;
-            if runtime.foreground.is_none() {
+            let retry_terminal = launch == ScanLaunch::Explicit
+                && !self.scanning.load(Ordering::Acquire)
+                && runtime
+                    .foreground
+                    .as_ref()
+                    .is_some_and(|scan| !scan.snapshot.active);
+            if runtime.foreground.is_none() || retry_terminal {
                 let mut pending = store
                     .conn
                     .prepare_cached(
@@ -1471,7 +1699,8 @@ impl Engine {
                     }
                 }
                 // Startup recovery/rule refresh may be launched by the watcher
-                // before Resume. Capture only already-pending full roots, once;
+                // before Resume. Capture only already-pending full roots;
+                // explicit Resume can replace an idle terminal result, but
                 // incremental work never creates or replaces a foreground scan.
                 if !roots.is_empty() {
                     runtime.foreground_generation = runtime.foreground_generation.wrapping_add(1);
@@ -1480,6 +1709,11 @@ impl Engine {
                         &roots,
                         store.foreground_context()?,
                     ));
+                    if !self.scanning.load(Ordering::Acquire) {
+                        // This is a new finite pass, not a continuation of the
+                        // previous failure's counts, cancellation or errors.
+                        runtime.stats = ScanStats::default();
+                    }
                     // A full-root recovery can arrive while an incremental
                     // worker is already waiting. Promotion must wake that
                     // worker as well as bypassing a newly spawned wait.
@@ -1542,6 +1776,15 @@ impl Engine {
                 if let Some(error) = failure {
                     engine.fail_worker(error);
                 }
+                // Maintenance is opportunistic. Failure must not change a
+                // completed traversal into a rescan or repeat filesystem work.
+                if let Err(error) = engine.maintain_idle_storage(false)
+                    && let Ok(mut runtime) = engine.runtime.lock()
+                {
+                    runtime.error.get_or_insert_with(|| {
+                        format!("Could not finish local storage maintenance: {error}")
+                    });
+                }
             });
         if let Err(error) = worker {
             let error = error.to_string();
@@ -1555,6 +1798,21 @@ impl Engine {
         // Runtime is presentation state. Even a panic while updating it must
         // publish a terminal failure; durable discovery remains in SQLite.
         let mut runtime = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let mut error = error;
+        // The coordinator has returned (or unwound), so every helper receiver
+        // is gone and can no longer publish. Recover *all* durable claims in
+        // one transaction, including a claim whose initialization failed and
+        // siblings not reached after another scope's database error. If the
+        // database is still unavailable, retry at the next worker admission;
+        // never require an application restart to make progress again.
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        match store.recover_discovery() {
+            Ok(()) => self.store.clear_poison(),
+            Err(recovery) => {
+                error.push_str(&format!(" Replay remains journaled: {recovery}"));
+            }
+        }
+        drop(store);
         runtime.error = Some(error.clone());
         runtime.stats.complete = false;
         runtime.stats.errors = runtime.stats.errors.saturating_add(1);
@@ -1600,6 +1858,29 @@ impl Engine {
     }
 
     fn run_discovery(&self) -> Result<()> {
+        // Exactly one discovery coordinator owns this boundary. A preceding
+        // error may have been unable to requeue its claims while SQLite was
+        // unavailable. Retry before admitting any new publication authority.
+        {
+            let _runtime = self.runtime.lock().map_err(store::err)?;
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            store.recover_discovery()?;
+            self.store.clear_poison();
+        }
+        #[cfg(test)]
+        {
+            let helper = self.scan_helper_fixture.lock().map_err(store::err)?.clone();
+            if let Some(helper) = helper {
+                return self.run_discovery_isolated(&helper);
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let helper = scan_worker::bundled_helper()
+                .ok_or("The trusted scan helper is unavailable; discovery stopped incomplete.")?;
+            self.run_discovery_isolated(&helper)
+        }
+        #[cfg(test)]
         loop {
             self.scan_checkpoint();
             let job = {
@@ -1660,6 +1941,432 @@ impl Engine {
         }
     }
 
+    fn begin_isolated_scope(&self, helper: &Path) -> Result<Option<IsolatedScope>> {
+        let mut runtime = self.runtime.lock().map_err(store::err)?;
+        if self.cancel.load(Ordering::Acquire) || self.pause_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut store = self.store.lock().map_err(store::err)?;
+        let Some((id, claimed)) = store.take_scope_bounded(scan_worker::ACTIVE_SCANS)? else {
+            return Ok(None);
+        };
+        let root = store.root(&id)?;
+        let indexed = store.enclosing_candidate(&root, &claimed)?;
+        let enclosing_parent = claimed
+            .parent()
+            .map(|parent| store.enclosing_candidate(&root, parent))
+            .transpose()?
+            .flatten();
+        let hints = (runtime.scan_mode == scanner::ScanMode::Suggestions)
+            .then(|| runtime.recent_files.snapshot());
+        let request = scan_worker::ScanRequest {
+            root: root.clone(),
+            requested: claimed.clone(),
+            indexed,
+            enclosing_parent,
+            kept: store
+                .kept()?
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| path_overlap(path, &root.path))
+                .collect(),
+            metadata_coverage: runtime.scan_mode == scanner::ScanMode::MetadataCoverage,
+            recent_files: hints.as_ref().map(|(_, hints)| hints.clone()),
+        };
+        // This resolver is deliberately lexical. All directory/metadata and
+        // ownership probes run in the child, never under the admission lock.
+        let (resolved, cargo_lock) = scan_worker::resolve_request(&request)?;
+        let scope = (resolved != root.path).then_some(resolved.as_path());
+        let ticket = runtime
+            .foreground
+            .as_mut()
+            .and_then(|scan| scan.claim(&id, &resolved));
+        let refresh = if cargo_lock {
+            store.begin_cargo_lock_refresh(&root, &claimed)?
+        } else {
+            store.begin_scope_refresh(&root, &claimed, scope)?
+        };
+        let handle = match scan_worker::start(helper, request) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let stats = ScanStats {
+                    errors: 1,
+                    message: error.clone(),
+                    ..Default::default()
+                };
+                store.finish_scope_refresh(&refresh, &stats, true)?;
+                if let (Some(scan), Some(ticket)) = (&mut runtime.foreground, &ticket) {
+                    scan.finish(ticket, Ok(&stats));
+                }
+                return Err(error);
+            }
+        };
+        Ok(Some(IsolatedScope {
+            root,
+            resolved,
+            cargo_lock,
+            ticket,
+            refresh,
+            handle,
+            stats: ScanStats::default(),
+            hints_revision: hints.map(|(revision, _)| revision),
+            epoch: self.read_epoch.load(Ordering::Acquire),
+            resolved_received: false,
+            started: Instant::now(),
+        }))
+    }
+
+    fn isolated_progress(
+        &self,
+        runtime: &mut Runtime,
+        base: &ScanStats,
+        settled: &ScanStats,
+        active: &[IsolatedScope],
+        started: Instant,
+        first_finding: Option<u64>,
+    ) {
+        let mut total = combine_stats(base, settled);
+        for scope in active {
+            total = combine_stats(&total, &scope.stats);
+        }
+        total.elapsed_ms = base
+            .elapsed_ms
+            .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        total.first_finding_ms = base
+            .first_finding_ms
+            .or(first_finding.map(|ms| base.elapsed_ms.saturating_add(ms)));
+        if !active.is_empty() {
+            total.complete = false;
+        }
+        if total.errors != 0 || total.cancelled {
+            total.complete = false;
+        }
+        runtime.stats = total;
+    }
+
+    /// Retire a read epoch before acknowledging mutation parking. Killing a
+    /// helper and discarding its receiver never waits for a blocked kernel call;
+    /// its fixed supervisor keeps the process slot until it can actually reap.
+    fn retire_isolated_scopes(
+        &self,
+        active: &mut Vec<IsolatedScope>,
+        cancelled: bool,
+    ) -> Result<()> {
+        for scope in active.iter() {
+            scope.handle.abort();
+        }
+        let mut runtime = self.runtime.lock().map_err(store::err)?;
+        let mut store = self.store.lock().map_err(store::err)?;
+        let mut failure = None;
+        for mut scope in active.drain(..) {
+            scope.stats.complete = false;
+            scope.stats.cancelled = cancelled;
+            scope.stats.message = if cancelled {
+                "Scan paused; scope queued for reconciliation."
+            } else {
+                "Read epoch ended for cleanup; scope queued for fresh reconciliation."
+            }
+            .into();
+            if let Err(error) = store.finish_scope_refresh(&scope.refresh, &scope.stats, true) {
+                // Keep retiring siblings even if one acknowledgement fails.
+                // Their handles are already aborted; none may publish again.
+                failure.get_or_insert(error);
+            }
+            if let (Some(scan), Some(ticket)) = (&mut runtime.foreground, &scope.ticket)
+                && scan.accepts(ticket)
+            {
+                if cancelled {
+                    scan.finish(ticket, Ok(&scope.stats));
+                } else {
+                    // The next read gets a fresh start, not the old helper's
+                    // measurements or completion authority. Keep the finite
+                    // foreground request active across an intervening cleanup.
+                    let root = scan.roots.get_mut(&ticket.root_id).unwrap();
+                    root.started_ms = None;
+                    root.stats = ScanStats::default();
+                    scan.rebuild();
+                }
+            }
+        }
+        if let Some(error) = failure {
+            // A persistent error remains in the durable journal. fail_worker
+            // and the next admission also retry this recovery transaction.
+            return match store.recover_discovery() {
+                Ok(()) => Err(error),
+                Err(recovery) => Err(format!("{error}; replay remains journaled: {recovery}")),
+            };
+        }
+        Ok(())
+    }
+
+    fn run_discovery_isolated(&self, helper: &Path) -> Result<()> {
+        let base = self.runtime.lock().map_err(store::err)?.stats.clone();
+        let started = Instant::now();
+        let mut first_finding = None;
+        let mut settled = ScanStats::default();
+        // A helper failure is durable work, not a reason to immediately launch
+        // the same failing helper again. Finish already-admitted siblings, then
+        // leave the failed scope queued for an explicit Resume/retry.
+        let mut stop_admissions = None::<String>;
+        let mut active = Vec::<IsolatedScope>::with_capacity(scan_worker::ACTIVE_SCANS);
+        loop {
+            if self.cancel.load(Ordering::Acquire) {
+                self.retire_isolated_scopes(&mut active, true)?;
+                let mut runtime = self.runtime.lock().map_err(store::err)?;
+                if runtime.resume_cancelled_worker && !self.scan_paused.load(Ordering::Acquire) {
+                    runtime.resume_cancelled_worker = false;
+                    self.cancel.store(false, Ordering::Release);
+                } else {
+                    runtime.stats.cancelled = true;
+                    runtime.stats.complete = false;
+                    if let Some(scan) = &mut runtime.foreground {
+                        scan.stop(true, "Scan paused; completed findings are ready to review.");
+                    }
+                    self.persist_foreground_summary(&mut runtime);
+                    self.finish_worker();
+                    return Ok(());
+                }
+            }
+            if self.pause_requested.load(Ordering::Acquire)
+                || active
+                    .iter()
+                    .any(|scope| scope.epoch != self.read_epoch.load(Ordering::Acquire))
+            {
+                self.retire_isolated_scopes(&mut active, false)?;
+                self.scan_checkpoint();
+                continue;
+            }
+            while active.len() < scan_worker::ACTIVE_SCANS && stop_admissions.is_none() {
+                match self.begin_isolated_scope(helper) {
+                    Ok(Some(scope)) => active.push(scope),
+                    Ok(None) => break,
+                    Err(error) => {
+                        stop_admissions = Some(error);
+                        break;
+                    }
+                }
+            }
+            if active.is_empty() {
+                // Admission and the terminal transition share runtime with
+                // event receipt; a new durable event cannot miss its worker.
+                let mut runtime = self.runtime.lock().map_err(store::err)?;
+                if self.cancel.load(Ordering::Acquire)
+                    || self.pause_requested.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                {
+                    let mut store = self.store.lock().map_err(store::err)?;
+                    if let Some(reason) = stop_admissions.take() {
+                        // begin_isolated_scope can fail after claiming a scope
+                        // but before it has a receiver. Recover that claim and
+                        // any refresh marker in the same durable boundary.
+                        store.recover_discovery()?;
+                        drop(store);
+                        runtime.error = Some(reason.clone());
+                        runtime.stats.complete = false;
+                        runtime.stats.errors = runtime.stats.errors.max(1);
+                        runtime.stats.message = format!(
+                            "Scan stopped after a read-only helper failure; pending scopes remain for Resume: {reason}"
+                        );
+                        let message = runtime.stats.message.clone();
+                        if let Some(scan) = &mut runtime.foreground {
+                            scan.stop(false, &message);
+                            // All already-admitted siblings may have reached
+                            // their terminal state before the failure barrier;
+                            // preserve the actionable Resume message anyway.
+                            scan.snapshot.stats.message = message;
+                        }
+                        self.persist_foreground_summary(&mut runtime);
+                        self.finish_worker();
+                        return Ok(());
+                    }
+                    if store.has_active_scopes()? {
+                        return Err("Discovery has an abandoned durable scope claim.".into());
+                    }
+                    if store.has_pending_scopes()? {
+                        // Receipt can enqueue work after the last empty claim
+                        // attempt and before this runtime lock. It needs a new
+                        // admission pass, not a false terminal failure.
+                        continue;
+                    }
+                }
+                self.isolated_progress(
+                    &mut runtime,
+                    &base,
+                    &settled,
+                    &active,
+                    started,
+                    first_finding,
+                );
+                if let Some(scan) = &mut runtime.foreground {
+                    scan.stop(
+                        false,
+                        "Scan stopped before every requested folder was checked.",
+                    );
+                }
+                self.persist_foreground_summary(&mut runtime);
+                self.finish_worker();
+                return Ok(());
+            }
+            let mut progressed = false;
+            let mut index = 0;
+            while index < active.len() {
+                let event = match active[index].handle.try_recv() {
+                    Ok(None) => {
+                        index += 1;
+                        continue;
+                    }
+                    Ok(Some(event)) => event,
+                    Err(error) => scan_worker::ScanEvent::Failed(error),
+                };
+                progressed = true;
+                let mut runtime = self.runtime.lock().map_err(store::err)?;
+                // This lock is the publication linearization point shared by
+                // mutation admission. Late output from an obsolete read epoch
+                // is never written to the index or presented as completed.
+                if self.cancel.load(Ordering::Acquire)
+                    || self.pause_requested.load(Ordering::Acquire)
+                    || active[index].epoch != self.read_epoch.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                let scope = &mut active[index];
+                let mut terminal = false;
+                let mut finished_hints = None;
+                let mut error = None;
+                match event {
+                    scan_worker::ScanEvent::Resolved { path, cargo_lock }
+                        if !scope.resolved_received
+                            && path == scope.resolved
+                            && cargo_lock == scope.cargo_lock =>
+                    {
+                        scope.resolved_received = true;
+                    }
+                    scan_worker::ScanEvent::Batch(mut batch) if scope.resolved_received => {
+                        if batch.candidates.len() > 512
+                            || batch.candidates.iter().any(|candidate| {
+                                candidate.root_id != scope.root.id
+                                    || !candidate_in_read_scope(
+                                        &scope.root,
+                                        &scope.resolved,
+                                        scope.cargo_lock,
+                                        &candidate.path,
+                                    )
+                            })
+                        {
+                            error = Some(
+                                "The scan helper returned a candidate outside its granted scope."
+                                    .into(),
+                            );
+                            terminal = true;
+                        } else {
+                            if batch.candidates.iter().any(|candidate| {
+                                candidate.suggestion_eligible
+                                    && !candidate.provisional
+                                    && candidate.blocked_reason.is_none()
+                            }) {
+                                first_finding.get_or_insert_with(|| {
+                                    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+                                });
+                                batch.stats.first_finding_ms = scope.stats.first_finding_ms.or(
+                                    Some(scope.started.elapsed().as_millis().min(u64::MAX as u128)
+                                        as u64),
+                                );
+                            }
+                            batch.stats.first_finding_ms = scope
+                                .stats
+                                .first_finding_ms
+                                .or(batch.stats.first_finding_ms);
+                            self.store.lock().map_err(store::err)?.save_batch(&batch)?;
+                            scope.stats = batch.stats;
+                            if let (Some(scan), Some(ticket)) =
+                                (&mut runtime.foreground, &scope.ticket)
+                            {
+                                scan.progress(ticket, &scope.stats);
+                            }
+                        }
+                    }
+                    scan_worker::ScanEvent::Finished {
+                        mut stats,
+                        recent_files,
+                    } if scope.resolved_received => {
+                        stats.first_finding_ms =
+                            scope.stats.first_finding_ms.or(stats.first_finding_ms);
+                        scope.stats = stats;
+                        finished_hints = recent_files;
+                        terminal = true;
+                    }
+                    scan_worker::ScanEvent::Failed(reason) => {
+                        error = Some(reason);
+                        terminal = true;
+                    }
+                    _ => {
+                        error = Some("The scan helper returned an invalid event sequence.".into());
+                        terminal = true;
+                    }
+                }
+                if terminal {
+                    let mut scope = active.remove(index);
+                    let failed = error.is_some();
+                    if let Some(error) = error {
+                        scope.handle.abort();
+                        scope.stats.complete = false;
+                        scope.stats.errors = scope.stats.errors.saturating_add(1);
+                        scope.stats.message = format!("Could not complete this scope: {error}");
+                        runtime.error = Some(error.clone());
+                        stop_admissions.get_or_insert(error);
+                    }
+                    let mut store = self.store.lock().map_err(store::err)?;
+                    // Failed helper/protocol output must remain replayable. A
+                    // successful partial Finished is still acknowledged normally.
+                    store.finish_scope_refresh(&scope.refresh, &scope.stats, failed)?;
+                    store.apply_root_coverage(&scope.root.id, &mut scope.stats)?;
+                    drop(store);
+                    if scope.stats.complete
+                        && scope.stats.errors == 0
+                        && !scope.stats.cancelled
+                        && let (Some(revision), Some(hints)) =
+                            (scope.hints_revision, finished_hints)
+                    {
+                        runtime.recent_files.replace_if_unchanged(revision, hints);
+                    }
+                    if let (Some(scan), Some(ticket)) = (&mut runtime.foreground, &scope.ticket) {
+                        scan.finish(ticket, Ok(&scope.stats));
+                    }
+                    settled = combine_stats(&settled, &scope.stats);
+                    if stop_admissions.is_none() {
+                        self.persist_foreground_summary(&mut runtime);
+                    }
+                } else {
+                    index += 1;
+                }
+                self.isolated_progress(
+                    &mut runtime,
+                    &base,
+                    &settled,
+                    &active,
+                    started,
+                    first_finding,
+                );
+            }
+            if !progressed {
+                // No per-root waiter threads. One coordinator checks bounded
+                // mailboxes, with the same condition used by cancel/mutation.
+                let parked = self.parked.lock().map_err(store::err)?;
+                if !self.cancel.load(Ordering::Acquire)
+                    && !self.pause_requested.load(Ordering::Acquire)
+                {
+                    let _ = self
+                        .pause_changed
+                        .wait_timeout(parked, Duration::from_millis(5))
+                        .map_err(store::err)?;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn scan_root(
         &self,
         id: &str,
@@ -1811,7 +2518,7 @@ impl Engine {
             // its claim/generation for recovery instead of pruning old findings.
             return Err(error);
         }
-        let (stats, error) = match result {
+        let (mut stats, error) = match result {
             Ok(stats) => (stats, None),
             Err(error) => {
                 latest.complete = false;
@@ -1826,6 +2533,7 @@ impl Engine {
         {
             let mut store = self.store.lock().map_err(store::err)?;
             store.finish_scope_refresh(&refresh, &stats, self.cancel.load(Ordering::Acquire))?;
+            store.apply_root_coverage(id, &mut stats)?;
         }
         let mut runtime = self.runtime.lock().map_err(store::err)?;
         runtime.stats = combine_stats(&base, &stats);
@@ -1838,6 +2546,38 @@ impl Engine {
             runtime.recent_files.replace_if_unchanged(revision, hints);
         }
         Ok(ScopeOutcome { stats, error })
+    }
+}
+
+#[derive(Default)]
+struct ManagedReviewState {
+    active: Option<(String, Arc<AtomicBool>)>,
+    cancelled: Option<String>,
+}
+
+fn managed_request_id(request: &Value) -> Result<&str> {
+    let id = request
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or("The owner review requires a request identifier")?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("The owner review request identifier is invalid".into());
+    }
+    Ok(id)
+}
+
+struct ManagedReviewGuard<'a>(&'a Mutex<ManagedReviewState>);
+impl Drop for ManagedReviewGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active = None;
     }
 }
 
@@ -1946,9 +2686,9 @@ fn success_envelope(data: Value) -> Value {
 }
 
 #[derive(serde::Serialize)]
-struct SnapshotEnvelope {
+struct SnapshotEnvelope<T> {
     ok: bool,
-    data: Snapshot,
+    data: T,
 }
 
 /// Executes a JSON command; the caller owns the returned UTF-8 response.
@@ -1978,6 +2718,17 @@ pub unsafe extern "C" fn ct_request(
             serde_json::to_string(&SnapshotEnvelope {
                 ok: true,
                 data: engine.snapshot()?,
+            })
+            .map_err(store::err)
+        } else if request.get("action").and_then(Value::as_str) == Some("snapshot_if_changed") {
+            serde_json::to_string(&SnapshotEnvelope {
+                ok: true,
+                data: engine.snapshot_update(
+                    request.get("after_revision").and_then(Value::as_str),
+                    request
+                        .get("after_content_revision")
+                        .and_then(Value::as_str),
+                )?,
             })
             .map_err(store::err)
         } else {
@@ -2039,6 +2790,54 @@ mod controller_tests {
     };
 
     #[test]
+    fn isolated_results_cannot_escape_the_exact_read_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = safety::authorize(&fs::canonicalize(temp.path()).unwrap(), "folder").unwrap();
+        let scope = root.path.join("project-a");
+        assert!(candidate_in_read_scope(
+            &root,
+            &scope,
+            false,
+            &scope.join("target")
+        ));
+        assert!(!candidate_in_read_scope(
+            &root,
+            &scope,
+            false,
+            &root.path.join("project-b/target")
+        ));
+        assert!(!candidate_in_read_scope(
+            &root,
+            &scope,
+            false,
+            &scope.join("../project-b/target")
+        ));
+        assert!(!candidate_in_read_scope(
+            &root, &root.path, false, &root.path
+        ));
+        let lock = scope.join("Cargo.lock");
+        assert!(candidate_in_read_scope(&root, &lock, true, &lock));
+        assert!(candidate_in_read_scope(
+            &root,
+            &lock,
+            true,
+            &scope.join("target")
+        ));
+        assert!(!candidate_in_read_scope(
+            &root,
+            &lock,
+            true,
+            &scope.join("target/unexpected-child")
+        ));
+        assert!(!candidate_in_read_scope(
+            &root,
+            &lock,
+            true,
+            &root.path.join("project-b/target")
+        ));
+    }
+
+    #[test]
     fn owned_success_envelope_preserves_json_values_and_encoding() {
         for data in [
             Value::Null,
@@ -2074,6 +2873,210 @@ mod controller_tests {
 
     fn ffi_response(engine: *const Arc<Engine>, request: &CStr) -> Value {
         parse_ffi_response(unsafe { ct_request(engine, request.as_ptr()) })
+    }
+
+    #[test]
+    fn conditional_snapshots_separate_progress_and_persistent_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&temp.path().join("library.sqlite"), None).unwrap();
+        let full = engine.snapshot_update(None, None).unwrap();
+        assert!(full.changed && full.snapshot.is_some() && full.progress.is_none());
+        let unchanged = engine
+            .snapshot_update(Some(&full.revision), Some(&full.content_revision))
+            .unwrap();
+        assert!(!unchanged.changed);
+        assert!(unchanged.snapshot.is_none() && unchanged.progress.is_none());
+        {
+            let mut runtime = engine.runtime.lock().unwrap();
+            runtime.stats.entries = 9_007_199_254_740_993;
+            runtime.stats.message = "Disposable progress only".into();
+            runtime.restored_foreground = Some(ForegroundScan {
+                active: true,
+                stats: runtime.stats.clone(),
+            });
+            engine.scanning.store(true, Ordering::Release);
+        }
+        let progress = engine
+            .snapshot_update(Some(&full.revision), Some(&full.content_revision))
+            .unwrap();
+        assert!(progress.changed && progress.snapshot.is_none());
+        assert_eq!(progress.content_revision, full.content_revision);
+        assert_ne!(progress.revision, full.revision);
+        let state = progress.progress.as_ref().unwrap();
+        assert!(state.scanning);
+        assert_eq!(state.stats.entries, 9_007_199_254_740_993);
+        assert!(state.foreground_scan.as_ref().unwrap().active);
+        assert!(serde_json::to_vec(&progress).unwrap().len() < 4096);
+        assert!(
+            engine
+                .snapshot_update(Some(&progress.revision), Some(&progress.content_revision))
+                .is_ok_and(|value| !value.changed)
+        );
+        // A persistent change, even outside the candidate list, requires a full
+        // replacement. No wallet/history/Keep update can hide behind progress.
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .keep("/disposable/kept", true)
+            .unwrap();
+        let changed = engine
+            .snapshot_update(Some(&progress.revision), Some(&progress.content_revision))
+            .unwrap();
+        assert!(changed.changed && changed.progress.is_none());
+        assert_ne!(changed.content_revision, progress.content_revision);
+        assert_eq!(
+            changed.snapshot.unwrap().kept_paths,
+            vec!["/disposable/kept"]
+        );
+        engine.scanning.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn conditional_snapshot_tokens_are_connection_scoped_and_cold_reads_are_full() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("library.sqlite");
+        let engine = Engine::open(&db, None).unwrap();
+        let old = engine.snapshot_update(None, None).unwrap();
+        for (revision, content) in [
+            (None, None),
+            (Some(old.revision.as_str()), None),
+            (Some("stale"), Some("stale")),
+        ] {
+            let response = engine.snapshot_update(revision, content).unwrap();
+            assert!(response.changed && response.snapshot.is_some());
+            assert!(response.progress.is_none());
+        }
+        drop(engine);
+        let reopened = Engine::open(&db, None).unwrap();
+        let response = reopened
+            .snapshot_update(Some(&old.revision), Some(&old.content_revision))
+            .unwrap();
+        assert!(response.changed && response.snapshot.is_some());
+        assert_ne!(response.content_revision, old.content_revision);
+    }
+
+    #[test]
+    fn conditional_snapshot_ffi_returns_typed_full_unchanged_and_progress_envelopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = CString::new(temp.path().join("library.sqlite").to_str().unwrap()).unwrap();
+        let handle = FfiHandle(unsafe { ct_open(path.as_ptr(), None) });
+        assert!(!handle.0.is_null());
+        let full = ffi_response(handle.0, c"{\"action\":\"snapshot_if_changed\"}");
+        assert_eq!(full["ok"], true);
+        assert!(full["data"].get("snapshot").is_some());
+        assert!(full["data"].get("progress").is_none());
+        let request = CString::new(
+            json!({
+                "action":"snapshot_if_changed",
+                "after_revision": full["data"]["revision"],
+                "after_content_revision": full["data"]["content_revision"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let unchanged = ffi_response(handle.0, &request);
+        assert_eq!(unchanged["data"]["changed"], false);
+        assert!(unchanged["data"].get("snapshot").is_none());
+        assert!(unchanged["data"].get("progress").is_none());
+        let engine = unsafe { &*handle.0 };
+        engine.runtime.lock().unwrap().error = Some("Disposable error".into());
+        let progress = ffi_response(handle.0, &request);
+        assert_eq!(progress["data"]["changed"], true);
+        assert!(progress["data"].get("snapshot").is_none());
+        assert_eq!(progress["data"]["progress"]["error"], "Disposable error");
+        assert_eq!(
+            progress["data"],
+            engine
+                .request(serde_json::from_slice(request.to_bytes()).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn lost_event_reconciliation_persists_lower_cursor_and_all_roots_across_restart() {
+        let (temp, engine, roots) = foreground_fixture(2);
+        engine.scan_paused.store(true, Ordering::Release);
+        engine
+            .request(json!({"action":"cursor","value":1000}))
+            .unwrap();
+        assert_eq!(
+            engine
+                .request(json!({"action":"reconcile_events","value":7}))
+                .unwrap()["cursor"],
+            7
+        );
+        assert_eq!(
+            engine
+                .request(json!({"action":"cursor","value":8}))
+                .unwrap()["cursor"],
+            8
+        );
+        drop(engine);
+        let restarted = Engine::open(&temp.path().join("library.sqlite"), None).unwrap();
+        assert_eq!(
+            restarted.request(json!({"action":"cursor"})).unwrap()["cursor"],
+            8
+        );
+        let store = restarted.store.lock().unwrap();
+        for root in roots {
+            assert!(store.incomplete(&root.id).unwrap());
+            let pending: bool = store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_scopes WHERE root_id=?1 AND path=?2)",
+                    rusqlite::params![root.id, root.path.to_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                pending,
+                "Every root must be journaled before the lower cursor is acknowledged"
+            );
+        }
+    }
+
+    #[test]
+    fn lost_event_reconciliation_never_acknowledges_partial_database_failure() {
+        let (_temp, engine, _roots) = foreground_fixture(2);
+        engine.scan_paused.store(true, Ordering::Release);
+        engine
+            .request(json!({"action":"cursor","value":1000}))
+            .unwrap();
+        let pending_before: u64 = engine
+            .store
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT count(*) FROM pending_scopes", [], |row| row.get(0))
+            .unwrap();
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_event_reset BEFORE UPDATE ON event_cursor
+             BEGIN SELECT RAISE(ABORT,'disposable cursor failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            engine
+                .request(json!({"action":"reconcile_events","value":7}))
+                .is_err()
+        );
+        assert_eq!(
+            engine.request(json!({"action":"cursor"})).unwrap()["cursor"],
+            1000
+        );
+        let pending_after: u64 = engine
+            .store
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT count(*) FROM pending_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending_after, pending_before);
     }
 
     #[test]
@@ -2874,6 +3877,488 @@ mod controller_tests {
             })
             .collect();
         (temp, engine, roots)
+    }
+
+    // These coordinator tests exercise the real process-wide admission pool.
+    // Independent unit-test engines must not compete for its production quota.
+    static ISOLATED_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn isolated_helper_fixture(directory: &Path, roots: &[Root], stalled: usize) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = directory.join("disposable-scan-helper");
+        let mut script = String::from("#!/bin/sh\ninput=$(/bin/cat)\ncase \"$input\" in\n");
+        for (index, root) in roots.iter().enumerate() {
+            // Root IDs are generated identifiers, not user-supplied shell text.
+            assert!(
+                root.id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            );
+            let mut frames = scan_worker::encode_json_frame(&scan_worker::ScanEvent::Resolved {
+                path: root.path.clone(),
+                cargo_lock: false,
+            })
+            .unwrap();
+            frames.extend(
+                scan_worker::encode_json_frame(&scan_worker::ScanEvent::Finished {
+                    stats: ScanStats {
+                        entries: 7,
+                        complete: true,
+                        message: "Fixture scope complete".into(),
+                        ..Default::default()
+                    },
+                    recent_files: None,
+                })
+                .unwrap(),
+            );
+            let escaped = frames
+                .iter()
+                .map(|byte| format!("\\{byte:03o}"))
+                .collect::<String>();
+            script.push_str(&format!("*'\"id\":\"{}\"'*)\n", root.id));
+            if index == stalled {
+                script.push_str("/bin/sleep 4\n");
+            }
+            script.push_str(&format!("printf '{escaped}'\n;;\n"));
+        }
+        script.push_str("*) exit 9;;\nesac\n");
+        fs::write(&helper, script).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        helper
+    }
+
+    fn isolated_failure_helper_fixture(
+        directory: &Path,
+        failed: &Root,
+        sibling: &Root,
+        malformed: bool,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = directory.join(if malformed {
+            "disposable-malformed-scan-helper"
+        } else {
+            "disposable-failed-scan-helper"
+        });
+        assert!(
+            failed
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
+        let mut outputs = Vec::new();
+        let mut failed_output = scan_worker::encode_json_frame(&scan_worker::ScanEvent::Resolved {
+            path: failed.path.clone(),
+            cargo_lock: false,
+        })
+        .unwrap();
+        if malformed {
+            failed_output.extend_from_slice(&[0, 0, 0, 3, b'n', b'o', b'p']);
+        } else {
+            failed_output.extend(
+                scan_worker::encode_json_frame(&scan_worker::ScanEvent::Failed(
+                    "disposable helper failure".into(),
+                ))
+                .unwrap(),
+            );
+        }
+        outputs.push((failed, failed_output));
+        let mut sibling_output =
+            scan_worker::encode_json_frame(&scan_worker::ScanEvent::Resolved {
+                path: sibling.path.clone(),
+                cargo_lock: false,
+            })
+            .unwrap();
+        sibling_output.extend(
+            scan_worker::encode_json_frame(&scan_worker::ScanEvent::Finished {
+                stats: ScanStats {
+                    entries: 7,
+                    complete: true,
+                    ..Default::default()
+                },
+                recent_files: None,
+            })
+            .unwrap(),
+        );
+        outputs.push((sibling, sibling_output));
+        let mut cases = String::new();
+        for (root, output) in outputs {
+            let escaped = output
+                .iter()
+                .map(|byte| format!("\\{byte:03o}"))
+                .collect::<String>();
+            let wait = if root.id == sibling.id {
+                let gate = directory.join("release-sibling");
+                format!(
+                    "attempt=0\nwhile [ ! -f '{}' ]; do\nattempt=$((attempt + 1))\n[ \"$attempt\" -lt 250 ] || exit 10\n/bin/sleep 0.01\ndone\n",
+                    gate.to_str().unwrap().replace('\'', "'\\''")
+                )
+            } else {
+                String::new()
+            };
+            cases.push_str(&format!(
+                "*'\"id\":\"{}\"'*)\n{wait}printf '{escaped}';;\n",
+                root.id
+            ));
+        }
+        let script =
+            format!("#!/bin/sh\ninput=$(/bin/cat)\ncase \"$input\" in\n{cases}*) exit 9;;\nesac\n");
+        fs::write(&helper, script).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        helper
+    }
+
+    #[test]
+    fn isolated_helper_failure_requeues_without_retry_storm_and_survives_resume() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for malformed in [false, true] {
+            let (temp, engine, roots) = foreground_fixture(3);
+            let helper =
+                isolated_failure_helper_fixture(temp.path(), &roots[0], &roots[1], malformed);
+            *engine.scan_helper_fixture.lock().unwrap() = Some(helper);
+            engine.request(json!({"action":"scan"})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let runtime = engine.runtime.lock().unwrap();
+                let scan = runtime.foreground.as_ref().unwrap();
+                if scan.roots[&roots[0].id].terminal {
+                    assert!(!scan.roots[&roots[1].id].terminal);
+                    assert!(scan.roots[&roots[2].id].started_ms.is_none());
+                    break;
+                }
+                drop(runtime);
+                assert!(Instant::now() < deadline, "Helper failure was not received");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fs::write(temp.path().join("release-sibling"), b"release").unwrap();
+            wait_for_discovery_idle(&engine);
+            let snapshot = engine.snapshot().unwrap();
+            let foreground = snapshot.foreground_scan.unwrap();
+            assert!(!foreground.active);
+            assert!(!snapshot.stats.complete);
+            assert!(snapshot.stats.errors > 0);
+            assert!(
+                foreground
+                    .stats
+                    .message
+                    .contains("pending scopes remain for Resume")
+            );
+            {
+                let store = engine.store.lock().unwrap();
+                assert!(!store.has_active_scopes().unwrap());
+                assert!(
+                    !store
+                        .conn
+                        .query_row::<bool, _, _>(
+                            "SELECT EXISTS(SELECT 1 FROM refreshes)",
+                            [],
+                            |row| row.get(0)
+                        )
+                        .unwrap()
+                );
+                assert!(store.has_pending_scopes().unwrap());
+                let pending: Vec<String> = store
+                    .conn
+                    .prepare("SELECT path FROM pending_scopes ORDER BY path")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<std::result::Result<_, _>>()
+                    .unwrap();
+                assert_eq!(
+                    pending,
+                    vec![
+                        roots[0].path.to_string_lossy().to_string(),
+                        roots[2].path.to_string_lossy().to_string()
+                    ]
+                );
+                assert_eq!(store.latest_stats().unwrap().entries, 7);
+                assert!(
+                    store
+                        .load_foreground_summary()
+                        .unwrap()
+                        .unwrap()
+                        .stats
+                        .message
+                        .contains("pending scopes remain for Resume")
+                );
+                assert!(store.history().unwrap().is_empty());
+                assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+            }
+
+            // The queued failed root survives process restart and a later
+            // explicit Resume completes through a healthy isolated helper.
+            let database = temp.path().join("library.sqlite");
+            drop(engine);
+            let reopened = Engine::open(&database, None).unwrap();
+            assert!(reopened.store.lock().unwrap().has_pending_scopes().unwrap());
+            *reopened.scan_helper_fixture.lock().unwrap() =
+                Some(isolated_helper_fixture(temp.path(), &roots, usize::MAX));
+            reopened.request(json!({"action":"resume"})).unwrap();
+            wait_for_discovery_idle(&reopened);
+            let completed = reopened.snapshot().unwrap();
+            assert!(completed.stats.complete);
+            assert_eq!(completed.stats.errors, 0);
+            assert_eq!(completed.stats.entries, 14);
+            assert!(completed.foreground_scan.unwrap().stats.complete);
+            let store = reopened.store.lock().unwrap();
+            assert!(!store.has_pending_scopes().unwrap());
+            assert!(!store.has_active_scopes().unwrap());
+            assert!(
+                !store
+                    .conn
+                    .query_row::<bool, _, _>(
+                        "SELECT EXISTS(SELECT 1 FROM incomplete_roots)",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_helper_start_failure_preserves_replay_and_persists_resume_summary() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for failure in ["start", "before-refresh", "cancel"] {
+            let before_refresh = failure == "before-refresh";
+            let (temp, engine, roots) = foreground_fixture(1);
+            // A trusted-path rejection is a synchronous start failure after
+            // begin-refresh. The trigger also covers a claim abandoned before
+            // a refresh/receiver exists; neither path may strand the claim.
+            *engine.scan_helper_fixture.lock().unwrap() = Some(if failure == "cancel" {
+                isolated_helper_fixture(temp.path(), &roots, 0)
+            } else {
+                temp.path().join("missing-helper")
+            });
+            if before_refresh {
+                engine.store.lock().unwrap().conn.execute_batch(
+                    "CREATE TEMP TRIGGER fail_isolated_begin BEFORE INSERT ON refreshes BEGIN SELECT RAISE(ABORT,'disposable isolated begin failure'); END;",
+                ).unwrap();
+            }
+            engine.request(json!({"action":"scan"})).unwrap();
+            if failure == "cancel" {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !engine.store.lock().unwrap().has_active_scopes().unwrap() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                engine.cancel_scan();
+            }
+            wait_for_discovery_idle(&engine);
+            {
+                let store = engine.store.lock().unwrap();
+                assert!(!store.has_active_scopes().unwrap());
+                assert!(store.has_pending_scopes().unwrap());
+                let pending: String = store
+                    .conn
+                    .query_row("SELECT path FROM pending_scopes", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(pending, roots[0].path.to_str().unwrap());
+                let summary = store.load_foreground_summary().unwrap().unwrap();
+                assert!(!summary.active);
+                assert!(!summary.stats.complete);
+                if failure == "cancel" {
+                    assert!(summary.stats.cancelled);
+                } else {
+                    assert!(
+                        summary
+                            .stats
+                            .message
+                            .contains("pending scopes remain for Resume")
+                    );
+                }
+                assert!(store.history().unwrap().is_empty());
+                assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+                if before_refresh {
+                    store
+                        .conn
+                        .execute_batch("DROP TRIGGER fail_isolated_begin")
+                        .unwrap();
+                }
+            }
+            *engine.scan_helper_fixture.lock().unwrap() =
+                Some(isolated_helper_fixture(temp.path(), &roots, usize::MAX));
+            let failed_generation = engine.runtime.lock().unwrap().foreground_generation;
+            engine.request(json!({"action":"resume"})).unwrap();
+            assert_ne!(
+                engine.runtime.lock().unwrap().foreground_generation,
+                failed_generation
+            );
+            wait_for_discovery_idle(&engine);
+            let completed = engine.snapshot().unwrap();
+            assert!(completed.stats.complete);
+            assert_eq!(completed.stats.errors, 0);
+            let foreground = completed.foreground_scan.unwrap();
+            assert!(!foreground.active && foreground.stats.complete);
+            assert!(!foreground.stats.cancelled);
+            assert_eq!(foreground.stats.entries, 7);
+            let store = engine.store.lock().unwrap();
+            assert!(!store.has_pending_scopes().unwrap());
+            let saved = store.load_foreground_summary().unwrap().unwrap();
+            assert!(saved.stats.complete);
+            assert_eq!(saved.stats.entries, 7);
+        }
+    }
+
+    #[test]
+    fn isolated_discovery_finishes_an_unrelated_root_while_another_is_stalled() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (temp, engine, roots) = foreground_fixture(2);
+        let helper = isolated_helper_fixture(temp.path(), &roots, 0);
+        *engine.scan_helper_fixture.lock().unwrap() = Some(helper);
+        engine.request(json!({"action":"scan"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let runtime = engine.runtime.lock().unwrap();
+            let scan = runtime.foreground.as_ref().unwrap();
+            if scan.roots[&roots[1].id].terminal {
+                assert!(!scan.roots[&roots[0].id].terminal);
+                assert_eq!(scan.roots[&roots[1].id].stats.entries, 7);
+                assert!(!scan.snapshot.stats.complete);
+                break;
+            }
+            drop(runtime);
+            assert!(
+                Instant::now() < deadline,
+                "A stalled helper hid the unrelated completed root"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.cancel_scan();
+        wait_for_discovery_idle(&engine);
+        let store = engine.store.lock().unwrap();
+        assert!(!store.has_active_scopes().unwrap());
+        assert!(store.has_pending_scopes().unwrap());
+        assert!(store.history().unwrap().is_empty());
+        assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+    }
+
+    #[test]
+    fn isolated_cleanup_parks_without_waiting_for_a_stalled_read_process() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (temp, engine, roots) = foreground_fixture(1);
+        *engine.scan_helper_fixture.lock().unwrap() =
+            Some(isolated_helper_fixture(temp.path(), &roots, 0));
+        engine.request(json!({"action":"scan"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.store.lock().unwrap().has_active_scopes().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old_epoch = engine.read_epoch.load(Ordering::Acquire);
+        let started = Instant::now();
+        let mutation = engine.begin_mutation().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "Mutation waited for a read-only helper"
+        );
+        assert_ne!(engine.read_epoch.load(Ordering::Acquire), old_epoch);
+        {
+            let store = engine.store.lock().unwrap();
+            assert!(!store.has_active_scopes().unwrap());
+            assert!(store.has_pending_scopes().unwrap());
+            assert_eq!(store.latest_stats().unwrap().entries, 0);
+        }
+        engine.cancel_scan();
+        drop(mutation);
+        wait_for_discovery_idle(&engine);
+        assert_eq!(
+            fs::read(roots[0].path.join("child/preserve.txt")).unwrap(),
+            b"disposable source"
+        );
+    }
+
+    #[test]
+    fn isolated_finalization_failure_replays_both_claims_without_restart() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (temp, engine, roots) = foreground_fixture(2);
+        *engine.scan_helper_fixture.lock().unwrap() =
+            Some(isolated_helper_fixture(temp.path(), &roots, 1));
+        engine.store.lock().unwrap().conn.execute_batch(&format!(
+            "CREATE TEMP TRIGGER fail_isolated_finish BEFORE DELETE ON active_scopes WHEN OLD.root_id='{}' BEGIN SELECT RAISE(ABORT,'disposable isolated finish failure'); END;", roots[0].id
+        )).unwrap();
+        engine.request(json!({"action":"scan"})).unwrap();
+        wait_for_discovery_idle(&engine);
+        assert!(
+            engine
+                .snapshot()
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("disposable isolated finish failure")
+        );
+        {
+            let store = engine.store.lock().unwrap();
+            let count: u64 = store
+                .conn
+                .query_row("SELECT count(*) FROM active_scopes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2, "Failed recovery must retain both durable claims");
+            store
+                .conn
+                .execute_batch("DROP TRIGGER fail_isolated_finish")
+                .unwrap();
+        }
+        // A new ordinary request recovers abandoned generations in this engine;
+        // no close/reopen, deletion, or inferred successful scan is involved.
+        *engine.scan_helper_fixture.lock().unwrap() = None;
+        engine
+            .request(json!({"action":"scan", "metadata_coverage":true}))
+            .unwrap();
+        wait_for_discovery_idle(&engine);
+        assert!(
+            engine
+                .snapshot()
+                .unwrap()
+                .foreground_scan
+                .unwrap()
+                .stats
+                .complete
+        );
+        let store = engine.store.lock().unwrap();
+        assert!(!store.has_active_scopes().unwrap());
+        assert!(!store.has_pending_scopes().unwrap());
+        assert!(store.history().unwrap().is_empty());
+        assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+    }
+
+    #[test]
+    fn managed_reviews_require_confirmation_and_cancellation_is_request_scoped() {
+        let (_temp, engine, _) = foreground_fixture(0);
+        assert!(
+            engine
+                .request(
+                    json!({"action":"managed_review", "provider":"homebrew", "request_id":"first"})
+                )
+                .is_err()
+        );
+        engine
+            .request(json!({"action":"cancel_managed_review", "request_id":"first"}))
+            .unwrap();
+        let error = engine.request(json!({"action":"managed_review", "provider":"homebrew", "request_id":"first", "confirmed_read_only":true})).unwrap_err();
+        assert!(error.contains("cancelled"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        engine.managed_review.lock().unwrap().active = Some(("second".into(), Arc::clone(&cancel)));
+        engine
+            .request(json!({"action":"cancel_managed_review", "request_id":"first"}))
+            .unwrap();
+        assert!(!cancel.load(Ordering::Acquire));
+        engine
+            .request(json!({"action":"cancel_managed_review", "request_id":"second"}))
+            .unwrap();
+        assert!(cancel.load(Ordering::Acquire));
+        engine.managed_review.lock().unwrap().active = None;
+        assert_eq!(engine.snapshot().unwrap().wallet.credited_bytes, 0);
     }
 
     fn dirty_scope(engine: &Arc<Engine>, root: &Root, path: &Path) {
@@ -4361,7 +5846,7 @@ mod controller_tests {
     }
 
     #[test]
-    fn discovery_journal_failure_retains_claim_and_ends_foreground_incomplete() {
+    fn discovery_journal_failure_retains_replay_and_can_resume_without_restart() {
         for failure_at in [DiscoveryStage::Claimed, DiscoveryStage::Began] {
             let (_temp, engine, roots) = foreground_fixture(2);
             let root = &roots[0];
@@ -4399,7 +5884,15 @@ mod controller_tests {
                 "SELECT (SELECT count(*) FROM active_scopes),(SELECT count(*) FROM pending_scopes),(SELECT count(*) FROM refreshes)",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).unwrap();
-            assert_eq!((active, pending), (1, 1));
+            assert_eq!(
+                (active, pending),
+                if failure_at == DiscoveryStage::Claimed {
+                    (0, 2)
+                } else {
+                    (1, 1)
+                },
+                "Failed recovery stays journaled; a recoverable start error is requeued immediately"
+            );
             assert_eq!(refreshes, u64::from(failure_at == DiscoveryStage::Began));
             assert_eq!(
                 store.latest_stats().unwrap().entries,
@@ -4412,6 +5905,23 @@ mod controller_tests {
                 fs::read(root.path.join("child/preserve.txt")).unwrap(),
                 b"disposable source"
             );
+            store
+                .conn
+                .execute_batch("DROP TRIGGER fail_journal")
+                .unwrap();
+            drop(store);
+            *engine.discovery_observer.lock().unwrap() = None;
+            engine
+                .request(json!({"action":"scan", "metadata_coverage":true}))
+                .unwrap();
+            wait_for_discovery_idle(&engine);
+            let snapshot = engine.snapshot().unwrap();
+            assert!(snapshot.foreground_scan.unwrap().stats.complete);
+            let store = engine.store.lock().unwrap();
+            assert!(!store.has_active_scopes().unwrap());
+            assert!(!store.has_pending_scopes().unwrap());
+            assert!(store.history().unwrap().is_empty());
+            assert_eq!(store.wallet().unwrap().credited_bytes, 0);
         }
     }
 
