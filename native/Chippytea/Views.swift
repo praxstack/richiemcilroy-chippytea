@@ -834,7 +834,7 @@ private struct ScanEverywhereCTA: View {
             Button("Scan my Mac") { model.scanMyMac() }
                 .buttonStyle(InkButtonStyle(kind: .primary, fullWidth: true, seed: seed))
                 .disabled(changing)
-                .accessibilityHint("Looks through your home folder for recognised build files and large downloads. Nothing is selected or removed automatically.")
+                .accessibilityHint("Looks through your home folder for app caches, old logs, build files and large personal files to review. Nothing is selected or removed automatically.")
             Menu {
                 Button("Projects Folder…") { model.chooseFolder(kind: "projects") }
                 Button("Downloads Folder…") { model.chooseFolder(kind: "downloads") }
@@ -865,19 +865,26 @@ private struct SuggestionRow: View {
         guard let live else { return false }
         return live == candidate && model.snapshot.roots.contains { $0.id == live.rootId }
     }
-    private var mayReview: Bool { model.canEnqueueCleanup && current && live?.blockedReason == nil }
+    private var mayReview: Bool { model.canEnqueueCleanup && current && live?.canReviewCleanup == true }
     private var deletesWithoutConfirmation: Bool { !model.confirmBeforeDeleting && permanentCleanupEligible(candidate) }
 
     var body: some View {
         HStack(spacing: 9) {
             ArtifactIcon(candidate: candidate, size: 26, seed: seed)
-            Text(candidate.title).font(TeaFont.bodySemibold).lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(candidate.displayName).font(TeaFont.bodySemibold).lineLimit(1).truncationMode(.middle)
+                Text(candidate.category).font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft).lineLimit(1)
+                Text(candidate.path).font(TeaFont.mono).foregroundStyle(TeaTheme.inkSoft)
+                    .lineLimit(1).truncationMode(.head).help(candidate.path)
+            }
             Spacer(minLength: 4)
             Text(space(candidate.allocatedBytes)).font(TeaFont.bodyNumber).monospacedDigit().fixedSize()
             Button(deletesWithoutConfirmation ? "Delete" : "Clean up") { if mayReview { model.requestCleanupOne(candidate) } }
                 .buttonStyle(InkButtonStyle(kind: deletesWithoutConfirmation ? .destructive : .quiet, compact: true, seed: seed &+ 3))
                 .disabled(!mayReview)
-                .accessibilityLabel(deletesWithoutConfirmation ? "Delete \(candidate.title) permanently" : "Review cleanup for \(candidate.title)")
+                .accessibilityLabel(deletesWithoutConfirmation
+                    ? "Delete \(candidate.displayName) permanently. Path: \(candidate.path)"
+                    : "Review cleanup for \(candidate.displayName). Path: \(candidate.path)")
                 .accessibilityHint(deletesWithoutConfirmation
                     ? model.hasCleanupWork
                         ? "Queues this developer artifact for permanent deletion after the current cleanup. No further prompt, Trash or restore."
@@ -886,7 +893,7 @@ private struct SuggestionRow: View {
                         ? "Shows the exact item and consequences before you confirm permanent deletion."
                         : "Shows the exact item and consequences before you choose whether to move it to Trash.")
         }
-        .help("\(candidate.category) · \(candidate.project) · \(space(candidate.allocatedBytes)) estimated")
+        .help("\(candidate.displayName) · \(candidate.category)\n\(candidate.path)\n\(space(candidate.allocatedBytes)) estimated")
         .padding(.horizontal, 11).padding(.vertical, 8)
     }
 }
@@ -911,18 +918,10 @@ private struct ArtifactIcon: View {
 
 // MARK: - Find space
 
-private enum DiscoveryFilter: String, CaseIterable {
-    case all = "All", developer = "Developer", downloads = "Downloads"
-}
-
-private enum DiscoverySort: String, CaseIterable {
-    case largest = "Largest first", oldest = "Oldest first", name = "Name"
-}
-
 private struct DiscoveryPage: View {
     @ObservedObject var model: AppModel
     @State private var filter: DiscoveryFilter = .all
-    @State private var sort: DiscoverySort = .largest
+    @State private var sort: DiscoverySort = .suggested
     @State private var search = ""
 
     private var changing: Bool { model.busy || model.snapshot.cleaning || model.scanActivityForUI }
@@ -941,23 +940,16 @@ private struct DiscoveryPage: View {
     }
 
     private var candidates: [Candidate] {
-        model.displayedCandidates.filter { item in
-            let matchesFilter = filter == .all || (filter == .developer ? item.isDeveloper : !item.isDeveloper)
-            return matchesFilter && (search.isEmpty || item.path.localizedCaseInsensitiveContains(search) || item.title.localizedCaseInsensitiveContains(search))
-        }.sorted { lhs, rhs in
-            switch sort {
-            case .largest: return lhs.allocatedBytes == rhs.allocatedBytes ? lhs.path < rhs.path : lhs.allocatedBytes > rhs.allocatedBytes
-            case .oldest: return lhs.modifiedNs == rhs.modifiedNs ? lhs.path < rhs.path : lhs.modifiedNs < rhs.modifiedNs
-            case .name: return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
-            }
-        }
+        sort.ordered(model.displayedCandidates.filter { item in
+            filter.matches(item) && item.matchesSearch(search)
+        })
     }
 
     private var selectedItems: [Candidate] { model.displayedCandidates.filter { model.selection.contains($0.id) } }
     private var selectedBytes: UInt64 { selectedItems.reduce(0) { $0 &+ $1.allocatedBytes } }
     private var selectionIsCurrent: Bool {
         !selectedItems.isEmpty && selectedItems.count == model.selection.count
-            && selectedItems.allSatisfy { $0.blockedReason == nil }
+            && selectedItems.allSatisfy(\.canReviewCleanup)
     }
     private var deletesWithoutConfirmation: Bool {
         !model.confirmBeforeDeleting && !selectedItems.isEmpty && selectedItems.allSatisfy(permanentCleanupEligible)
@@ -1035,22 +1027,11 @@ private struct DiscoveryPage: View {
         VStack(spacing: 7) {
             HStack(spacing: 6) {
                 ForEach(Array(DiscoveryFilter.allCases.enumerated()), id: \.element) { index, item in
-                    Button { filter = item } label: { Text(item.rawValue) }
+                    Button { filter = item } label: { Text(item.rawValue).lineLimit(1).fixedSize() }
                         .buttonStyle(ChipButtonStyle(active: filter == item, seed: 261 + index * 4))
                         .accessibilityAddTraits(filter == item ? [.isSelected] : [])
                 }
                 Spacer(minLength: 0)
-                Menu {
-                    Picker("Sort", selection: $sort) {
-                        ForEach(DiscoverySort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.inline).labelsHidden()
-                } label: {
-                    Image(systemName: "arrow.up.arrow.down").inkMenuChrome(seed: 273)
-                }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                .foregroundStyle(TeaTheme.ink)
-                .help("Sort findings — \(sort.rawValue)").accessibilityLabel("Sort findings")
             }
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass").font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
@@ -1065,6 +1046,17 @@ private struct DiscoveryPage: View {
                 Text(candidateCount.formatted())
                     .font(TeaFont.caption).monospacedDigit().foregroundStyle(TeaTheme.inkSoft)
                     .help("\(candidateCount) findings in this view")
+                Menu {
+                    Picker("Sort", selection: $sort) {
+                        ForEach(DiscoverySort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.inline).labelsHidden()
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down").inkMenuChrome(seed: 273)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .foregroundStyle(TeaTheme.ink)
+                .help("Sort findings — \(sort.rawValue)").accessibilityLabel("Sort findings — \(sort.rawValue)")
             }
             .padding(.horizontal, 10).padding(.vertical, 7)
             .background(WobblyRect(radius: TeaTheme.controlRadius, amplitude: 0.8, seed: 275, step: 10).fill(TeaTheme.card))
@@ -1192,11 +1184,11 @@ private struct CandidateRow: View {
     let candidate: Candidate
     var seed: Int
     private var changing: Bool { model.busy || model.snapshot.cleaning }
-    private var selectionAllowed: Bool { model.canEnqueueCleanup && candidate.blockedReason == nil }
+    private var selectionAllowed: Bool { model.canEnqueueCleanup && candidate.canReviewCleanup }
     private var atSelectionLimit: Bool { !model.selection.contains(candidate.id) && model.selection.count >= 100 }
     private var isSelected: Bool { model.selection.contains(candidate.id) }
     private var metadataLabel: String {
-        guard !candidate.isDeveloper else { return candidate.category }
+        guard candidate.isPersonalFile else { return candidate.category }
         let fileType = URL(fileURLWithPath: candidate.path).pathExtension.uppercased()
         let type = fileType.isEmpty ? "Local file" : "\(fileType) file"
         guard candidate.modifiedNs > 0 else { return type }
@@ -1204,7 +1196,7 @@ private struct CandidateRow: View {
         return "\(type) · Modified \(date.formatted(date: .abbreviated, time: .omitted))"
     }
     private var selected: Binding<Bool> {
-        Binding(get: { candidate.blockedReason == nil && model.selection.contains(candidate.id) }, set: { value in
+        Binding(get: { candidate.canReviewCleanup && model.selection.contains(candidate.id) }, set: { value in
             guard selectionAllowed, !value || !atSelectionLimit else { return }
             if value { model.selection.insert(candidate.id) } else { model.selection.remove(candidate.id) }
         })
@@ -1214,17 +1206,18 @@ private struct CandidateRow: View {
         let shape = WobblyRect(radius: TeaTheme.cardRadius, seed: seed)
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 9) {
-                Toggle("Select \(candidate.title)", isOn: selected)
+                Toggle("Select \(candidate.displayName)", isOn: selected)
                     .toggleStyle(InkCheckboxStyle(seed: seed &+ 3))
                     .padding(.top, 7)
                     .disabled(!selectionAllowed || atSelectionLimit)
                     .help(atSelectionLimit ? "Select up to 100 items at a time." : "Select this item for cleanup")
-                    .accessibilityLabel("Select \(candidate.title)")
+                    .accessibilityLabel("Select \(candidate.displayName). Path: \(candidate.path)")
                 ArtifactIcon(candidate: candidate, size: 32, seed: seed &+ 5)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(candidate.title).font(TeaFont.bodySemibold).lineLimit(1).help(metadataLabel)
+                    Text(candidate.displayName).font(TeaFont.bodySemibold).lineLimit(1).truncationMode(.middle).help(metadataLabel)
+                    Text(candidate.category).font(TeaFont.captionMedium).foregroundStyle(TeaTheme.inkSoft).lineLimit(1)
                     Text(candidate.path).font(TeaFont.mono).foregroundStyle(TeaTheme.inkSoft)
-                        .lineLimit(1).truncationMode(.middle).help(candidate.path).textSelection(.enabled)
+                        .lineLimit(1).truncationMode(.head).help(candidate.path).textSelection(.enabled)
                 }
                 Spacer(minLength: 4)
                 VStack(alignment: .trailing, spacing: 0) {
@@ -1236,18 +1229,18 @@ private struct CandidateRow: View {
             Text(candidate.explanation).font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
                 .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 5) {
-                Image(systemName: candidate.blockedReason == nil ? "arrow.turn.down.right" : "lock").font(TeaFont.caption).padding(.top, 1)
-                Text(candidate.blockedReason ?? candidate.consequence)
+                Image(systemName: candidate.canReviewCleanup ? "arrow.turn.down.right" : "lock").font(TeaFont.caption).padding(.top, 1)
+                Text(candidate.cleanupBlockedReason ?? candidate.consequence)
                     .font(TeaFont.caption).lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
-            .foregroundStyle(candidate.blockedReason == nil ? TeaTheme.inkSoft : TeaTheme.rust)
+            .foregroundStyle(candidate.canReviewCleanup ? TeaTheme.inkSoft : TeaTheme.rust)
             InkDivider(seed: seed &+ 7)
             HStack(spacing: 6) {
                 if permanentCleanupEligible(candidate) {
                     Text(potentialReward(candidate)).font(TeaFont.caption).foregroundStyle(TeaTheme.goldDeep)
                         .lineLimit(1).minimumScaleFactor(0.8)
                 } else {
-                    Text(candidate.blockedReason == nil ? "Trash only" : "Unavailable for cleanup")
+                    Text(candidate.canReviewCleanup ? "Trash only" : "Unavailable for cleanup")
                         .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft).fixedSize()
                 }
                 Spacer(minLength: 4)
@@ -1261,7 +1254,7 @@ private struct CandidateRow: View {
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .foregroundStyle(TeaTheme.inkSoft)
-                .accessibilityLabel("Actions for \(candidate.title)")
+                .accessibilityLabel("Actions for \(candidate.displayName). Path: \(candidate.path)")
             }
         }
         .padding(.horizontal, 11).padding(.vertical, 9)
@@ -1277,7 +1270,7 @@ private struct CandidateRow: View {
 }
 
 private func permanentCleanupEligible(_ item: Candidate) -> Bool {
-    item.isDeveloper && item.eligiblePermanent && item.blockedReason == nil
+    item.canDeletePermanently
 }
 
 private func potentialReward(_ item: Candidate) -> String {
@@ -1457,7 +1450,7 @@ private struct ReviewTakeover: View {
                     .accessibilityHint(model.hasCleanupWork
                         ? "Queues the reviewed items to move to Trash after the current cleanup. Earns no chips."
                         : "Moves the reviewed items to Trash. Earns no chips.")
-                Text("For permanent cleanup, select only eligible developer artifacts. Personal downloads go to Trash only.")
+                Text("App caches, logs, Xcode build data and personal files go to Trash only. Permanent cleanup is limited to eligible developer artifacts.")
                     .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1483,7 +1476,8 @@ private struct ReviewItemCard: View {
                 HStack(alignment: .top, spacing: 10) {
                     ArtifactIcon(candidate: item, size: 30, seed: seed &+ 5)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title).font(TeaFont.bodySemibold).lineLimit(1)
+                        Text(item.displayName).font(TeaFont.bodySemibold).lineLimit(1).truncationMode(.middle)
+                        Text(item.category).font(TeaFont.captionMedium).foregroundStyle(TeaTheme.inkSoft).lineLimit(1)
                         Text(item.path).font(TeaFont.mono).foregroundStyle(TeaTheme.inkSoft)
                             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
@@ -1496,7 +1490,7 @@ private struct ReviewItemCard: View {
                 }
                 Text(item.explanation).font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
-                if let reason = item.blockedReason {
+                if let reason = item.cleanupBlockedReason {
                     Label(reason, systemImage: "lock")
                         .font(TeaFont.caption).foregroundStyle(TeaTheme.rust)
                         .fixedSize(horizontal: false, vertical: true)
