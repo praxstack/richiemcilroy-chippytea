@@ -12,6 +12,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawF
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 pub(crate) const MAX_DEPTH: usize = 128;
 const MAX_LINK_IDENTITIES: usize = 131_072;
@@ -899,6 +900,19 @@ pub(crate) struct RegularFile {
 /// Read only small, regular, owned manifests. Keep the parent pinned through the
 /// read, then verify that the original pathname still reaches that parent/file.
 pub(crate) fn read_regular(path: &Path, cancel: &AtomicBool) -> Result<RegularFile> {
+    read_regular_bounded(path, cancel, MAX_MANIFEST)
+}
+
+/// A provider may impose a smaller evidence limit. Enforce it on the pinned
+/// descriptor before allocating, not after reading a larger file into memory.
+pub(crate) fn read_regular_bounded(
+    path: &Path,
+    cancel: &AtomicBool,
+    maximum_bytes: u64,
+) -> Result<RegularFile> {
+    if maximum_bytes == 0 || maximum_bytes > MAX_MANIFEST {
+        return Err("Invalid project evidence byte limit".into());
+    }
     cancelled(cancel)?;
     let _local_io = LocalOnlyIo::new()?;
     absolute_components(path)?;
@@ -907,7 +921,7 @@ pub(crate) fn read_regular(path: &Path, cancel: &AtomicBool) -> Result<RegularFi
     let parent = open_directory_with_access(parent_path, true, Some(cancel))?;
     cancelled(cancel)?;
     let parent_identity = stat_fd(parent.as_raw_fd())?.identity;
-    let captured = read_regular_at(parent.as_fd(), name, cancel)?;
+    let captured = read_regular_at(parent.as_fd(), name, cancel, maximum_bytes)?;
     #[cfg(test)]
     tests::observe_regular_read(tests::RegularReadPhase::BeforePathValidation);
     cancelled(cancel)?;
@@ -939,10 +953,11 @@ fn read_regular_at(
     parent: BorrowedFd<'_>,
     name: &OsStr,
     cancel: &AtomicBool,
+    maximum_bytes: u64,
 ) -> Result<RegularFile> {
     cancelled(cancel)?;
     let before = stat_child(parent.as_raw_fd(), name)?;
-    if !regular_evidence_metadata(&before) {
+    if !regular_evidence_metadata(&before) || before.identity.size > maximum_bytes {
         return Err("Project evidence is not a small, independent, local regular file".into());
     }
     let name = c_name(name)?;
@@ -2286,6 +2301,7 @@ pub(crate) fn measure_try_observing_with_policy(
 
 /// Cheap coverage for artifacts already excluded by suggestion policy. This is
 /// never mutation evidence: the fingerprint is deliberately empty.
+#[cfg(test)]
 pub(crate) fn measure_metadata_observing(
     path: &Path,
     device: u64,
@@ -2306,6 +2322,7 @@ pub(crate) fn measure_metadata_observing(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn measure_metadata_observing_with_policy(
     path: &Path,
     device: u64,
@@ -2332,6 +2349,7 @@ pub(crate) fn measure_metadata_observing_with_policy(
 
 /// Once a descendant proves an artifact ineligible, stop reading its siblings.
 /// Cleanup and metadata benchmarks never use this abbreviated measurement.
+#[cfg(test)]
 pub(crate) fn measure_suggestion_observing_with_policy(
     path: &Path,
     device: u64,
@@ -2363,194 +2381,359 @@ fn measure_observing_impl(
     stop_after_modified_ns: Option<i64>,
     mut observe: impl FnMut(&Entry, &Measurement) -> Result<()>,
 ) -> Result<Measurement> {
-    let _local_io = LocalOnlyIo::new()?;
-    cancelled(cancel)?;
-    let root = Entry {
-        path: path.to_path_buf(),
-        meta: metadata(path)?,
-    };
-    let initial = root.meta.identity.clone();
-    let mut result = Measurement::default();
-    let mut digest = fingerprint.then(Digest::default);
-    let mut links = Hardlinks::default();
-    let mut regular_links =
-        (policy == MeasurementPolicy::Developer).then(RegularLinkClosure::default);
-    let mut stack = Vec::new();
-    let mut next = Some(root);
-    loop {
+    let mut cursor = MeasurementCursor::new(
+        path,
+        device,
+        policy,
+        fingerprint,
+        stop_after_modified_ns,
+        cancel,
+    )?;
+    match cursor.advance_unbounded(cancel, &mut observe)? {
+        MeasurementProgress::Pending => unreachable!("an unbounded measurement must finish"),
+        MeasurementProgress::Complete(result) => Ok(result),
+    }
+}
+
+/// One bounded slice of a complete measurement. A pending cursor owns all
+/// provisional state; only `Complete` exposes the finalized fingerprint and
+/// hard-link closure decision.
+#[derive(Debug)]
+pub(crate) enum MeasurementProgress {
+    Pending,
+    Complete(Measurement),
+}
+
+/// Resumable metadata measurement for one artifact. It deliberately cannot move
+/// between threads: directory readers and the local-only I/O policy are tied to
+/// the worker that advances it.
+pub(crate) struct MeasurementCursor {
+    path: PathBuf,
+    device: u64,
+    policy: MeasurementPolicy,
+    stop_after_modified_ns: Option<i64>,
+    initial: Identity,
+    result: Measurement,
+    digest: Option<Digest>,
+    links: Hardlinks,
+    regular_links: Option<RegularLinkClosure>,
+    stack: Vec<Directory>,
+    next: Option<Entry>,
+    terminal: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl MeasurementCursor {
+    pub(crate) fn full(
+        path: &Path,
+        device: u64,
+        policy: MeasurementPolicy,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        Self::new(path, device, policy, true, None, cancel)
+    }
+
+    pub(crate) fn metadata(
+        path: &Path,
+        device: u64,
+        policy: MeasurementPolicy,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        Self::new(path, device, policy, false, None, cancel)
+    }
+
+    pub(crate) fn suggestion(
+        path: &Path,
+        device: u64,
+        policy: MeasurementPolicy,
+        max_modified_ns: i64,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        Self::new(path, device, policy, true, Some(max_modified_ns), cancel)
+    }
+
+    fn new(
+        path: &Path,
+        device: u64,
+        policy: MeasurementPolicy,
+        fingerprint: bool,
+        stop_after_modified_ns: Option<i64>,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        let _local_io = LocalOnlyIo::new()?;
         cancelled(cancel)?;
-        if let Some(latest_allowed) = stop_after_modified_ns
-            && result.entries > 0
-            && (result.unsafe_reason.is_some() || result.latest_modified_ns > latest_allowed)
-        {
-            result.pruned = true;
-            result
-                .unsafe_reason
-                .get_or_insert("Artifact contents changed within the required quiet period".into());
-            break;
-        }
-        let entry = if let Some(entry) = next.take() {
-            entry
-        } else {
-            let Some(directory) = stack.last_mut() else {
-                break;
-            };
-            match Directory::next(directory, cancel) {
-                Ok(Some(entry)) => entry,
-                Ok(None) => {
-                    if let Err(reason) = directory.unchanged() {
-                        result.unsafe_reason.get_or_insert(reason);
-                    }
-                    stack.pop();
-                    continue;
-                }
-                Err(reason) => {
-                    cancelled(cancel)?;
-                    result.errors += 1;
-                    result.unsafe_reason.get_or_insert(reason);
-                    // A failed read cannot safely be assumed to advance.
-                    stack.pop();
-                    continue;
-                }
-            }
+        let root = Entry {
+            path: path.to_path_buf(),
+            meta: metadata(path)?,
         };
-        let meta = &entry.meta;
-        result.entries += 1;
-        result.latest_modified_ns = result.latest_modified_ns.max(meta.identity.modified_ns);
-        let excluded_name = excluded_measurement_name(
-            entry.path.file_name().unwrap_or_default(),
-            meta.is_dir(),
+        let initial = root.meta.identity.clone();
+        Ok(Self {
+            path: path.to_path_buf(),
+            device,
             policy,
-        );
-        let mut link_error = None;
-        let safe_link = if meta.is_symlink()
-            && meta.identity.device == device
-            && !meta.is_dataless()
-            && !excluded_name
-        {
-            let payload = match policy {
-                MeasurementPolicy::Strict => internal_bin_link(&entry.path, path, device),
-                MeasurementPolicy::Developer => {
-                    developer_link_payload(&entry, stack.last(), cancel)
+            stop_after_modified_ns,
+            initial,
+            result: Measurement::default(),
+            digest: fingerprint.then(Digest::default),
+            links: Hardlinks::default(),
+            regular_links: (policy == MeasurementPolicy::Developer)
+                .then(RegularLinkClosure::default),
+            stack: Vec::new(),
+            next: Some(root),
+            terminal: false,
+            _thread: std::marker::PhantomData,
+        })
+    }
+
+    /// Advances by no more than `max_entries` and stops before beginning another
+    /// entry step after `deadline`. One step can require multiple descriptor-
+    /// relative observations, and an individual OS call can still overrun the
+    /// deadline; process isolation is required to contain such a blocked call.
+    pub(crate) fn advance(
+        &mut self,
+        cancel: &AtomicBool,
+        max_entries: usize,
+        deadline: Instant,
+        mut observe: impl FnMut(&Entry, &Measurement) -> Result<()>,
+    ) -> Result<MeasurementProgress> {
+        if max_entries == 0 {
+            return Err("A measurement quantum must allow at least one entry".into());
+        }
+        self.advance_guarded(cancel, max_entries, Some(deadline), &mut observe)
+    }
+
+    fn advance_unbounded(
+        &mut self,
+        cancel: &AtomicBool,
+        observe: &mut impl FnMut(&Entry, &Measurement) -> Result<()>,
+    ) -> Result<MeasurementProgress> {
+        self.advance_guarded(cancel, usize::MAX, None, observe)
+    }
+
+    fn advance_guarded(
+        &mut self,
+        cancel: &AtomicBool,
+        max_entries: usize,
+        deadline: Option<Instant>,
+        observe: &mut impl FnMut(&Entry, &Measurement) -> Result<()>,
+    ) -> Result<MeasurementProgress> {
+        if self.terminal {
+            return Err("Measurement cursor is already terminal".into());
+        }
+        let _local_io = LocalOnlyIo::new()?;
+        let outcome = self.advance_inner(cancel, max_entries, deadline, observe);
+        if outcome.is_err() {
+            self.terminal = true;
+        }
+        outcome
+    }
+
+    fn advance_inner(
+        &mut self,
+        cancel: &AtomicBool,
+        max_entries: usize,
+        deadline: Option<Instant>,
+        observe: &mut impl FnMut(&Entry, &Measurement) -> Result<()>,
+    ) -> Result<MeasurementProgress> {
+        let mut processed = 0;
+        loop {
+            cancelled(cancel)?;
+            if let Some(latest_allowed) = self.stop_after_modified_ns
+                && self.result.entries > 0
+                && (self.result.unsafe_reason.is_some()
+                    || self.result.latest_modified_ns > latest_allowed)
+            {
+                self.result.pruned = true;
+                self.result.unsafe_reason.get_or_insert(
+                    "Artifact contents changed within the required quiet period".into(),
+                );
+                return self.finish(cancel).map(MeasurementProgress::Complete);
+            }
+            if processed >= max_entries
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Ok(MeasurementProgress::Pending);
+            }
+            let entry = if let Some(entry) = self.next.take() {
+                entry
+            } else {
+                let Some(directory) = self.stack.last_mut() else {
+                    return self.finish(cancel).map(MeasurementProgress::Complete);
+                };
+                match Directory::next(directory, cancel) {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => {
+                        if let Err(reason) = directory.unchanged() {
+                            self.result.unsafe_reason.get_or_insert(reason);
+                        }
+                        self.stack.pop();
+                        continue;
+                    }
+                    Err(reason) => {
+                        cancelled(cancel)?;
+                        self.result.errors += 1;
+                        self.result.unsafe_reason.get_or_insert(reason);
+                        // A failed read cannot safely be assumed to advance.
+                        self.stack.pop();
+                        continue;
+                    }
                 }
             };
-            match payload {
-                Ok(bytes) => Some(bytes),
-                Err(reason) => {
-                    cancelled(cancel)?;
-                    if policy == MeasurementPolicy::Developer {
-                        result.errors += 1;
+            processed += 1;
+            let meta = &entry.meta;
+            self.result.entries += 1;
+            self.result.latest_modified_ns = self
+                .result
+                .latest_modified_ns
+                .max(meta.identity.modified_ns);
+            let excluded_name = excluded_measurement_name(
+                entry.path.file_name().unwrap_or_default(),
+                meta.is_dir(),
+                self.policy,
+            );
+            let mut link_error = None;
+            let safe_link = if meta.is_symlink()
+                && meta.identity.device == self.device
+                && !meta.is_dataless()
+                && !excluded_name
+            {
+                let payload = match self.policy {
+                    MeasurementPolicy::Strict => {
+                        internal_bin_link(&entry.path, &self.path, self.device)
                     }
-                    link_error = Some(reason);
-                    None
+                    MeasurementPolicy::Developer => {
+                        developer_link_payload(&entry, self.stack.last(), cancel)
+                    }
+                };
+                match payload {
+                    Ok(bytes) => Some(bytes),
+                    Err(reason) => {
+                        cancelled(cancel)?;
+                        if self.policy == MeasurementPolicy::Developer {
+                            self.result.errors += 1;
+                        }
+                        link_error = Some(reason);
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
-        if let Some(digest) = &mut digest {
-            digest.add(
-                entry.path.strip_prefix(path).unwrap_or(&entry.path),
-                meta,
-                safe_link.as_deref(),
-            );
-        }
-        let exclusion = if meta.identity.device != device {
-            Some("A nested mount belongs to a different volume")
-        } else if meta.is_dataless() {
-            Some("Contains cloud placeholders; their contents were not downloaded")
-        } else if excluded_name {
-            Some("Contains protected, cloud-managed, or shared-store data")
-        } else if meta.is_symlink() && safe_link.is_none() {
-            Some(match policy {
-                MeasurementPolicy::Strict => {
-                    "Contains symbolic links outside supported internal .bin commands; linked content has uncertain ownership"
-                }
-                MeasurementPolicy::Developer => link_error
-                    .as_deref()
-                    .unwrap_or("A symbolic-link payload could not be verified"),
-            })
-        } else if !meta.is_dir() && !meta.is_file() && safe_link.is_none() {
-            Some("Contains special files; cleanup is unsupported")
-        } else {
-            None
-        };
-        if let Some(reason) = exclusion {
-            result.skipped += 1;
-            result.unsafe_reason.get_or_insert(reason.into());
-            observe(&entry, &result)?;
-            continue;
-        }
-        if meta.uid != unsafe { libc::geteuid() } {
-            result
-                .unsafe_reason
-                .get_or_insert("Contains items owned by another account".into());
-        }
-        if meta.is_symlink() && meta.links != 1 {
-            result.unsafe_reason.get_or_insert(
-                "Contains hard-linked symbolic links that may be shared outside this artifact"
-                    .into(),
-            );
-        }
-        if meta.is_file() {
-            result.files += 1;
-            if let Some(closure) = &mut regular_links {
-                if let Err(reason) = closure.observe(meta) {
-                    result.unsafe_reason.get_or_insert(reason);
-                }
-            } else if meta.links > 1 {
-                result.unsafe_reason.get_or_insert(
-                    "Contains hard-linked files that may be shared outside this artifact".into(),
+            } else {
+                None
+            };
+            if let Some(digest) = &mut self.digest {
+                digest.add(
+                    entry.path.strip_prefix(&self.path).unwrap_or(&entry.path),
+                    meta,
+                    safe_link.as_deref(),
                 );
             }
-            if links.first(meta) {
-                result.logical_bytes = result.logical_bytes.saturating_add(meta.identity.size);
-                result.allocated_bytes = result.allocated_bytes.saturating_add(meta.allocated);
-            }
-        } else if meta.is_dir() {
-            result.directories += 1;
-            if stack.len() >= MAX_DEPTH {
-                result.skipped += 1;
-                result
-                    .unsafe_reason
-                    .get_or_insert("Directory depth exceeds the bounded traversal limit".into());
+            let exclusion = if meta.identity.device != self.device {
+                Some("A nested mount belongs to a different volume")
+            } else if meta.is_dataless() {
+                Some("Contains cloud placeholders; their contents were not downloaded")
+            } else if excluded_name {
+                Some("Contains protected, cloud-managed, or shared-store data")
+            } else if meta.is_symlink() && safe_link.is_none() {
+                Some(match self.policy {
+                    MeasurementPolicy::Strict => {
+                        "Contains symbolic links outside supported internal .bin commands; linked content has uncertain ownership"
+                    }
+                    MeasurementPolicy::Developer => link_error
+                        .as_deref()
+                        .unwrap_or("A symbolic-link payload could not be verified"),
+                })
+            } else if !meta.is_dir() && !meta.is_file() && safe_link.is_none() {
+                Some("Contains special files; cleanup is unsupported")
             } else {
-                let opened = match stack.last() {
-                    Some(parent) => Directory::open_child(parent, &entry),
-                    None => Directory::open(&entry.path),
-                };
-                match opened {
-                    Ok(directory) => stack.push(directory),
-                    Err(reason) => {
-                        result.errors += 1;
-                        result.unsafe_reason.get_or_insert(reason);
+                None
+            };
+            if let Some(reason) = exclusion {
+                self.result.skipped += 1;
+                self.result.unsafe_reason.get_or_insert(reason.into());
+                observe(&entry, &self.result)?;
+                continue;
+            }
+            if meta.uid != unsafe { libc::geteuid() } {
+                self.result
+                    .unsafe_reason
+                    .get_or_insert("Contains items owned by another account".into());
+            }
+            if meta.is_symlink() && meta.links != 1 {
+                self.result.unsafe_reason.get_or_insert(
+                    "Contains hard-linked symbolic links that may be shared outside this artifact"
+                        .into(),
+                );
+            }
+            if meta.is_file() {
+                self.result.files += 1;
+                if let Some(closure) = &mut self.regular_links {
+                    if let Err(reason) = closure.observe(meta) {
+                        self.result.unsafe_reason.get_or_insert(reason);
+                    }
+                } else if meta.links > 1 {
+                    self.result.unsafe_reason.get_or_insert(
+                        "Contains hard-linked files that may be shared outside this artifact"
+                            .into(),
+                    );
+                }
+                if self.links.first(meta) {
+                    self.result.logical_bytes =
+                        self.result.logical_bytes.saturating_add(meta.identity.size);
+                    self.result.allocated_bytes =
+                        self.result.allocated_bytes.saturating_add(meta.allocated);
+                }
+            } else if meta.is_dir() {
+                self.result.directories += 1;
+                if self.stack.len() >= MAX_DEPTH {
+                    self.result.skipped += 1;
+                    self.result.unsafe_reason.get_or_insert(
+                        "Directory depth exceeds the bounded traversal limit".into(),
+                    );
+                } else {
+                    let opened = match self.stack.last() {
+                        Some(parent) => Directory::open_child(parent, &entry),
+                        None => Directory::open(&entry.path),
+                    };
+                    match opened {
+                        Ok(directory) => self.stack.push(directory),
+                        Err(reason) => {
+                            self.result.errors += 1;
+                            self.result.unsafe_reason.get_or_insert(reason);
+                        }
                     }
                 }
             }
+            observe(&entry, &self.result)?;
         }
-        observe(&entry, &result)?;
     }
-    if identity(path)? != initial {
-        result
-            .unsafe_reason
-            .get_or_insert("The selected item changed during measurement".into());
+
+    fn finish(&mut self, cancel: &AtomicBool) -> Result<Measurement> {
+        cancelled(cancel)?;
+        if identity(&self.path)? != self.initial {
+            self.result
+                .unsafe_reason
+                .get_or_insert("The selected item changed during measurement".into());
+        }
+        if self.links.saturated() {
+            self.result.errors += 1;
+            self.result.unsafe_reason = Some("Hard-link identity limit reached; size accounting is incomplete and cleanup is excluded".into());
+        }
+        if !self.result.pruned
+            && let Some(closure) = self.regular_links.take()
+            && let Err(reason) = closure.verify()
+        {
+            self.result.unsafe_reason.get_or_insert(reason);
+        }
+        self.result.fingerprint = if self.result.pruned {
+            String::new()
+        } else {
+            self.digest
+                .take()
+                .map(|digest| digest.finish())
+                .unwrap_or_default()
+        };
+        self.terminal = true;
+        Ok(std::mem::take(&mut self.result))
     }
-    if links.saturated() {
-        result.errors += 1;
-        result.unsafe_reason = Some("Hard-link identity limit reached; size accounting is incomplete and cleanup is excluded".into());
-    }
-    if !result.pruned
-        && let Some(closure) = regular_links
-        && let Err(reason) = closure.verify()
-    {
-        result.unsafe_reason.get_or_insert(reason);
-    }
-    result.fingerprint = if result.pruned {
-        String::new()
-    } else {
-        digest.map(|digest| digest.finish()).unwrap_or_default()
-    };
-    Ok(result)
 }
 
 /// Reproducible raw traversal using exactly the production Directory primitive.
@@ -3110,6 +3293,37 @@ pub(crate) mod tests {
                     "Cancelled"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn bounded_evidence_read_rejects_over_limit_before_opening_or_allocating() {
+        let (_temp, base) = fixture();
+        let path = base.join("package.json");
+        let cancel = AtomicBool::new(false);
+        std::fs::write(&path, b"12345678").unwrap();
+        assert_eq!(
+            read_regular_bounded(&path, &cancel, 8).unwrap().bytes,
+            b"12345678"
+        );
+        with_regular_read_observer(
+            |_| panic!("over-limit evidence must be rejected before open/read"),
+            || assert!(read_regular_bounded(&path, &cancel, 7).is_err()),
+        );
+        assert!(read_regular_bounded(&path, &cancel, 0).is_err());
+        assert!(read_regular_bounded(&path, &cancel, MAX_MANIFEST + 1).is_err());
+        let changed_path = path.clone();
+        let result = with_regular_read_observer(
+            move |phase| {
+                if matches!(phase, RegularReadPhase::BeforeOpen) {
+                    std::fs::write(&changed_path, b"123456789").unwrap();
+                }
+            },
+            || read_regular_bounded(&path, &cancel, 8),
+        );
+        assert!(
+            result.is_err(),
+            "growth after the size check must fail closed"
         );
     }
 
@@ -4795,6 +5009,184 @@ pub(crate) mod tests {
         assert_eq!(measurement.files, 2);
         assert_eq!(measurement.skipped, 1);
         assert!(measurement.unsafe_reason.is_some());
+    }
+
+    fn assert_same_measurement(actual: &Measurement, expected: &Measurement) {
+        assert_eq!(actual.pruned, expected.pruned);
+        assert_eq!(actual.logical_bytes, expected.logical_bytes);
+        assert_eq!(actual.allocated_bytes, expected.allocated_bytes);
+        assert_eq!(actual.files, expected.files);
+        assert_eq!(actual.latest_modified_ns, expected.latest_modified_ns);
+        assert_eq!(actual.fingerprint, expected.fingerprint);
+        assert_eq!(actual.unsafe_reason, expected.unsafe_reason);
+        assert_eq!(actual.entries, expected.entries);
+        assert_eq!(actual.directories, expected.directories);
+        assert_eq!(actual.skipped, expected.skipped);
+        assert_eq!(actual.errors, expected.errors);
+    }
+
+    #[test]
+    fn bounded_measurement_cursor_matches_the_synchronous_wrapper() {
+        let (_temp, base) = fixture();
+        let (tree, first, _) = internal_regular_links(&base);
+        let cancel = AtomicBool::new(false);
+        let device = identity(&tree).unwrap().device;
+        let expected =
+            measure_with_policy(&tree, device, &cancel, MeasurementPolicy::Developer).unwrap();
+        let mut cursor =
+            MeasurementCursor::full(&tree, device, MeasurementPolicy::Developer, &cancel).unwrap();
+        let mut observed = 0;
+        let mut yields = 0;
+        let actual = loop {
+            let progress = cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, partial| {
+                        observed += 1;
+                        assert!(
+                            partial.fingerprint.is_empty(),
+                            "a resumable partial must never expose mutation evidence"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            match progress {
+                MeasurementProgress::Pending => yields += 1,
+                MeasurementProgress::Complete(measurement) => break measurement,
+            }
+        };
+        assert!(yields > 1);
+        assert_eq!(observed, actual.entries);
+        assert_same_measurement(&actual, &expected);
+        assert_eq!(std::fs::read(first).unwrap(), [7u8; 8192]);
+        assert!(
+            cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, _| Ok(()),
+                )
+                .unwrap_err()
+                .contains("terminal")
+        );
+    }
+
+    #[test]
+    fn measurement_cursor_deadline_and_cancellation_are_sticky() {
+        let (_temp, base) = fixture();
+        std::fs::write(base.join("payload"), b"preserve").unwrap();
+        let cancel = AtomicBool::new(false);
+        let device = identity(&base).unwrap().device;
+        let mut cursor =
+            MeasurementCursor::metadata(&base, device, MeasurementPolicy::Strict, &cancel).unwrap();
+        let mut observed = 0;
+        assert!(matches!(
+            cursor
+                .advance(&cancel, 1, Instant::now(), |_, _| {
+                    observed += 1;
+                    Ok(())
+                })
+                .unwrap(),
+            MeasurementProgress::Pending
+        ));
+        assert_eq!(observed, 0);
+        assert!(matches!(
+            cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, partial| {
+                        observed += 1;
+                        assert!(partial.fingerprint.is_empty());
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            MeasurementProgress::Pending
+        ));
+        assert_eq!(observed, 1);
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, _| Ok(()),
+                )
+                .unwrap_err(),
+            "Cancelled"
+        );
+        cancel.store(false, Ordering::Release);
+        assert!(
+            cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, _| Ok(()),
+                )
+                .unwrap_err()
+                .contains("terminal")
+        );
+    }
+
+    #[test]
+    fn measurement_cursor_revalidates_a_root_replaced_while_yielded() {
+        let (_temp, base) = fixture();
+        let tree = base.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("payload"), b"old output").unwrap();
+        let cancel = AtomicBool::new(false);
+        let device = identity(&tree).unwrap().device;
+        let mut cursor =
+            MeasurementCursor::full(&tree, device, MeasurementPolicy::Strict, &cancel).unwrap();
+        assert!(matches!(
+            cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, partial| {
+                        assert!(partial.fingerprint.is_empty());
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            MeasurementProgress::Pending
+        ));
+        let old = base.join("old-tree");
+        std::fs::rename(&tree, &old).unwrap();
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("replacement"), b"must not be measured").unwrap();
+        let measured = loop {
+            match cursor
+                .advance(
+                    &cancel,
+                    1,
+                    Instant::now() + std::time::Duration::from_secs(1),
+                    |_, partial| {
+                        assert!(partial.fingerprint.is_empty());
+                        Ok(())
+                    },
+                )
+                .unwrap()
+            {
+                MeasurementProgress::Pending => {}
+                MeasurementProgress::Complete(measurement) => break measurement,
+            }
+        };
+        assert!(measured.unsafe_reason.is_some());
+        assert_eq!(std::fs::read(old.join("payload")).unwrap(), b"old output");
+        assert_eq!(
+            std::fs::read(tree.join("replacement")).unwrap(),
+            b"must not be measured"
+        );
     }
 
     fn internal_regular_links(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
