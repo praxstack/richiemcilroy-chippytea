@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const COIN_BYTES: u64 = 100_000_000;
-// Rebuild derived findings after conditional-boundary and nested-Keep fixes.
-pub const RULE_VERSION: u32 = 8;
+// Rebuild derived findings for category-specific everyday Mac recommendations.
+pub const RULE_VERSION: u32 = 9;
 pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
