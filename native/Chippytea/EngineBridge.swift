@@ -38,11 +38,128 @@ struct SnapshotResponseDecoder {
     mutating func clear() { cached = nil }
 }
 
+private struct ConditionalSnapshotProgress: Decodable {
+    let scanning: Bool
+    let cleaning: Bool
+    let stats: ScanStats
+    let foregroundScan: ForegroundScan?
+    let error: String?
+    let hasForegroundScan: Bool
+    let hasError: Bool
+
+    private enum CodingKeys: String, CodingKey { case scanning, cleaning, stats, foregroundScan, error }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        scanning = try values.decode(Bool.self, forKey: .scanning)
+        cleaning = try values.decode(Bool.self, forKey: .cleaning)
+        stats = try values.decode(ScanStats.self, forKey: .stats)
+        hasForegroundScan = values.contains(.foregroundScan)
+        hasError = values.contains(.error)
+        foregroundScan = try values.decodeIfPresent(ForegroundScan.self, forKey: .foregroundScan)
+        error = try values.decodeIfPresent(String.self, forKey: .error)
+    }
+}
+
+private struct ConditionalSnapshotData: Decodable {
+    let revision: String
+    let contentRevision: String
+    let changed: Bool
+    let snapshot: EngineSnapshot?
+    let progress: ConditionalSnapshotProgress?
+}
+
+private struct ConditionalSnapshotResponse: Decodable {
+    let ok: Bool
+    let data: ConditionalSnapshotData?
+    let error: String?
+}
+
+/// Reuses the complete snapshot while allowing progress-only responses to
+/// update the five mutable progress fields without copying the review model.
+struct ConditionalSnapshotDecoder {
+    private(set) var snapshot: EngineSnapshot?
+    private(set) var revision: String?
+    private(set) var contentRevision: String?
+
+    var requestTokens: [String: Any]? {
+        guard let revision, let contentRevision else { return nil }
+        return ["after_revision": revision, "after_content_revision": contentRevision]
+    }
+
+    mutating func clear() {
+        snapshot = nil
+        revision = nil
+        contentRevision = nil
+    }
+
+    mutating func decode(_ data: Data) throws -> EngineSnapshot {
+        do {
+            let response = try EngineClient.decode(ConditionalSnapshotResponse.self, data)
+            guard response.ok, let data = response.data else {
+                throw EngineError.message(response.error ?? "The operation could not be completed.")
+            }
+            guard Self.validRevision(data.revision), Self.validRevision(data.contentRevision) else {
+                throw EngineError.message("The engine returned an invalid snapshot revision.")
+            }
+            guard let cached = snapshot else {
+                guard data.changed, let full = data.snapshot, data.progress == nil else {
+                    throw EngineError.message("The engine returned an incomplete snapshot.")
+                }
+                snapshot = full
+                revision = data.revision
+                contentRevision = data.contentRevision
+                return full
+            }
+            if !data.changed {
+                guard data.snapshot == nil, data.progress == nil,
+                      revision == data.revision, contentRevision == data.contentRevision else {
+                    throw EngineError.message("The engine returned an invalid unchanged snapshot.")
+                }
+                return cached
+            }
+            if let full = data.snapshot {
+                guard data.progress == nil, revision != data.revision else {
+                    throw EngineError.message("The engine returned an invalid full snapshot.")
+                }
+                snapshot = full
+                revision = data.revision
+                contentRevision = data.contentRevision
+                return full
+            }
+            guard let progress = data.progress, contentRevision == data.contentRevision,
+                  revision != data.revision else {
+                throw EngineError.message("The engine returned an invalid progress snapshot.")
+            }
+            var updated = cached
+            updated.scanning = progress.scanning
+            updated.cleaning = progress.cleaning
+            updated.stats = progress.stats
+            if progress.hasForegroundScan { updated.foregroundScan = progress.foregroundScan }
+            if progress.hasError { updated.error = progress.error }
+            snapshot = updated
+            revision = data.revision
+            return updated
+        } catch {
+            clear()
+            throw error
+        }
+    }
+
+    private static func validRevision(_ value: String) -> Bool {
+        let bytes = value.utf8
+        return !bytes.isEmpty && bytes.count <= 128 && bytes.allSatisfy { $0 < 0x80 }
+    }
+}
+
 final class EngineClient: @unchecked Sendable {
     private let handle: UnsafeMutableRawPointer
     private let queue = DispatchQueue(label: "app.chippytea.engine", qos: .utility)
     private let progressQueue = DispatchQueue(label: "app.chippytea.cleanup-progress", qos: .utility)
-    private var snapshotDecoder = SnapshotResponseDecoder()
+    private let managedReviewQueue = DispatchQueue(label: "app.chippytea.managed-review", qos: .utility)
+    private let managedReviewAdmission = NSLock()
+    private var managedReviewRunning = false
+    private var conditionalSnapshotDecoder = ConditionalSnapshotDecoder()
     init(database: URL) throws {
         guard let handle = database.path.withCString({ ct_open($0, nativeTrash) }) else { throw EngineError.message("The local library could not be opened. Check free space and whether another chippytea process has it open.") }
         self.handle = handle
@@ -52,6 +169,39 @@ final class EngineClient: @unchecked Sendable {
     func request(_ request: [String: Any]) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             queue.async { do { continuation.resume(returning: try self.requestSync(request)) } catch { continuation.resume(throwing: error) } }
+        }
+    }
+    /// One explicitly requested owner-tool review has an independent queue so
+    /// a slow tool cannot hold snapshots, events, or cleanup progress hostage.
+    /// Admission happens before dispatch, keeping this queue bounded to one.
+    func reviewManagedProvider(_ provider: String, requestID: String) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let admitted = managedReviewAdmission.withLock {
+                guard !managedReviewRunning else { return false }
+                managedReviewRunning = true
+                return true
+            }
+            guard admitted else {
+                continuation.resume(throwing: EngineError.message("An installed-tool review is already running."))
+                return
+            }
+            managedReviewQueue.async {
+                defer { self.managedReviewAdmission.withLock { self.managedReviewRunning = false } }
+                do {
+                    continuation.resume(returning: try self.requestSync([
+                        "action": "managed_review", "provider": provider, "confirmed_read_only": true,
+                        "request_id": requestID,
+                    ]))
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+    func cancelManagedReview(_ requestID: String) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            progressQueue.async {
+                _ = try? self.requestSync(["action": "cancel_managed_review", "request_id": requestID])
+                continuation.resume()
+            }
         }
     }
     /// Submit directly to one serial control queue to preserve lifecycle order
@@ -69,18 +219,28 @@ final class EngineClient: @unchecked Sendable {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 do {
-                    guard let result = "{\"action\":\"snapshot\"}".withCString({ ct_request(self.handle, $0) }) else {
-                        throw EngineError.message("The engine did not return a result.")
-                    }
-                    defer { ct_free_string(result) }
-                    let data = Data(bytes: result, count: strlen(result))
-                    continuation.resume(returning: try self.snapshotDecoder.decode(data))
+                    let tokens = self.conditionalSnapshotDecoder.requestTokens
+                    var request: [String: Any] = ["action": "snapshot_if_changed"]
+                    if let tokens { request.merge(tokens) { _, newer in newer } }
+                    // The conditional endpoint also returns a complete typed
+                    // snapshot on a cold request, together with both revisions.
+                    let data = try self.directSnapshotRequest(request)
+                    continuation.resume(returning: try self.conditionalSnapshotDecoder.decode(data))
                 } catch {
-                    self.snapshotDecoder.clear()
+                    self.conditionalSnapshotDecoder.clear()
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+    private func directSnapshotRequest(_ request: [String: Any]) throws -> Data {
+        let encoded = try JSONSerialization.data(withJSONObject: request)
+        let text = String(decoding: encoded, as: UTF8.self)
+        guard let result = text.withCString({ ct_request(handle, $0) }) else {
+            throw EngineError.message("The engine did not return a result.")
+        }
+        defer { ct_free_string(result) }
+        return Data(bytes: result, count: strlen(result))
     }
     static func decodeSnapshotResponse(_ data: Data) throws -> EngineSnapshot {
         try decode(SnapshotResponse.self, data).snapshot
@@ -371,10 +531,9 @@ struct DiscoveryPresentation: Equatable {
     private var cleanupProgressTask: Task<Void, Never>?
     /// Armed while a cleanup is running, so the falling edge of `snapshot.cleaning` fires once.
     private var cleanupRunning = false
-    private var eventTask: Task<Void, Never>?
+    private let eventIngress = FolderEventMailbox()
     private var watcherRevision = 0
     private var eventReceiptFailed = false
-    private var eventSubmissions = 0
     private var cursor: UInt64 = 0
     private var pendingCursor: UInt64 = 0
     private let audio = CoinAudio()
@@ -489,6 +648,7 @@ struct DiscoveryPresentation: Equatable {
               snapshot.roots.contains(where: { $0.id == choice.keeper.rootId }),
               snapshot.roots.contains(where: { $0.id == reviewItems[0].rootId }) else { return false }
         return !report.progress.cancelled && choice.copyID != choice.keeperID
+            && !eventIngress.containsChanges(overlapping: [choice.keeper.path, reviewItems[0].path])
     }
 
     func openDuplicates() {
@@ -532,7 +692,8 @@ struct DiscoveryPresentation: Equatable {
                 duplicateProgress = report.progress
                 if duplicateCancellationRequested {
                     errorMessage = "Duplicate check cancelled. No files were changed."
-                } else if duplicateHistoryLostDuringCheck || duplicateEventsDuringCheck.contains(where: { event in
+                } else if eventIngress.containsChanges(overlapping: report.groups.flatMap { $0.files.map { $0.candidate.path } })
+                    || duplicateHistoryLostDuringCheck || duplicateEventsDuringCheck.contains(where: { event in
                     report.groups.contains { group in group.files.contains { file in Self.pathsOverlap(event, file.candidate.path) } }
                 }) {
                     errorMessage = "Files changed during this check. Check again before reviewing a copy."
@@ -859,9 +1020,73 @@ struct DiscoveryPresentation: Equatable {
         }
     }
 
+    private func drainEventIngress() async {
+        while let work = eventIngress.startNext() {
+            // Every discarded payload is represented by a loss barrier. This
+            // happens even for stale watcher generations, before they can be
+            // skipped by the dirty/cursor protocol.
+            invalidateDuplicateReport(paths: work.batch.events.map(\.path), historyLost: work.batch.historyLost)
+            await processEventWork(work)
+            eventIngress.finishActive()
+        }
+    }
+
+    private func processEventWork(_ work: FolderEventWork) async {
+        let events = work.batch.events
+        let last = work.batch.last
+        let historyLost = work.batch.historyLost
+        guard watcherRevision == work.revision, !restoringAccess,
+              !(homeAuthorized && !diskAccessConfigured), let client else { return }
+        var needsReload = false
+        do {
+            if historyLost {
+                // The engine commits every current root's reconciliation and
+                // the exact post-loss cursor together, including an ID wrap.
+                let response = try await client.request(["action": "reconcile_events", "value": last])
+                let acknowledgment = try EngineClient.decode([String: UInt64].self, response)
+                guard watcherRevision == work.revision else { return }
+                guard acknowledgment["cursor"] == last else { throw EngineError.message("Event reconciliation did not acknowledge its cursor.") }
+                cursor = last
+                eventReceiptFailed = false
+                needsReload = true
+            } else {
+              for root in snapshot.roots where diskAccessConfigured || root.path != homePath {
+                guard watcherRevision == work.revision else { return }
+                let affected = events.filter { $0.path == root.path || $0.path.hasPrefix(root.path + "/") }
+                    for start in stride(from: 0, to: affected.count, by: 512) {
+                        guard watcherRevision == work.revision else { return }
+                        let batch = affected[start..<min(start + 512, affected.count)].map(\.request)
+                        let response = try await client.request(["action": "dirty", "root_id": root.id, "events": batch])
+                        let acknowledgment = try EngineClient.decode(DirtyAcknowledgment.self, response)
+                        needsReload = needsReload || acknowledgment.ignored != true
+                    }
+              }
+            }
+            // Requests are journaled in order. A failed submission keeps
+            // the earlier cursor so a relaunch can replay that history.
+            guard watcherRevision == work.revision else { return }
+            if !historyLost, !eventReceiptFailed, last > cursor {
+                let response = try await client.request(["action": "cursor", "value": last])
+                let acknowledgment = try EngineClient.decode([String: UInt64].self, response)
+                guard watcherRevision == work.revision else { return }
+                guard let durable = acknowledgment["cursor"], durable >= last else { throw EngineError.message("The event cursor was not saved.") }
+                cursor = durable
+            }
+        } catch {
+            guard watcherRevision == work.revision else { return }
+            eventReceiptFailed = true
+            needsReload = true
+            if errorMessage != error.localizedDescription { errorMessage = error.localizedDescription }
+        }
+        // Ignored events still advance the durable cursor, but do
+        // not read and republish an unchanged application snapshot.
+        if needsReload { poll() }
+    }
+
     private func restartWatcher() {
         watcher = nil
         watcherRevision &+= 1
+        eventIngress.activate(revision: watcherRevision)
         eventReceiptFailed = false
         let revision = watcherRevision
         // One event can resume the engine's entire durable queue, including a
@@ -870,49 +1095,14 @@ struct DiscoveryPresentation: Equatable {
         if cursor == 0 { pendingCursor = max(pendingCursor, FSEventsGetCurrentEventId()) }
         let roots = snapshot.roots.filter { diskAccessConfigured || $0.path != homePath }
         guard !roots.isEmpty else { return }
+        let ingress = eventIngress
         watcher = FolderWatcher(paths: roots.map(\.path), since: cursor == 0 ? pendingCursor : cursor, excluding: [directory.path]) { [weak self] events, last, historyLost in
+            // Enqueue synchronously on the producer queue, before scheduling
+            // anything on MainActor. Subsequent callbacks retain no new Task.
+            guard ingress.enqueue(FolderEventWork(batch: FolderEventBatch(events: events, last: last, historyLost: historyLost), revision: revision)) else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.invalidateDuplicateReport(paths: events.map(\.path), historyLost: historyLost)
-                let previous = self.eventTask
-                self.eventSubmissions += 1
-                self.eventTask = Task { @MainActor [weak self] in
-                    await previous?.value
-                    guard let self else { return }
-                    defer { self.eventSubmissions -= 1 }
-                    guard self.watcherRevision == revision, !self.restoringAccess,
-                          !(self.homeAuthorized && !self.diskAccessConfigured), let client = self.client else { return }
-                    var needsReload = false
-                    do {
-                        for root in self.snapshot.roots where self.diskAccessConfigured || root.path != self.homePath {
-                            let affected = events.filter { $0.path == root.path || $0.path.hasPrefix(root.path + "/") }
-                            if historyLost {
-                                _ = try await client.request(["action": "dirty", "root_id": root.id])
-                                needsReload = true
-                            } else {
-                                for start in stride(from: 0, to: affected.count, by: 512) {
-                                    let batch = affected[start..<min(start + 512, affected.count)].map(\.request)
-                                    let response = try await client.request(["action": "dirty", "root_id": root.id, "events": batch])
-                                    let acknowledgment = try EngineClient.decode(DirtyAcknowledgment.self, response)
-                                    needsReload = needsReload || acknowledgment.ignored != true
-                                }
-                            }
-                        }
-                        // Requests are journaled in order. A failed submission keeps
-                        // the earlier cursor so a relaunch can replay that history.
-                        if !self.eventReceiptFailed, last > self.cursor {
-                            _ = try await client.request(["action": "cursor", "value": last])
-                            self.cursor = last
-                        }
-                    } catch {
-                        self.eventReceiptFailed = true
-                        needsReload = true
-                        if self.errorMessage != error.localizedDescription { self.errorMessage = error.localizedDescription }
-                    }
-                    // Ignored events still advance the durable cursor, but do
-                    // not read and republish an unchanged application snapshot.
-                    if needsReload { self.poll() }
-                }
+                await self.drainEventIngress()
             }
         }
         if watcher?.isRunning != true { errorMessage = "Filesystem observation could not start. Use Scan again to refresh this folder." }
