@@ -44,8 +44,9 @@ mkdir -p "$(dirname "$app_output")"
 staging="$(mktemp -d "$(dirname "$app_output")/.chippytea-build.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 staged_app="$staging/chippytea.app"
-mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources" "$staged_app/Contents/Frameworks"
+mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Helpers" "$staged_app/Contents/Resources" "$staged_app/Contents/Frameworks"
 executables=()
+scan_helpers=()
 framework_source=""
 for arch in "${architectures[@]}"; do
     cargo_args=(build --release --locked)
@@ -62,6 +63,8 @@ for arch in "${architectures[@]}"; do
         rust_dir="$cargo_target_dir/$triple/release"
     fi
     cargo "${cargo_args[@]}"
+    cp "$rust_dir/chippytea-scan-helper" "$staging/chippytea-scan-helper-$arch"
+    scan_helpers+=("$staging/chippytea-scan-helper-$arch")
     CHIPPYTEA_RUST_LIB_DIR="$(cd "$rust_dir" && pwd)"
     export CHIPPYTEA_RUST_LIB_DIR
     swift_bin_dir="$(swift build "${swift_args[@]}" --show-bin-path)"
@@ -100,10 +103,12 @@ PY
 done
 if [[ "${#executables[@]}" -eq 1 ]]; then
     cp "${executables[0]}" "$staged_app/Contents/MacOS/chippytea"
+    cp "${scan_helpers[0]}" "$staged_app/Contents/Helpers/chippytea-scan-helper"
 else
     lipo -create "${executables[@]}" -output "$staged_app/Contents/MacOS/chippytea"
+    lipo -create "${scan_helpers[@]}" -output "$staged_app/Contents/Helpers/chippytea-scan-helper"
 fi
-chmod +x "$staged_app/Contents/MacOS/chippytea"
+chmod +x "$staged_app/Contents/MacOS/chippytea" "$staged_app/Contents/Helpers/chippytea-scan-helper"
 ditto "$framework_source" "$staged_app/Contents/Frameworks/Sparkle.framework"
 cp native/Info.plist "$staged_app/Contents/Info.plist"
 cp native/Assets/AppIcon.icns "$staged_app/Contents/Resources/AppIcon.icns"
