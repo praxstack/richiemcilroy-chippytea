@@ -1,7 +1,9 @@
 //! A single streaming worker classifies before descending, emits bounded batches,
 //! and leaves persistent indexing and candidate retention to the SQLite owner.
+use crate::activity::ActivitySnapshot;
 use crate::lock_facts::{BunLockCache, NpmLockCache};
 use crate::model::{Candidate, RULE_VERSION, Result, Root, ScanBatch, ScanStats};
+use crate::recommendations;
 use crate::refresh::RecentFileHints;
 pub use crate::safety::measure;
 use crate::safety::{
@@ -20,6 +22,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 const LARGE_FILE_BYTES: u64 = 100_000_000;
 const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BATCH: usize = 64;
@@ -27,7 +30,9 @@ const MAX_SHALLOW_FRONTIER: usize = 32;
 const MAX_DEFERRED_ARTIFACTS: usize = 256;
 const DAY_NS: i64 = 86_400_000_000_000;
 const DEVELOPER_QUIET_DAYS: i64 = 7;
+#[cfg(test)]
 const INSTALLER_QUIET_DAYS: i64 = 14;
+#[cfg(test)]
 const DOWNLOAD_QUIET_DAYS: i64 = 30;
 /// Mutation preparation may reuse an activity snapshot no older than this
 /// before its measurement; the final recheck always captures a fresh one.
@@ -1262,14 +1267,7 @@ fn unfinished_component(name: &OsStr) -> bool {
 }
 
 fn downloads_boundary(root: &Root) -> Option<PathBuf> {
-    match root.kind.as_str() {
-        "downloads" => Some(root.path.clone()),
-        "folder" if root.path.file_name() == Some(OsStr::new("Downloads")) => {
-            Some(root.path.clone())
-        }
-        "folder" | "home" => Some(root.path.join("Downloads")),
-        _ => None,
-    }
+    recommendations::downloads_boundary(root)
 }
 
 #[cfg(test)]
@@ -1287,19 +1285,13 @@ fn unfinished_download(boundary: Option<&Path>, path: &Path) -> bool {
     })
 }
 
-fn installer(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| {
-        extension.as_bytes().eq_ignore_ascii_case(b"dmg")
-            || extension.as_bytes().eq_ignore_ascii_case(b"pkg")
-    })
-}
-
 fn suggestion_reason(found: &Evidence, measured: &Measurement, now_ns: i64) -> Option<String> {
-    if measured.allocated_bytes < LARGE_FILE_BYTES {
-        return Some(
-            "Less than 100 MB is allocated locally; it is not a meaningful cleanup opportunity"
-                .into(),
-        );
+    let minimum = recommendations::minimum_bytes(found.kind);
+    if measured.allocated_bytes < minimum {
+        return Some(format!(
+            "Less than {} MB is allocated locally; it does not meet this category's size threshold",
+            minimum / 1_000_000
+        ));
     }
     let latest = measured.latest_modified_ns.max(found.latest_modified_ns);
     if !quiet_for(latest, now_ns, found.quiet_days) {
@@ -1309,6 +1301,64 @@ fn suggestion_reason(found: &Evidence, measured: &Measurement, now_ns: i64) -> O
         ));
     }
     None
+}
+
+fn everyday_evidence(path: &Path, meta: &EntryMeta, kind: &'static str) -> Option<Evidence> {
+    if meta.is_file() && meta.identity.size < recommendations::minimum_bytes(kind) {
+        return None;
+    }
+    let (explanation, consequence) = match kind {
+        "cache" => (
+            "An old cache in your authorized user Library/Caches location. Apps may regenerate or download this data again; it is not personal application-support data.",
+            "Close the owning app before moving this cache to Trash. Ownership cannot always be identified; an app can keep writing to files in Trash, and changes there can prevent automatic restore. The app may need network access or start more slowly. Keep offline data you still need. Trash does not free space or earn chips.",
+        ),
+        "log" => (
+            "An old, sizeable log file in your authorized user Library/Logs location. Logs can help diagnose a problem; age does not establish that they are no longer needed.",
+            "Review this log before moving it to Trash. Keep it if you are troubleshooting or need a diagnostic record. Trash does not free space or earn chips.",
+        ),
+        "crashreport" => (
+            "An old crash or diagnostic report in your authorized user Library/Logs/DiagnosticReports location. It may still be useful for support or troubleshooting.",
+            "Review the report before moving it to Trash. Keep reports needed by support. Trash does not free space or earn chips.",
+        ),
+        "xcode" => (
+            "Old Xcode-generated data in your authorized user Library/Developer/Xcode/DerivedData location. Archives, simulators, device support and project source are not included.",
+            "Close Xcode and build tools before moving this folder to Trash. Xcode must rebuild or reindex the affected project, and compiled products in this folder are removed. Trash does not free space or earn chips.",
+        ),
+        "installer" => (
+            "An old downloaded disk image or installer in your authorized Downloads location. Its age does not prove installation completed or that you no longer need it.",
+            "Review the installer before moving it to Trash. Keep it if you need to reinstall offline. Downloads never earn chips, and Trash does not free space.",
+        ),
+        "archive" => (
+            "An old downloaded archive or disk image in your authorized Downloads location. This scan does not assume it has been extracted or that another copy exists.",
+            "Check that you no longer need the archive before moving it to Trash. It may be your only copy. Downloads never earn chips, and Trash does not free space.",
+        ),
+        "largefile" => (
+            "A large, older document, media file or archive in an authorized personal-file scope. Size and modification time make it worth reviewing, not automatically disposable.",
+            "Open or preview this file and decide whether to keep it. Personal files are Trash-only, never earn chips, and are never permanently removed by chippytea.",
+        ),
+        "download" => (
+            "A large local download in your authorized Downloads location. Review its contents; age and size do not prove it is no longer needed.",
+            "Review the file before moving it to Trash. You can restore it while it remains in Trash. Personal files never earn chips.",
+        ),
+        _ => return None,
+    };
+    let name = path.file_name()?.to_string_lossy();
+    let title = match kind {
+        "cache" => format!("{name} cache"),
+        "xcode" => format!("{name} Xcode data"),
+        _ => name.into_owned(),
+    };
+    Some(Evidence {
+        kind,
+        title,
+        explanation,
+        consequence,
+        fingerprint: format!("{kind}-v{RULE_VERSION}"),
+        blocked: None,
+        latest_modified_ns: meta.identity.modified_ns,
+        quiet_days: recommendations::quiet_days(kind),
+        activity_root: recommendations::checks_activity(kind).then(|| path.to_path_buf()),
+    })
 }
 
 fn evidence(
@@ -1344,6 +1394,14 @@ fn evidence_with_downloads_cached(
     cancel: &AtomicBool,
     caches: Option<&mut EvidenceCaches>,
 ) -> Result<Option<Evidence>> {
+    if let Some(kind) = recommendations::library_candidate(root, path, meta.is_dir()) {
+        return Ok(everyday_evidence(path, meta, kind));
+    }
+    if recommendations::library_area(root, path).is_some() {
+        // Library containers are never developer projects and are not themselves
+        // cleanup units. Only the location-specific adapters above may classify.
+        return Ok(None);
+    }
     // Most traversed directories cannot be adapters. Reject them by their
     // final component before walking the parent and authorization prefixes.
     // Supported artifacts and Downloads still pass the scope check below.
@@ -1391,29 +1449,30 @@ fn evidence_with_downloads_cached(
             _ => Ok(None),
         }
     } else if meta.is_file()
-        && meta.identity.size >= LARGE_FILE_BYTES
         && downloads.is_some_and(|boundary| path.starts_with(boundary))
         && !unfinished_download(downloads, path)
     {
-        Ok(Some(Evidence {
-            kind: "download",
-            title: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            explanation: "A large local download in your authorized Downloads location. Review its contents; age and size do not prove it is no longer needed.",
-            consequence: "Review the file before moving it to Trash. You can restore it while it remains in Trash. Personal files never earn chips.",
-            fingerprint: format!("large-local-file-v{RULE_VERSION}"),
-            blocked: None,
-            latest_modified_ns: meta.identity.modified_ns,
-            quiet_days: if installer(path) {
-                INSTALLER_QUIET_DAYS
-            } else {
-                DOWNLOAD_QUIET_DAYS
-            },
-            activity_root: None,
-        }))
+        let kind = if recommendations::installer(path) {
+            "installer"
+        } else if recommendations::archive(path) {
+            "archive"
+        } else {
+            "download"
+        };
+        Ok(everyday_evidence(path, meta, kind))
+    } else if meta.is_file()
+        && meta.identity.size >= recommendations::minimum_bytes("largefile")
+        && recommendations::personal_scope(root, path)
+        && path
+            .file_name()
+            .is_some_and(recommendations::personal_file_name)
+        && !path
+            .strip_prefix(&root.path)
+            .unwrap()
+            .components()
+            .any(|part| unfinished_component(part.as_os_str()))
+    {
+        Ok(everyday_evidence(path, meta, "largefile"))
     } else {
         Ok(None)
     }
@@ -1589,11 +1648,12 @@ fn is_recent_local_file(meta: &EntryMeta, device: u64, cutoff: i64) -> bool {
 fn activity_reason(
     cached: &mut Option<(Instant, Result<ActivitySnapshot>)>,
     project: &Path,
+    kind: &str,
     cancel: &AtomicBool,
     max_age: Duration,
 ) -> Option<String> {
     match ActivitySnapshot::capture_with_max_age(cached, max_age, cancel) {
-        Ok(snapshot) => snapshot.blocked(project),
+        Ok(snapshot) => snapshot.blocked_for(kind, project, cancel),
         Err(reason) => Some(reason.clone()),
     }
 }
@@ -1671,11 +1731,87 @@ pub(crate) fn scan_with_options(
     scope: Option<&Path>,
     kept: &[PathBuf],
     cancel: &AtomicBool,
-    options: ScanOptions<'_>,
+    mut options: ScanOptions<'_>,
     checkpoint: impl Fn(),
-    publish: impl FnMut(ScanBatch),
+    mut publish: impl FnMut(ScanBatch),
 ) -> Result<ScanStats> {
-    ScanSession::new(options.mode).scan(
+    let mut session = ScanSession::new(options.mode);
+    let selected = scope.unwrap_or(&root.path);
+    if root.kind == "home"
+        && (selected == root.path || recommendations::library_corridor(root, selected))
+    {
+        safety::check_scope_policy(root, selected)?;
+        safety::validate_root(root)?;
+        let started = Instant::now();
+        let mut total = ScanStats::default();
+        let mut lanes: Vec<PathBuf> = recommendations::HOME_LIBRARY_ROUTES
+            .iter()
+            .map(|route| root.path.join(route))
+            .filter(|path| path.starts_with(selected))
+            .collect();
+        // Normal Home discovery still excludes Library before metadata. These
+        // three fixed, grant-anchored probes never enumerate other Library data.
+        // Reuse one session so hard-link accounting remains shared across lanes.
+        if selected == root.path {
+            lanes.push(root.path.clone());
+        }
+        for lane in lanes {
+            checkpoint();
+            if safety::cancelled(cancel).is_err() {
+                total.cancelled = true;
+                break;
+            }
+            if kept.iter().any(|path| lane.starts_with(path)) {
+                total.skipped += 1;
+                continue;
+            }
+            let scanned = session.scan(
+                root,
+                ScanScope {
+                    path: Some(&lane),
+                    expected: None,
+                    recent_files: options.recent_files.as_deref_mut(),
+                },
+                kept,
+                cancel,
+                &checkpoint,
+                |mut batch| {
+                    batch.stats = crate::combine_stats(&total, &batch.stats);
+                    batch.stats.complete = false;
+                    batch.stats.elapsed_ms = started.elapsed().as_millis() as u64;
+                    publish(batch);
+                },
+            );
+            match scanned {
+                Ok(stats) => total = crate::combine_stats(&total, &stats),
+                Err(_) if safety::cancelled(cancel).is_err() => total.cancelled = true,
+                Err(_) => {
+                    // One inaccessible targeted route must not hide useful
+                    // findings in the rest of the authorized Home folder.
+                    total.errors += 1;
+                }
+            }
+            total.elapsed_ms = started.elapsed().as_millis() as u64;
+            if total.cancelled {
+                break;
+            }
+        }
+        total.complete = !total.cancelled && total.errors == 0;
+        total.message = if total.cancelled {
+            "Scan cancelled; completed findings remain available."
+        } else if total.errors > 0 {
+            "Scan finished with inaccessible locations; completed findings are ready to review."
+        } else {
+            "Scan complete. Targeted cleanup and personal-file findings are ready to review."
+        }
+        .into();
+        publish(ScanBatch {
+            candidates: Vec::new(),
+            stats: total.clone(),
+        });
+        return Ok(total);
+    }
+    session.scan(
         root,
         ScanScope {
             path: scope,
@@ -1922,13 +2058,28 @@ impl ScanSession {
                 let Some(frame) = frontier.front_mut() else {
                     break;
                 };
-                let next_entry = if mode == ScanMode::Suggestions
-                    && !downloads
-                        .as_ref()
-                        .is_some_and(|path| frame.directory.path.starts_with(path))
+                let library = recommendations::library_area(root, &frame.directory.path);
+                let next_entry = if library.is_some()
+                    || (mode == ScanMode::Suggestions
+                        && !downloads
+                            .as_ref()
+                            .is_some_and(|path| frame.directory.path.starts_with(path)))
                 {
                     let home_children = root.kind == "home" && frame.directory.path == root.path;
-                    match frame.directory.next_discovery(cancel, home_children) {
+                    let step = if let Some((area, suffix)) = library {
+                        frame.directory.next_library_discovery(
+                            cancel,
+                            area == recommendations::LibraryArea::Caches
+                                && suffix.as_os_str().is_empty(),
+                        )
+                    } else if recommendations::personal_scope(root, &frame.directory.path) {
+                        frame
+                            .directory
+                            .next_personal_discovery(cancel, home_children)
+                    } else {
+                        frame.directory.next_discovery(cancel, home_children)
+                    };
+                    match step {
                         Ok(step) => {
                             stats.entries += step.files + step.skipped;
                             stats.files += step.files;
@@ -2018,6 +2169,8 @@ impl ScanSession {
                 || entry.meta.is_dataless()
                 || safety::excluded_home_media(root, &entry.path)
                 || safety::excluded_name(entry.path.file_name().unwrap_or_default(), is_dir)
+                || (recommendations::library_area(root, &entry.path).is_some()
+                    && !recommendations::library_route_allowed(root, &entry.path))
                 || (!is_dir && !entry.meta.is_file())
             {
                 stats.skipped += 1;
@@ -2110,13 +2263,17 @@ impl ScanSession {
                             found.quiet_days,
                         );
                         let mut blocked = found.blocked.clone();
-                        if found.kind != "download" && blocked.is_none() && quiet {
+                        if recommendations::checks_activity(found.kind)
+                            && blocked.is_none()
+                            && quiet
+                        {
                             blocked = activity_reason(
                                 &mut activity,
                                 found
                                     .activity_root
                                     .as_deref()
                                     .unwrap_or_else(|| entry.path.parent().unwrap()),
+                                found.kind,
                                 cancel,
                                 SCAN_ACTIVITY_MAX_AGE,
                             );
@@ -2142,7 +2299,7 @@ impl ScanSession {
                             publisher.queue(candidate, &stats, false);
                             continue;
                         }
-                    } else if found.kind != "download" && (!early_quiet || blocked.is_some()) {
+                    } else if is_dir && (!early_quiet || blocked.is_some()) {
                         if mode == ScanMode::Suggestions {
                             stats.skipped += 1;
                             stats.excluded_artifacts += 1;
@@ -2170,7 +2327,7 @@ impl ScanSession {
                     }
                     if mode == ScanMode::Suggestions
                         && !was_deferred
-                        && found.kind != "download"
+                        && is_dir
                         && early_quiet
                         && blocked.is_none()
                         && let Some(path) = scope
@@ -2222,7 +2379,7 @@ impl ScanSession {
                     let cutoff = clock_ns().saturating_sub(found.quiet_days.saturating_mul(DAY_NS));
                     let can_learn = mode == ScanMode::Suggestions
                         && !was_deferred
-                        && found.kind != "download"
+                        && is_dir
                         && early_quiet
                         && blocked.is_none()
                         && scope.recent_files.is_some();
@@ -2254,10 +2411,10 @@ impl ScanSession {
                             checkpoint();
                         }
                     };
-                    let policy = if found.kind == "download" {
-                        MeasurementPolicy::Strict
-                    } else {
+                    let policy = if recommendations::developer_measurement(found.kind) {
                         MeasurementPolicy::Developer
+                    } else {
+                        MeasurementPolicy::Strict
                     };
                     let measured = if mode == ScanMode::Suggestions
                         && !was_deferred
@@ -2321,19 +2478,29 @@ impl ScanSession {
                             }
                         }
                     }
-                    if found.kind != "download" && blocked.is_none() && quality_reason.is_none() {
+                    if recommendations::checks_git(found.kind)
+                        && blocked.is_none()
+                        && quality_reason.is_none()
+                    {
                         let project = entry.path.parent().unwrap();
                         if let Err(reason) = git_untracked(root, project, &entry.path, cancel) {
                             blocked = Some(reason);
                         }
-                        if blocked.is_none() {
-                            blocked = activity_reason(
-                                &mut activity,
-                                found.activity_root.as_deref().unwrap_or(project),
-                                cancel,
-                                SCAN_ACTIVITY_MAX_AGE,
-                            );
-                        }
+                    }
+                    if recommendations::checks_activity(found.kind)
+                        && blocked.is_none()
+                        && quality_reason.is_none()
+                    {
+                        blocked = activity_reason(
+                            &mut activity,
+                            found
+                                .activity_root
+                                .as_deref()
+                                .unwrap_or_else(|| entry.path.parent().unwrap()),
+                            found.kind,
+                            cancel,
+                            SCAN_ACTIVITY_MAX_AGE,
+                        );
                     }
                     // Manifest changes during a long measurement invalidate the
                     // row. The identity-keyed cache serves unchanged files
@@ -2366,15 +2533,15 @@ impl ScanSession {
                     candidate.suggestion_eligible = candidate.blocked_reason.is_none()
                         && quality_reason.is_none()
                         && !stats.cancelled;
-                    candidate.eligible_permanent =
-                        found.kind != "download" && candidate.suggestion_eligible;
+                    candidate.eligible_permanent = recommendations::permanent_kind(found.kind)
+                        && candidate.suggestion_eligible;
                     stats.elapsed_ms = started.elapsed().as_millis() as u64;
                     let first_finding =
                         candidate.suggestion_eligible && stats.first_finding_ms.is_none();
                     if candidate.suggestion_eligible {
                         stats.candidates += 1;
                         stats.first_finding_ms.get_or_insert(stats.elapsed_ms);
-                        candidate.explanation.push_str(&format!(" At least 100 MB is allocated locally. The {} have been unmodified for at least {} days.", if found.kind == "download" { "file contents" } else { "artifact contents and ownership files" }, found.quiet_days));
+                        candidate.explanation.push_str(&format!(" At least {} MB is allocated locally. The {} have been unmodified for at least {} days.", recommendations::minimum_bytes(found.kind) / 1_000_000, if is_dir { "contents and identification files" } else { "file contents" }, found.quiet_days));
                     } else {
                         stats.skipped += 1;
                         if let Some(reason) = quality_reason {
@@ -2524,28 +2691,33 @@ pub(crate) fn revalidate_observing(
     if let Some(reason) = &current.blocked {
         return Err(reason.clone());
     }
+    if candidate.eligible_permanent && !recommendations::permanent_kind(current.kind) {
+        return Err(
+            "This category is review and Trash-only; permanent cleanup is not allowed".into(),
+        );
+    }
     let mut activity = None;
-    let git_evidence = if current.kind != "download" {
-        let project = candidate.path.parent().unwrap();
-        let git = git_untracked(root, project, &candidate.path, cancel)?;
-        if let Some(reason) = activity_reason(
-            &mut activity,
-            current.activity_root.as_deref().unwrap_or(project),
-            cancel,
-            ACTIVITY_MAX_AGE,
-        ) {
-            return Err(reason);
-        }
-        git
-    } else if candidate.eligible_permanent {
-        return Err("Personal files cannot be permanently cleaned by chippytea".into());
+    let project = candidate.path.parent().unwrap();
+    let git_evidence = if recommendations::checks_git(current.kind) {
+        git_untracked(root, project, &candidate.path, cancel)?
     } else {
         None
     };
-    let policy = if current.kind == "download" {
-        MeasurementPolicy::Strict
-    } else {
+    if recommendations::checks_activity(current.kind)
+        && let Some(reason) = activity_reason(
+            &mut activity,
+            current.activity_root.as_deref().unwrap_or(project),
+            current.kind,
+            cancel,
+            ACTIVITY_MAX_AGE,
+        )
+    {
+        return Err(reason);
+    }
+    let policy = if recommendations::developer_measurement(current.kind) {
         MeasurementPolicy::Developer
+    } else {
+        MeasurementPolicy::Strict
     };
     let measured = safety::measure_try_observing_with_policy(
         &candidate.path,
@@ -2596,9 +2768,12 @@ pub(crate) fn revalidate_observing(
     }
     // Processes started during the potentially long measurement must be seen:
     // the final gate always captures fresh and never reuses an aged snapshot.
-    if current.kind != "download"
-        && let Some(reason) = ActivitySnapshot::capture(cancel)?
-            .blocked(latest.activity_root.as_deref().unwrap_or(project))
+    if recommendations::checks_activity(current.kind)
+        && let Some(reason) = ActivitySnapshot::capture(cancel)?.blocked_for(
+            current.kind,
+            latest.activity_root.as_deref().unwrap_or(project),
+            cancel,
+        )
     {
         return Err(reason);
     }
@@ -2620,7 +2795,7 @@ pub(crate) fn revalidate_observing(
             }
         }
         git.unchanged(root, cancel)?;
-    } else if current.kind != "download"
+    } else if recommendations::checks_git(current.kind)
         && git_untracked(
             root,
             candidate.path.parent().unwrap(),
@@ -3252,134 +3427,6 @@ fn git_untracked(
     result?;
     repository.unchanged(root, cancel)?;
     Ok(Some(repository))
-}
-
-struct ActivitySnapshot {
-    working_directories: Vec<PathBuf>,
-    executable_paths: Vec<PathBuf>,
-}
-impl ActivitySnapshot {
-    #[cfg(target_os = "macos")]
-    fn capture(cancel: &AtomicBool) -> Result<Self> {
-        // Query only this account. Kernel/system services that cannot be inspected
-        // are outside the per-user build activity signal, rather than silently
-        // treated as known idle processes.
-        let mut pids = [0i32; 4096];
-        let bytes = unsafe {
-            libc::proc_listpids(
-                4,
-                libc::geteuid(),
-                pids.as_mut_ptr().cast(),
-                std::mem::size_of_val(&pids) as i32,
-            )
-        };
-        if bytes <= 0 || bytes as usize >= std::mem::size_of_val(&pids) {
-            return Err("Running-project activity could not be completely checked".into());
-        }
-        let mut working_directories = Vec::new();
-        let mut executable_paths = Vec::new();
-        for pid in pids
-            .into_iter()
-            .take(bytes as usize / std::mem::size_of::<i32>())
-        {
-            safety::cancelled(cancel)?;
-            if pid <= 0 {
-                continue;
-            }
-            let mut executable = [0u8; 4096];
-            let length = unsafe {
-                libc::proc_pidpath(pid, executable.as_mut_ptr().cast(), executable.len() as u32)
-            };
-            if length <= 0 {
-                // proc_listpids includes unreaped zombies. Their pid can still
-                // satisfy kill(pid, 0), while libproc reports ESRCH because they
-                // have no running executable or working directory.
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(
-                    "A running executable could not be identified; cleanup is withheld".into(),
-                );
-            }
-            let length = executable
-                .iter()
-                .position(|byte| *byte == 0)
-                .ok_or("A running executable path was truncated")?;
-            executable_paths.push(PathBuf::from(OsStr::from_bytes(&executable[..length])));
-            // The scanner's cwd alone is not development activity, but its
-            // executable still must not be removed from a live build directory.
-            if pid == std::process::id() as i32 {
-                continue;
-            }
-            let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-            let read = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDVNODEPATHINFO,
-                    0,
-                    (&mut info as *mut libc::proc_vnodepathinfo).cast(),
-                    std::mem::size_of_val(&info) as i32,
-                )
-            };
-            if read != std::mem::size_of_val(&info) as i32 {
-                // A process that exited during enumeration has no ongoing cwd.
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(
-                    "A running process's project activity is unavailable; cleanup is withheld"
-                        .into(),
-                );
-            }
-            let path_storage = &info.pvi_cdir.vip_path;
-            let raw = unsafe {
-                std::slice::from_raw_parts(
-                    path_storage.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(path_storage),
-                )
-            };
-            let length = raw
-                .iter()
-                .position(|byte| *byte == 0)
-                .ok_or("A process working directory was truncated")?;
-            if length == 0 {
-                return Err("A process working directory could not be identified".into());
-            }
-            let path = PathBuf::from(OsStr::from_bytes(&raw[..length]));
-            if !path.is_absolute() {
-                return Err("A process working directory is ambiguous".into());
-            }
-            working_directories.push(path);
-        }
-        Ok(Self {
-            working_directories,
-            executable_paths,
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    fn capture(_cancel: &AtomicBool) -> Result<Self> {
-        Err("Reliable activity checks are supported only by the native macOS engine".into())
-    }
-    /// Reuse one bounded-age snapshot across nearby gates. A failed capture is
-    /// cached too: an unreadable process table stays an exclusion, never
-    /// silently retried into apparent idleness within the same window.
-    fn capture_with_max_age<'a>(
-        cached: &'a mut Option<(Instant, Result<Self>)>,
-        max_age: Duration,
-        cancel: &AtomicBool,
-    ) -> &'a Result<Self> {
-        if cached
-            .as_ref()
-            .is_none_or(|(captured, _)| captured.elapsed() >= max_age)
-        {
-            *cached = Some((Instant::now(), Self::capture(cancel)));
-        }
-        &cached.as_ref().unwrap().1
-    }
-    fn blocked(&self, project: &Path) -> Option<String> {
-        self.working_directories.iter().chain(&self.executable_paths).any(|directory| directory.starts_with(project))
-            .then(|| "A running process uses this project or one of its compiled applications; close its build, install, server, app, or terminal before cleanup".into())
-    }
 }
 
 #[cfg(test)]
@@ -4431,7 +4478,7 @@ mod tests {
         let file = std::fs::File::create(project.join("review.dmg")).unwrap();
         file.set_len(LARGE_FILE_BYTES).unwrap();
         let (_, rows) = candidates(&root);
-        let download = rows.iter().find(|row| row.kind == "download").unwrap();
+        let download = rows.iter().find(|row| row.kind == "installer").unwrap();
         assert!(!download.eligible_permanent);
         assert!(download.consequence.contains("never earn chips"));
     }
@@ -6185,6 +6232,7 @@ mod tests {
             executable_paths: vec![PathBuf::from(
                 "/Users/developer/projects/running/target/debug/app",
             )],
+            running_app_bundle_ids: Default::default(),
         };
         assert!(
             snapshot
@@ -6323,6 +6371,35 @@ mod tests {
             assert!(suggestion_reason(&found, &measured, now).is_none());
             measured.latest_modified_ns += 1;
             assert!(suggestion_reason(&found, &measured, now).is_some());
+        }
+        for kind in [
+            "cache",
+            "log",
+            "crashreport",
+            "xcode",
+            "installer",
+            "archive",
+            "largefile",
+        ] {
+            let days = recommendations::quiet_days(kind);
+            let found = policy_evidence(kind, days);
+            measured.allocated_bytes = recommendations::minimum_bytes(kind);
+            measured.latest_modified_ns = now - days * DAY_NS;
+            assert!(
+                suggestion_reason(&found, &measured, now).is_none(),
+                "{kind}"
+            );
+            measured.allocated_bytes -= 1;
+            assert!(
+                suggestion_reason(&found, &measured, now).is_some(),
+                "{kind}"
+            );
+            measured.allocated_bytes += 1;
+            measured.latest_modified_ns += 1;
+            assert!(
+                suggestion_reason(&found, &measured, now).is_some(),
+                "{kind}"
+            );
         }
     }
 
@@ -6633,9 +6710,42 @@ mod tests {
     }
 
     #[test]
-    fn personal_files_outside_downloads_and_unfinished_downloads_are_not_suggestions() {
-        let (_temp, mut root, project) = fixture();
+    fn a_downloads_child_in_a_generic_folder_keeps_personal_file_rules() {
+        let (_temp, mut root, _) = fixture();
         root.kind = "folder".into();
+        let downloads = root.path.join("Downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        for (name, size, folder_kind, home_kind) in [
+            ("data.bin", 100_000_000, None, "download"),
+            ("archive.zip", 50_000_000, None, "archive"),
+            ("recording.MOV", 500_000_000, Some("largefile"), "download"),
+        ] {
+            let path = downloads.join(name);
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            let meta = safety::metadata(&path).unwrap();
+            root.kind = "folder".into();
+            assert_eq!(
+                evidence(&root, &path, &meta, &AtomicBool::new(false))
+                    .unwrap()
+                    .map(|e| e.kind),
+                folder_kind
+            );
+            assert!(!in_downloads(&root, &path));
+            root.kind = "home".into();
+            assert_eq!(
+                evidence(&root, &path, &meta, &AtomicBool::new(false))
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                home_kind
+            );
+        }
+    }
+
+    #[test]
+    fn small_personal_files_and_unfinished_downloads_are_not_suggestions() {
+        let (_temp, mut root, project) = fixture();
+        root.kind = "home".into();
         let documents = root.path.join("Documents");
         let downloads = root.path.join("Downloads");
         std::fs::create_dir(&documents).unwrap();
@@ -6652,8 +6762,20 @@ mod tests {
                 .set_len(LARGE_FILE_BYTES)
                 .unwrap();
         }
+        for (name, bytes) in [
+            ("below-floor.pdf", 499_999_999),
+            ("at-floor.pdf", 500_000_000),
+        ] {
+            std::fs::File::create(documents.join(name))
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
         let (stats, rows) = candidates(&root);
-        let downloads_rows: Vec<_> = rows.iter().filter(|row| row.kind == "download").collect();
+        let personal_rows: Vec<_> = rows.iter().filter(|row| row.kind == "largefile").collect();
+        assert_eq!(personal_rows.len(), 1);
+        assert_eq!(personal_rows[0].path, documents.join("at-floor.pdf"));
+        let downloads_rows: Vec<_> = rows.iter().filter(|row| row.kind == "installer").collect();
         assert_eq!(downloads_rows.len(), 1);
         assert_eq!(downloads_rows[0].path, downloads.join("review.dmg"));
         assert!(
@@ -6713,7 +6835,7 @@ mod tests {
             .expect("A project named Music must remain discoverable");
         assert!(
             rows.iter()
-                .any(|row| row.path == download && row.kind == "download")
+                .any(|row| row.path == download && row.kind == "installer")
         );
         let mut stale = artifact.clone();
         stale.path = root.path.join("Music/node_modules");

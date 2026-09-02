@@ -85,7 +85,7 @@ struct DiskAccessView: View {
             title("Let chippytea have a look round.", seed: 703)
             copy("To look through your home folder, macOS asks you to switch on Full Disk Access once. It’s quick: open Settings, drag chippytea in, switch it on.")
             VStack(alignment: .leading, spacing: 6) {
-                dashed("Finds old build folders, dependencies and big downloads.", seed: 771)
+                dashed("Finds old caches, logs, build files, downloads and large personal files.", seed: 771)
                 dashed("Leaves photo and music libraries alone.", seed: 773)
                 dashed("Removes nothing without your review.", seed: 775)
             }

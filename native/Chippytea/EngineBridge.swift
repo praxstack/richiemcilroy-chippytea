@@ -54,6 +54,15 @@ final class EngineClient: @unchecked Sendable {
             queue.async { do { continuation.resume(returning: try self.requestSync(request)) } catch { continuation.resume(throwing: error) } }
         }
     }
+    /// Submit directly to one serial control queue to preserve lifecycle order
+    /// without waiting behind a long content check on the ordinary work queue.
+    func setInteractive(_ active: Bool) {
+        progressQueue.async {
+            // This is advisory: a rejected hint must not become a cleanup
+            // failure or enter the snapshot response decoder.
+            _ = try? self.requestSync(["action": "set_interactive", "active": active])
+        }
+    }
     /// Scan progress uses this frequently. Decode changed responses on the
     /// engine queue before returning to the main actor.
     func snapshot() async throws -> EngineSnapshot {
@@ -99,6 +108,28 @@ final class EngineClient: @unchecked Sendable {
                 do {
                     let data = try self.requestSync(["action": "cleanup_progress"])
                     continuation.resume(returning: try Self.decode(CleanupProgress?.self, data))
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+    func duplicateProgress() async throws -> DuplicateCheckProgress? {
+        try await withCheckedThrowingContinuation { continuation in
+            progressQueue.async {
+                do {
+                    let data = try self.requestSync(["action": "duplicate_progress"])
+                    continuation.resume(returning: try Self.decode(DuplicateCheckProgress?.self, data))
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+    /// Bypass the work queue so a long comparison can be stopped without
+    /// cancelling ordinary discovery or other prepared cleanup reviews.
+    func cancelDuplicates() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            progressQueue.async {
+                do {
+                    _ = try self.requestSync(["action": "cancel_duplicates"])
+                    continuation.resume()
                 } catch { continuation.resume(throwing: error) }
             }
         }
@@ -228,6 +259,16 @@ struct DiscoveryPresentation: Equatable {
     @Published var selection = Set<String>()
     @Published var destination = Destination.coins
     @Published var showReview = false
+    @Published var showDuplicates = false
+    @Published private(set) var duplicateReport: DuplicateReport?
+    @Published private(set) var duplicateProgress: DuplicateCheckProgress?
+    @Published private(set) var duplicateChecking = false
+    @Published private(set) var duplicateChoice: DuplicateCleanupChoice?
+    private var duplicateReportReceivedAt: TimeInterval?
+    private var duplicateCancellationRequested = false
+    private var duplicateCancellationTask: Task<Void, Never>?
+    private var duplicateEventsDuringCheck: [String] = []
+    private var duplicateHistoryLostDuringCheck = false
     @Published var showDiskAccess = false
     @Published var diskAccessPhase = DiskAccessPhase.intro
     @Published var diskAccessMessage: String?
@@ -436,6 +477,152 @@ struct DiscoveryPresentation: Equatable {
         return snapshot.candidates.filter { !cleanupCandidateIDs.contains($0.id) }
     }
 
+    var duplicateReviewIsCurrent: Bool {
+        guard let choice = duplicateChoice, let report = duplicateReport,
+              let received = duplicateReportReceivedAt,
+              ProcessInfo.processInfo.systemUptime - received < Double(min(report.expiresInSeconds, 120)),
+              choice.reportToken == report.token, reviewItems.count == 1,
+              reviewItems[0].id == choice.copyID,
+              let group = report.groups.first(where: { $0.id == choice.groupID }),
+              group.files.contains(where: { $0.id == choice.copyID && !$0.keeperOnly && $0.candidate == reviewItems[0] }),
+              group.files.contains(where: { $0.id == choice.keeperID && $0.candidate == choice.keeper }),
+              snapshot.roots.contains(where: { $0.id == choice.keeper.rootId }),
+              snapshot.roots.contains(where: { $0.id == reviewItems[0].rootId }) else { return false }
+        return !report.progress.cancelled && choice.copyID != choice.keeperID
+    }
+
+    func openDuplicates() {
+        guard !busy, !hasCleanupWork, !snapshot.scanning else { return }
+        showDuplicates = true
+        destination = .discover
+    }
+
+    func closeDuplicates() {
+        guard !duplicateChecking else { return }
+        showDuplicates = false
+        duplicateChoice = nil
+    }
+
+    func checkDuplicates() {
+        guard let client, !busy, !hasCleanupWork, !snapshot.scanning else { return }
+        busy = true
+        duplicateChecking = true
+        duplicateCancellationRequested = false
+        duplicateEventsDuringCheck = []
+        duplicateHistoryLostDuringCheck = false
+        duplicateReport = nil
+        duplicateChoice = nil
+        duplicateReportReceivedAt = nil
+        duplicateProgress = nil
+        errorMessage = nil
+        Task {
+            let progressTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    do {
+                        let progress = try await client.duplicateProgress()
+                        guard !Task.isCancelled, let self, self.duplicateChecking else { return }
+                        if let progress, self.duplicateProgress != progress { self.duplicateProgress = progress }
+                    } catch { if Task.isCancelled { return } }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
+            do {
+                let report = try EngineClient.decode(DuplicateReport.self,
+                    await client.request(["action": "check_duplicates"]))
+                duplicateProgress = report.progress
+                if duplicateCancellationRequested {
+                    errorMessage = "Duplicate check cancelled. No files were changed."
+                } else if duplicateHistoryLostDuringCheck || duplicateEventsDuringCheck.contains(where: { event in
+                    report.groups.contains { group in group.files.contains { file in Self.pathsOverlap(event, file.candidate.path) } }
+                }) {
+                    errorMessage = "Files changed during this check. Check again before reviewing a copy."
+                } else {
+                    duplicateReport = report
+                    duplicateReportReceivedAt = ProcessInfo.processInfo.systemUptime
+                }
+            } catch {
+                errorMessage = duplicateCancellationRequested
+                    ? "Duplicate check cancelled. No files were changed."
+                    : error.localizedDescription
+            }
+            progressTask.cancel()
+            // A queued cancellation belongs to this check. Do not admit Check
+            // again until its independent queue has acknowledged it.
+            await duplicateCancellationTask?.value
+            duplicateCancellationTask = nil
+            duplicateChecking = false
+            duplicateEventsDuringCheck = []
+            busy = false
+            await reload()
+            poll()
+        }
+    }
+
+    func reviewDuplicate(report: DuplicateReport, groupID: String, keeperID: String, copyID: String) {
+        guard canEnqueueCleanup, !hasCleanupWork, duplicateReport?.token == report.token,
+              !report.progress.cancelled, keeperID != copyID,
+              let group = report.groups.first(where: { $0.id == groupID }),
+              let keeper = group.files.first(where: { $0.id == keeperID }),
+              let copy = group.files.first(where: { $0.id == copyID && !$0.keeperOnly }),
+              keeper.candidate.isPersonalFile, copy.candidate.isPersonalFile,
+              copy.candidate.canReviewCleanup else { return }
+        duplicateChoice = DuplicateCleanupChoice(reportToken: report.token, groupID: groupID,
+            keeperID: keeperID, copyID: copyID, keeper: keeper.candidate)
+        reviewItems = [copy.candidate]
+        guard duplicateReviewIsCurrent else {
+            duplicateChoice = nil
+            reviewItems = []
+            duplicateReport = nil
+            errorMessage = "This duplicate report expired or changed. Check files again."
+            return
+        }
+        selection = []
+        showReview = true
+    }
+
+    private static func pathsOverlap(_ left: String, _ right: String) -> Bool {
+        left == right || left.hasPrefix(right + "/") || right.hasPrefix(left + "/")
+    }
+
+    private func invalidateDuplicateReport(paths: [String], historyLost: Bool) {
+        if duplicateChecking {
+            if historyLost || paths.count > 512 - duplicateEventsDuringCheck.count {
+                duplicateHistoryLostDuringCheck = true
+            } else {
+                duplicateEventsDuringCheck.append(contentsOf: paths)
+            }
+        }
+        guard let report = duplicateReport else { return }
+        if historyLost || paths.contains(where: { event in
+            report.groups.contains { group in group.files.contains { file in Self.pathsOverlap(event, file.candidate.path) } }
+        }) {
+            duplicateReport = nil
+            duplicateReportReceivedAt = nil
+        }
+    }
+
+    private func reconcileDuplicateReport(with current: EngineSnapshot) {
+        guard let report = duplicateReport else { return }
+        let files = report.groups.flatMap(\.files).map(\.candidate)
+        let rootIDs = Set(files.map(\.rootId))
+        let rootsChanged = snapshot.roots.filter { rootIDs.contains($0.id) }
+            != current.roots.filter { rootIDs.contains($0.id) }
+        let keptChanged = snapshot.keptPaths != current.keptPaths && files.contains { file in
+            let before = snapshot.keptPaths.contains { Self.pathsOverlap($0, file.path) }
+            let after = current.keptPaths.contains { Self.pathsOverlap($0, file.path) }
+            return before != after
+        }
+        // Reports may include indexed rows beyond the ordinary 500-row page.
+        // Missing rows alone are not evidence of deletion; validate any rows
+        // which are visible, and retain the backend's exact final checks.
+        let visible = Dictionary(uniqueKeysWithValues: current.candidates.map { ($0.id, $0) })
+        let changed = files.contains { file in visible[file.id].map { $0 != file } ?? false }
+        if rootsChanged || keptChanged || changed {
+            duplicateReport = nil
+            duplicateReportReceivedAt = nil
+        }
+    }
+
     func start() async {
         guard client == nil, !busy else { return }
         // Restore access before accepting grant changes or starting filesystem
@@ -447,6 +634,8 @@ struct DiscoveryPresentation: Equatable {
         do {
             let directory = directory
             client = try await Task.detached(priority: .utility) { try EngineClient(database: directory.appendingPathComponent("library.sqlite")) }.value
+            // Visibility may have changed while the client was being created.
+            client?.setInteractive(visible)
             let accessRecord = await Task.detached(priority: .utility) {
                 guard let data = try? Data(contentsOf: directory.appendingPathComponent("disk-access.json")) else { return DiskAccessSetupRecord?.none }
                 return try? JSONDecoder().decode(DiskAccessSetupRecord.self, from: data)
@@ -557,6 +746,7 @@ struct DiscoveryPresentation: Equatable {
                 snapshotReadObservationID = requestID
                 lastObservedSnapshotReadError = nil
             }
+            reconcileDuplicateReport(with: current)
             if current != snapshot { snapshot = current }
             var presentation = discoveryPresentation
             if let boundary = acceptedScanSnapshotBoundary, requestID > boundary {
@@ -571,7 +761,7 @@ struct DiscoveryPresentation: Equatable {
                 presentation.update(current)
             }
             if presentation != discoveryPresentation { discoveryPresentation = presentation }
-            let retainedSelection = selection.intersection(current.candidates.lazy.filter { $0.blockedReason == nil }.map(\.id))
+            let retainedSelection = selection.intersection(current.candidates.lazy.filter(\.canReviewCleanup).map(\.id))
             if retainedSelection != selection { selection = retainedSelection }
             if let expanded = expandedSuggestion, !current.candidates.contains(where: { $0.id == expanded }) { expandedSuggestion = nil }
             if !presentation.isRequestPending && current.error != lastObservedEngineError {
@@ -683,6 +873,7 @@ struct DiscoveryPresentation: Equatable {
         watcher = FolderWatcher(paths: roots.map(\.path), since: cursor == 0 ? pendingCursor : cursor, excluding: [directory.path]) { [weak self] events, last, historyLost in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.invalidateDuplicateReport(paths: events.map(\.path), historyLost: historyLost)
                 let previous = self.eventTask
                 self.eventSubmissions += 1
                 self.eventTask = Task { @MainActor [weak self] in
@@ -1007,6 +1198,16 @@ struct DiscoveryPresentation: Equatable {
         }
     }
     func cancel() {
+        if duplicateChecking {
+            guard !duplicateCancellationRequested else { return }
+            duplicateCancellationRequested = true
+            duplicateReport = nil
+            duplicateCancellationTask = Task {
+                do { try await client?.cancelDuplicates() }
+                catch { errorMessage = error.localizedDescription }
+            }
+            return
+        }
         if activeCleanup != nil || !queuedCleanups.isEmpty {
             cleanupCancellationRequested = true
             queuedCleanups.removeAll(keepingCapacity: true)
@@ -1019,7 +1220,8 @@ struct DiscoveryPresentation: Equatable {
     /// A stored confirmation preference must never turn inspection into deletion.
     func reviewSelection() {
         guard canEnqueueCleanup else { return }
-        reviewItems = displayedCandidates.filter { selection.contains($0.id) && $0.blockedReason == nil }
+        duplicateChoice = nil
+        reviewItems = displayedCandidates.filter { selection.contains($0.id) && $0.canReviewCleanup }
         showReview = !reviewItems.isEmpty
     }
     func reviewOne(_ candidate: Candidate) {
@@ -1030,9 +1232,10 @@ struct DiscoveryPresentation: Equatable {
     /// Only a deliberate cleanup action may use the remembered opt-out.
     func requestCleanupSelection() {
         guard canEnqueueCleanup else { return }
-        reviewItems = displayedCandidates.filter { selection.contains($0.id) && $0.blockedReason == nil }
+        duplicateChoice = nil
+        reviewItems = displayedCandidates.filter { selection.contains($0.id) && $0.canReviewCleanup }
         guard !reviewItems.isEmpty else { showReview = false; return }
-        if !confirmBeforeDeleting && reviewItems.allSatisfy(\.eligiblePermanent) {
+        if !confirmBeforeDeleting && reviewItems.allSatisfy(\.canDeletePermanently) {
             clean(permanently: true)
         } else {
             showReview = true
@@ -1045,11 +1248,20 @@ struct DiscoveryPresentation: Equatable {
     }
     func clean(permanently: Bool) {
         guard canEnqueueCleanup, !reviewItems.isEmpty, reviewItems.count <= 100 else { return }
+        guard reviewItems.allSatisfy({ permanently ? $0.canDeletePermanently : $0.canReviewCleanup }) else { return }
         let reviewedItems = reviewItems
+        if duplicateChoice != nil && (permanently || !duplicateReviewIsCurrent) { return }
         guard !cleanupOverlapsReservation(reviewedItems) else { return }
+        if let keeper = duplicateChoice?.keeper {
+            let requests = queuedCleanups + (activeCleanup.map { [$0] } ?? [])
+            guard !requests.contains(where: { request in request.items.contains { item in
+                Self.pathsOverlap(item.path, keeper.path)
+                    || (item.identity.device == keeper.identity.device && item.identity.inode == keeper.identity.inode)
+            } }) else { return }
+        }
         let from = max(displayedCoinBalance, confirmedEarnedCoins)
         if activeCleanup == nil && queuedCleanups.isEmpty { cleanupCancellationRequested = false }
-        queuedCleanups.append(CleanupRequest(items: reviewedItems, permanently: permanently))
+        queuedCleanups.append(CleanupRequest(items: reviewedItems, permanently: permanently, duplicate: duplicateChoice))
         refreshCleanupReservations()
         let estimate = makeCleanupEstimate()
         pendingCleanupEstimate = estimate
@@ -1063,6 +1275,10 @@ struct DiscoveryPresentation: Equatable {
         reviewItems = []
         expandedSuggestion = nil
         showReview = false
+        showDuplicates = false
+        duplicateChoice = nil
+        duplicateReport = nil
+        duplicateReportReceivedAt = nil
         destination = .coins
         startNextCleanupIfPossible()
         // Adding work can also request one retry of an unresolved final read.
@@ -1083,6 +1299,10 @@ struct DiscoveryPresentation: Equatable {
                 || queuedCleanups.contains(where: { $0.items.contains(where: { overlaps(item, $0) }) }) {
                 return true
             }
+            if activeCleanup?.duplicate.map({ overlaps(item, $0.keeper) }) == true
+                || queuedCleanups.contains(where: { $0.duplicate.map { overlaps(item, $0.keeper) } == true }) {
+                return true
+            }
         }
         return false
     }
@@ -1091,6 +1311,10 @@ struct DiscoveryPresentation: Equatable {
         var reserved = Set<String>()
         if let activeCleanup { reserved.formUnion(activeCleanup.items.map(\.id)) }
         for request in queuedCleanups { reserved.formUnion(request.items.map(\.id)) }
+        if let keeper = activeCleanup?.duplicate?.keeper { reserved.insert(keeper.id) }
+        for request in queuedCleanups {
+            if let keeper = request.duplicate?.keeper { reserved.insert(keeper.id) }
+        }
         if reserved != cleanupCandidateIDs { cleanupCandidateIDs = reserved }
         if queuedCleanupCount != queuedCleanups.count { queuedCleanupCount = queuedCleanups.count }
     }
@@ -1130,9 +1354,18 @@ struct DiscoveryPresentation: Equatable {
         startCleanupProgress(client)
         Task {
             do {
-                let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-                let items = try JSONSerialization.jsonObject(with: encoder.encode(request.items))
-                let data = try await client.request(["action": "prepare", "operation": request.permanently ? "permanent" : "trash", "items": items])
+                let data: Data
+                if let duplicate = request.duplicate {
+                    guard !request.permanently, request.items.count == 1,
+                          request.items[0].id == duplicate.copyID else {
+                        throw EngineError.message("The duplicate review no longer matches this cleanup.")
+                    }
+                    data = try await client.request(duplicate.prepareRequest)
+                } else {
+                    let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+                    let items = try JSONSerialization.jsonObject(with: encoder.encode(request.items))
+                    data = try await client.request(["action": "prepare", "operation": request.permanently ? "permanent" : "trash", "items": items])
+                }
                 let result = try JSONSerialization.jsonObject(with: data) as? [String: String]
                 guard let token = result?["token"] else { throw EngineError.message("Review could not be prepared.") }
                 guard activeCleanup?.id == request.id, !cleanupCancellationRequested else {
@@ -1256,6 +1489,7 @@ struct DiscoveryPresentation: Equatable {
     }
     func windowClosed() {
         visible = false; panelVisible = false
+        client?.setInteractive(false)
         consumedCleanupPreviewID = cleanupPreview?.id
         if let id = cleanupPreview?.id { finishCleanupPreview(id) }
         presentedCleanupPreviewID = nil
@@ -1265,6 +1499,7 @@ struct DiscoveryPresentation: Equatable {
     }
     func windowOpened() {
         visible = true; panelVisible = true
+        client?.setInteractive(true)
         if snapshot.wallet.pendingCoins > 0 { destination = .coins }
         collect()
     }

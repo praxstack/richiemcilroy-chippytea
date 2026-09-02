@@ -2,6 +2,7 @@ use crate::model::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::RefCell;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 pub struct Store {
@@ -10,6 +11,14 @@ pub struct Store {
 }
 
 pub type StoredOperation = (Root, Candidate, Receipt, Option<Identity>, Option<PathBuf>);
+
+pub(crate) struct DuplicateInputs {
+    pub files: Vec<crate::duplicates::Input>,
+    pub indexed_files: u64,
+    pub skipped_buckets: u64,
+    pub skipped_bucket_files: u64,
+    pub bucket_limit_reached: bool,
+}
 
 /// Binds one committed refresh generation to its separately durable scope claim.
 pub(crate) struct ScopeRefresh {
@@ -30,16 +39,22 @@ const FOREGROUND_STATE_SQL: &str = "SELECT revision,
 
 // The expression and ordering match the partial index below. SQLite can stop
 // after the visible page instead of decoding and sorting the entire disk index.
-const SUGGESTIONS_SQL: &str = "SELECT c.json FROM candidates c
+static SUGGESTIONS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT c.json FROM candidates c
     WHERE json_extract(c.json,'$.suggestion_eligible')=1
       AND json_extract(c.json,'$.blocked_reason') IS NULL
-      AND json_extract(c.json,'$.allocated_bytes')>=100000000
+      AND json_extract(c.json,'$.allocated_bytes')>={}
       AND NOT EXISTS(SELECT 1 FROM kept k WHERE c.path=k.path
           OR substr(c.path,1,length(k.path)+1)=k.path||'/'
           OR substr(k.path,1,length(c.path)+1)=c.path||'/')
-    ORDER BY CASE json_extract(c.json,'$.kind') WHEN 'cargo' THEN 0 WHEN 'node' THEN 1 WHEN 'venv' THEN 2 WHEN 'webcache' THEN 3 ELSE 4 END,
+    ORDER BY {},
              json_extract(c.json,'$.allocated_bytes') DESC, c.path
-    LIMIT 500";
+    LIMIT 500",
+        crate::recommendations::minimum_size_sql("c.json"),
+        crate::recommendations::priority_sql("c.json")
+    )
+});
 
 /// One page of the operations ledger, newest first. `?1` NULL starts at the
 /// newest receipt; a `next_before` cursor value continues strictly older ones.
@@ -69,15 +84,21 @@ impl Store {
             CREATE TABLE IF NOT EXISTS wallet(id INTEGER PRIMARY KEY CHECK(id=1), collected INTEGER NOT NULL, remainder INTEGER NOT NULL, credited INTEGER NOT NULL);
             INSERT OR IGNORE INTO wallet VALUES(1,0,0,0);
             PRAGMA user_version=2;").map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA cache_size=-8192;
-            CREATE INDEX IF NOT EXISTS candidate_paths ON candidates(root_id,path);
+        conn.execute_batch(&format!(
+            "PRAGMA cache_size=-8192;
             DROP INDEX IF EXISTS candidate_suggestions_v2;
-            CREATE INDEX IF NOT EXISTS candidate_suggestions_v3 ON candidates(
-                CASE json_extract(json,'$.kind') WHEN 'cargo' THEN 0 WHEN 'node' THEN 1 WHEN 'venv' THEN 2 WHEN 'webcache' THEN 3 ELSE 4 END,
+            DROP INDEX IF EXISTS candidate_suggestions_v3;
+            CREATE INDEX IF NOT EXISTS candidate_suggestions_v4 ON candidates(
+                {},
                 json_extract(json,'$.allocated_bytes') DESC, path)
                 WHERE json_extract(json,'$.suggestion_eligible')=1
                   AND json_extract(json,'$.blocked_reason') IS NULL
-                  AND json_extract(json,'$.allocated_bytes')>=100000000;
+                  AND json_extract(json,'$.allocated_bytes')>={};",
+            crate::recommendations::priority_sql("json"),
+            crate::recommendations::minimum_size_sql("json")
+        ))
+        .map_err(err)?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS candidate_paths ON candidates(root_id,path);
             CREATE TABLE IF NOT EXISTS index_version(id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
             INSERT OR IGNORE INTO index_version VALUES(1,0);
             CREATE TABLE IF NOT EXISTS foreground_state(
@@ -830,9 +851,102 @@ impl Store {
         if let Some(cached) = self.visible_candidates.borrow().as_ref() {
             return Ok(cached.clone());
         }
-        let candidates = self.json_rows::<Candidate>(SUGGESTIONS_SQL)?;
+        let candidates = self.json_rows::<Candidate>(&SUGGESTIONS_SQL)?;
         *self.visible_candidates.borrow_mut() = Some(candidates.clone());
         Ok(candidates)
+    }
+
+    /// Explicit content checks use their own bounded query, never the visible
+    /// all-category page. A size bucket is either included whole or reported as
+    /// skipped; a truncated bucket must not look like a complete duplicate set.
+    pub(crate) fn duplicate_inputs(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<DuplicateInputs> {
+        const MAX_BUCKETS: usize = 1024;
+        crate::safety::cancelled(cancel)?;
+        let predicate = format!(
+            "json_extract(c.json,'$.kind') IN ('download','installer','archive','largefile')
+            AND json_extract(c.json,'$.suggestion_eligible')=1
+            AND json_extract(c.json,'$.blocked_reason') IS NULL
+            AND COALESCE(json_extract(c.json,'$.provisional'),0)=0
+            AND json_extract(c.json,'$.eligible_permanent')=0
+            AND json_extract(c.json,'$.allocated_bytes')>={}
+            AND typeof(json_extract(c.json,'$.identity.size'))='integer'
+            AND json_extract(c.json,'$.identity.size')>0
+            AND length(CAST(c.json AS BLOB))<=16384",
+            crate::recommendations::minimum_size_sql("c.json")
+        );
+        let indexed_files = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM candidates c JOIN roots r ON r.id=c.root_id WHERE {predicate}"),
+            [], |row| row.get(0),
+        ).map_err(err)?;
+        let mut result = DuplicateInputs {
+            files: Vec::new(),
+            indexed_files,
+            skipped_buckets: 0,
+            skipped_bucket_files: 0,
+            bucket_limit_reached: false,
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT json_extract(c.json,'$.identity.device'),json_extract(c.json,'$.identity.size'),COUNT(*)
+            FROM candidates c JOIN roots r ON r.id=c.root_id WHERE {predicate}
+            GROUP BY json_extract(c.json,'$.identity.device'),json_extract(c.json,'$.identity.size')
+            HAVING COUNT(*)>1
+            ORDER BY SUM(json_extract(c.json,'$.allocated_bytes')) DESC,
+                     json_extract(c.json,'$.identity.device'),json_extract(c.json,'$.identity.size') DESC
+            LIMIT {}", MAX_BUCKETS + 1
+        )).map_err(err)?;
+        let mut buckets = statement.query([]).map_err(err)?;
+        let mut bucket_index = 0;
+        while let Some(bucket) = buckets.next().map_err(err)? {
+            crate::safety::cancelled(cancel)?;
+            if bucket_index == MAX_BUCKETS {
+                result.bucket_limit_reached = true;
+                break;
+            }
+            bucket_index += 1;
+            let device: u64 = bucket.get(0).map_err(err)?;
+            let size: u64 = bucket.get(1).map_err(err)?;
+            let count: u64 = bucket.get(2).map_err(err)?;
+            if count > (crate::duplicates::MAX_FILES - result.files.len()) as u64 {
+                result.skipped_buckets += 1;
+                result.skipped_bucket_files = result.skipped_bucket_files.saturating_add(count);
+                continue;
+            }
+            let mut members = self
+                .conn
+                .prepare(&format!(
+                    "SELECT r.json,c.json,EXISTS(SELECT 1 FROM kept k WHERE c.path=k.path
+                    OR substr(c.path,1,length(k.path)+1)=k.path||'/'
+                    OR substr(k.path,1,length(c.path)+1)=c.path||'/')
+                FROM candidates c JOIN roots r ON r.id=c.root_id WHERE {predicate}
+                    AND json_extract(c.json,'$.identity.device')=?1
+                    AND json_extract(c.json,'$.identity.size')=?2 ORDER BY c.path"
+                ))
+                .map_err(err)?;
+            let mut rows = members.query(params![device, size]).map_err(err)?;
+            let before = result.files.len();
+            while let Some(row) = rows.next().map_err(err)? {
+                crate::safety::cancelled(cancel)?;
+                if result.files.len() - before >= count as usize {
+                    return Err(
+                        "The indexed size bucket changed during selection; check again".into(),
+                    );
+                }
+                result.files.push(crate::duplicates::Input {
+                    root: serde_json::from_str(&row.get::<_, String>(0).map_err(err)?)
+                        .map_err(err)?,
+                    candidate: serde_json::from_str(&row.get::<_, String>(1).map_err(err)?)
+                        .map_err(err)?,
+                    keeper_only: row.get(2).map_err(err)?,
+                });
+            }
+            if result.files.len() - before != count as usize {
+                return Err("The indexed size bucket changed during selection; check again".into());
+            }
+        }
+        Ok(result)
     }
 
     fn invalidate_candidates(&self) {
@@ -1347,6 +1461,8 @@ pub fn err(e: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::AtomicBool;
 
     fn item(id: &str, path: &str, kind: &str, bytes: u64, eligible: bool) -> Candidate {
         Candidate {
@@ -1395,6 +1511,15 @@ mod tests {
                 identity: item("root", "/root", "cargo", 1, false).identity,
             })
             .unwrap();
+    }
+
+    fn duplicate_bucket_counts(inputs: &DuplicateInputs) -> BTreeMap<(u64, u64), usize> {
+        let mut counts = BTreeMap::new();
+        for input in &inputs.files {
+            let identity = &input.candidate.identity;
+            *counts.entry((identity.device, identity.size)).or_insert(0) += 1;
+        }
+        counts
     }
 
     fn terminal_summary(entries: u64) -> ForegroundScan {
@@ -2969,8 +3094,8 @@ mod tests {
                 blocked,
             ],
         );
-        // Deterministic consequence groups: recompile, reinstall, recreate,
-        // rebuild, then personal review; size orders within a group.
+        // Cleanup artifacts share the first group; size orders that group.
+        // Personal-file review cannot displace those cleanup opportunities.
         assert_eq!(
             store
                 .candidates()
@@ -2978,16 +3103,384 @@ mod tests {
                 .iter()
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>(),
-            ["cargo", "node", "venv", "webcache", "personal"]
+            ["venv", "webcache", "node", "cargo", "personal"]
         );
         store.keep("/root/cargo", true).unwrap();
         assert_eq!(store.candidates().unwrap().len(), 4);
         store.keep("/root/cargo", false).unwrap();
-        assert_eq!(store.candidates().unwrap()[0].id, "cargo");
+        assert_eq!(store.candidates().unwrap()[0].id, "venv");
         let mut changed = store.candidate("cargo").unwrap();
         changed.suggestion_eligible = false;
         save(&mut store, vec![changed]);
         assert_eq!(store.candidates().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn category_thresholds_and_priority_are_applied_by_the_indexed_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let kinds = [
+            "cache",
+            "log",
+            "crashreport",
+            "xcode",
+            "installer",
+            "archive",
+            "download",
+            "largefile",
+        ];
+        let mut rows = Vec::new();
+        for kind in kinds {
+            let minimum = crate::recommendations::minimum_bytes(kind);
+            rows.push(item(kind, &format!("/root/{kind}"), kind, minimum, true));
+            rows.push(item(
+                &format!("small-{kind}"),
+                &format!("/root/small-{kind}"),
+                kind,
+                minimum - 1,
+                true,
+            ));
+        }
+        rows.push(item(
+            "unknown",
+            "/root/unknown",
+            "unrecognized",
+            u64::MAX,
+            true,
+        ));
+        save(&mut store, rows);
+        assert_eq!(
+            store
+                .candidates()
+                .unwrap()
+                .iter()
+                .map(|row| row.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "xcode",
+                "cache",
+                "log",
+                "crashreport",
+                "installer",
+                "download",
+                "archive",
+                "largefile"
+            ]
+        );
+        // The 1 MB report and 10 MB log survive the query's size filter, while
+        // a 500 MB personal file cannot displace first-group cleanup artifacts.
+        assert_eq!(
+            store.candidate("crashreport").unwrap().allocated_bytes,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn duplicate_inputs_admit_whole_buckets_without_exceeding_500_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let mut rows = Vec::new();
+        // These are indexed sizes only; no corresponding large files are made.
+        // Aggregate allocated size orders the buckets exactly as listed.
+        for (prefix, bytes, count) in [
+            ("oversized", 1_000_000_000, 501),
+            ("large-fit", 900_000_000, 498),
+            ("cannot-fit-remainder", 800_000_000, 3),
+            ("small-fit", 700_000_000, 2),
+            ("after-full", 600_000_000, 2),
+        ] {
+            for index in 0..count {
+                let id = format!("{prefix}-{index:03}");
+                rows.push(item(&id, &format!("/root/{id}"), "download", bytes, true));
+            }
+        }
+        save(&mut store, rows);
+
+        let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+        assert_eq!(inputs.files.len(), 500);
+        assert_eq!(inputs.indexed_files, 1006);
+        assert_eq!(
+            duplicate_bucket_counts(&inputs),
+            BTreeMap::from([((1, 900_000_000), 498), ((1, 700_000_000), 2)]),
+            "Oversized buckets must be skipped whole, leaving room for later complete buckets"
+        );
+        assert_eq!(inputs.skipped_buckets, 3);
+        assert_eq!(inputs.skipped_bucket_files, 506);
+        assert!(!inputs.bucket_limit_reached);
+    }
+
+    #[test]
+    fn duplicate_inputs_keep_protected_rows_as_keeper_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        save(
+            &mut store,
+            vec![
+                item(
+                    "protected",
+                    "/root/café%_/clip.mov",
+                    "download",
+                    600_000_000,
+                    true,
+                ),
+                item(
+                    "copy",
+                    "/root/other/copy.mov",
+                    "download",
+                    600_000_000,
+                    true,
+                ),
+            ],
+        );
+        for (kept, overlaps) in [
+            ("/root/café%_", true),
+            ("/root/café%_/clip.mov", true),
+            ("/root/café%_/clip.mov/previously-kept-child", true),
+            ("/root/café%_/clip.mov-other", false),
+            ("/root/caféXX/clip.mov", false),
+        ] {
+            store.keep(kept, true).unwrap();
+            // Populate the ordinary page after Keep has hidden any protected row.
+            assert_eq!(
+                store.candidates().unwrap().len(),
+                if overlaps { 1 } else { 2 }
+            );
+            let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+            assert_eq!(inputs.indexed_files, 2);
+            assert_eq!(
+                inputs
+                    .files
+                    .iter()
+                    .map(|input| (input.candidate.id.as_str(), input.keeper_only))
+                    .collect::<BTreeMap<_, _>>(),
+                BTreeMap::from([("copy", false), ("protected", overlaps)]),
+                "{kept}"
+            );
+            store.keep(kept, false).unwrap();
+        }
+        store.keep("/root", true).unwrap();
+        assert!(store.candidates().unwrap().is_empty());
+        let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+        assert_eq!(inputs.files.len(), 2);
+        assert!(inputs.files.iter().all(|input| input.keeper_only));
+        assert_eq!(store.kept().unwrap(), ["/root"]);
+    }
+
+    #[test]
+    fn duplicate_inputs_are_independent_of_visible_limit_and_category_ranks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let mut personal = Vec::new();
+        // Each same-size pair crosses ordinary presentation categories.
+        for (kind, bytes) in [
+            ("installer", 500_000_000),
+            ("archive", 500_000_000),
+            ("download", 600_000_000),
+            ("largefile", 600_000_000),
+        ] {
+            let mut candidate = item(kind, &format!("/root/{kind}"), kind, bytes, true);
+            candidate.eligible_permanent = false;
+            personal.push(candidate);
+        }
+        save(&mut store, personal);
+        assert_eq!(store.candidates().unwrap().len(), 4);
+        save(
+            &mut store,
+            (0..500)
+                .map(|index| {
+                    let id = format!("cargo-{index:03}");
+                    item(
+                        &id,
+                        &format!("/root/{id}/target"),
+                        "cargo",
+                        100_000_000,
+                        true,
+                    )
+                })
+                .collect(),
+        );
+        let visible = store.candidates().unwrap();
+        assert_eq!(visible.len(), 500);
+        assert!(visible.iter().all(|candidate| candidate.kind == "cargo"));
+
+        let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+        assert_eq!(inputs.indexed_files, 4);
+        assert_eq!(
+            inputs
+                .files
+                .iter()
+                .map(|input| input.candidate.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["installer", "archive", "download", "largefile"])
+        );
+        assert_eq!(
+            duplicate_bucket_counts(&inputs),
+            BTreeMap::from([((1, 500_000_000), 2), ((1, 600_000_000), 2)])
+        );
+    }
+
+    #[test]
+    fn duplicate_inputs_exclude_unverified_ineligible_and_nonpersonal_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let mut rows = vec![
+            item("match-a", "/root/match-a", "download", 600_000_000, true),
+            item("match-b", "/root/match-b", "download", 600_000_000, true),
+            item(
+                "singleton",
+                "/root/singleton",
+                "download",
+                700_000_000,
+                true,
+            ),
+        ];
+        for reason in [
+            "provisional",
+            "ineligible",
+            "blocked",
+            "nonpersonal",
+            "permanent",
+            "zero-size",
+            "below-minimum",
+            "oversized-json",
+            "missing-root",
+        ] {
+            for index in 0..2 {
+                let id = format!("{reason}-{index}");
+                let mut candidate =
+                    item(&id, &format!("/root/{id}"), "download", 600_000_000, true);
+                match reason {
+                    "provisional" => {} // Inject the stored flag below, after normal saving.
+                    "ineligible" => candidate.suggestion_eligible = false,
+                    "blocked" => candidate.blocked_reason = Some("Fixture activity guard".into()),
+                    "nonpersonal" => candidate.kind = "cargo".into(),
+                    "permanent" => candidate.eligible_permanent = true,
+                    "zero-size" => candidate.identity.size = 0,
+                    "below-minimum" => {
+                        candidate.allocated_bytes =
+                            crate::recommendations::minimum_bytes("download") - 1;
+                    }
+                    "oversized-json" => candidate.evidence = "x".repeat(17_000),
+                    "missing-root" => candidate.root_id = "missing".into(),
+                    _ => unreachable!(),
+                }
+                rows.push(candidate);
+            }
+        }
+        save(&mut store, rows);
+        // save_batch intentionally refuses provisional rows. Directly mark these
+        // disposable records to exercise the query's own defensive predicate.
+        store
+            .conn
+            .execute(
+                "UPDATE candidates SET json=json_set(json,'$.provisional',json('true'))
+                 WHERE id IN ('provisional-0','provisional-1')",
+                [],
+            )
+            .unwrap();
+
+        let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            inputs.indexed_files, 3,
+            "Only eligible indexed rows are counted"
+        );
+        assert_eq!(
+            inputs
+                .files
+                .iter()
+                .map(|input| input.candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            ["match-a", "match-b"],
+            "Invalid rows cannot join an otherwise eligible size bucket"
+        );
+        assert_eq!(inputs.skipped_buckets, 0);
+        assert_eq!(inputs.skipped_bucket_files, 0);
+        assert!(!inputs.bucket_limit_reached);
+    }
+
+    #[test]
+    fn duplicate_inputs_do_not_form_buckets_across_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let mut other = store.root("root").unwrap();
+        other.id = "other".into();
+        other.path = "/other".into();
+        other.identity.device = 2;
+        store.add_root(&other).unwrap();
+        let mut rows = Vec::new();
+        for (root_id, root_path, device) in [("root", "/root", 1), ("other", "/other", 2)] {
+            for (suffix, bytes) in [
+                ("pair-a", 500_000_000),
+                ("pair-b", 500_000_000),
+                ("singleton", 800_000_000),
+            ] {
+                let id = format!("{root_id}-{suffix}");
+                let mut candidate = item(
+                    &id,
+                    &format!("{root_path}/{suffix}"),
+                    "download",
+                    bytes,
+                    true,
+                );
+                candidate.root_id = root_id.into();
+                candidate.identity.device = device;
+                rows.push(candidate);
+            }
+        }
+        save(&mut store, rows);
+
+        let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+        assert_eq!(inputs.indexed_files, 6);
+        assert_eq!(
+            duplicate_bucket_counts(&inputs),
+            BTreeMap::from([((1, 500_000_000), 2), ((2, 500_000_000), 2)]),
+            "One same-size file on each device is not a comparable bucket"
+        );
+        assert!(inputs.files.iter().all(|input| {
+            input.root.id == input.candidate.root_id
+                && input.root.identity.device == input.candidate.identity.device
+        }));
+        assert_eq!(inputs.skipped_buckets, 0);
+    }
+
+    #[test]
+    fn duplicate_inputs_report_the_bucket_limit_without_partial_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let pair = |bucket: usize| {
+            let bytes = 100_000_000 + bucket as u64;
+            (0..2)
+                .map(|member| {
+                    let id = format!("bucket-{bucket:04}-{member}");
+                    item(&id, &format!("/root/{id}"), "download", bytes, true)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut rows = Vec::new();
+        for bucket in 0..1024 {
+            rows.extend(pair(bucket));
+        }
+        save(&mut store, rows);
+        for extra_bucket in [false, true] {
+            if extra_bucket {
+                save(&mut store, pair(1024));
+            }
+            let inputs = store.duplicate_inputs(&AtomicBool::new(false)).unwrap();
+            assert_eq!(inputs.indexed_files, if extra_bucket { 2050 } else { 2048 });
+            assert_eq!(inputs.files.len(), 500);
+            let counts = duplicate_bucket_counts(&inputs);
+            assert_eq!(counts.len(), 250);
+            assert!(counts.values().all(|count| *count == 2));
+            assert_eq!(inputs.skipped_buckets, 774);
+            assert_eq!(inputs.skipped_bucket_files, 1548);
+            assert_eq!(inputs.bucket_limit_reached, extra_bucket);
+        }
     }
 
     #[test]
@@ -3115,7 +3608,7 @@ mod tests {
         let store = Store::open(&dir.path().join("db")).unwrap();
         let mut query = store
             .conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {SUGGESTIONS_SQL}"))
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", SUGGESTIONS_SQL.as_str()))
             .unwrap();
         let details = query
             .query_map([], |r| r.get::<_, String>(3))
@@ -3123,7 +3616,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(details.contains("candidate_suggestions_v3"), "{details}");
+        assert!(details.contains("candidate_suggestions_v4"), "{details}");
         assert!(!details.contains("USE TEMP B-TREE"), "{details}");
     }
     #[test]
