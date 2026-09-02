@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+mod support;
+
 struct Fixture {
     engine: Arc<Engine>,
     database: PathBuf,
@@ -149,6 +151,7 @@ fn digest(path: &std::path::Path) -> blake3::Hash {
 
 #[test]
 fn internal_cargo_links_are_reviewable_and_cleanup_cannot_reward_them_twice() {
+    let _engine_guard = support::engine_guard();
     let fixture = fixture();
     let (_, token) = review(&fixture);
     assert!(
@@ -215,6 +218,7 @@ fn internal_cargo_links_are_reviewable_and_cleanup_cannot_reward_them_twice() {
 
 #[test]
 fn an_external_alias_created_after_review_preserves_every_name_and_earns_nothing() {
+    let _engine_guard = support::engine_guard();
     let fixture = fixture();
     let (_, token) = review(&fixture);
     let before = digest(&fixture.payload);
