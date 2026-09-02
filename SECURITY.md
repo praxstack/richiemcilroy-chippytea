@@ -29,4 +29,4 @@ The app's local library can contain filesystem paths, permissions, cleanup histo
 
 Keep `.env` files, tokens, signing keys, certificate exports and local signing configuration out of Git. A `.gitignore` rule does not protect a file that has already been committed.
 
-The [recommendation policy](docs/SUGGESTIONS.md) documents current exclusions and known limits. It is a description of the safeguards, not a guarantee that every cleanup is risk-free.
+Safeguards do not guarantee that every cleanup is risk-free. Review the selected files and keep backups.

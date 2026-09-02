@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* One material: cream paper, charcoal ink, marigold gold, one ballpoint-blue
-   accent. Values are TeaTheme's, from docs/DESIGN.md. */
+   accent. */
 @theme {
   --color-paper: #faf5ea;
   --color-paper-deep: #f1eadb;

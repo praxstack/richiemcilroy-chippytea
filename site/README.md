@@ -28,8 +28,6 @@ Production hosting needs a Next.js runtime for `/download`, not a static-only ex
 
 The demo runs entirely in memory with fictional files and successful example outcomes. It does not scan your Mac or remove anything. It shows supported developer artifacts, while downloads are Trash-only and earn no chips. It is an illustration of the interaction, not evidence of measured storage recovery.
 
-The native policy lives in [SUGGESTIONS.md](../docs/SUGGESTIONS.md).
-
 ## The same drawing, in three places
 
 - `lib/ink.ts` and `lib/art.ts` share the native app's seeded paths and letterforms.

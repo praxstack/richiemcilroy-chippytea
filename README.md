@@ -43,7 +43,7 @@ chippytea runs locally from your menu bar. No account, no telemetry, no automati
 
 Moving files to **Trash does not free storage**. App caches, logs, Xcode DerivedData, downloads and personal files are review/Trash-only; they never earn chips. Permanent cleanup is limited to verified, eligible developer build files and dependencies.
 
-This is early software that can permanently delete files. Start with a disposable test folder and keep backups. Full Disk Access is optional. The [recommendation policy](docs/SUGGESTIONS.md) explains what qualifies, what stays out, and where the checks have limits.
+This is early software that can permanently delete files. Start with a disposable test folder and keep backups. Full Disk Access is optional.
 
 <details>
 <summary>About the chip counter</summary>
@@ -65,7 +65,7 @@ cd chippytea
 open build/chippytea.app
 ```
 
-Local builds are ad-hoc signed by default, not notarized releases. For toolchain versions, a safe test fixture, stable signing, and all test commands, see the [development guide](docs/development.md). Quit the running app before rebuilding.
+Local builds are ad-hoc signed by default, not notarized releases. Quit the running app before rebuilding.
 
 ```sh
 env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR cargo test --locked
@@ -83,10 +83,8 @@ Working on the landing page? See [site/README.md](site/README.md).
 | [Landing page](site) | The same drawing paths and chip-shop style, built with Next.js |
 | [Tests and benchmarks](scripts) | Disposable fixtures, native integration checks, and reproducible performance tools |
 
-[Cleanup policy](docs/SUGGESTIONS.md) · [Disk access](docs/DISK-ACCESS.md) · [Development](docs/development.md) · [Releasing](docs/RELEASING.md)
-
 ## Contributing
 
 Bug reports, careful safety tests, clearer docs, and small fixes are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing cleanup behaviour. Please keep personal paths, logs, and credentials out of public issues. Security problems belong in a [private report](https://github.com/richiemcilroy/chippytea/security/advisories/new).
 
-[MIT licensed](LICENSE). Built with lessons from [Kondo](https://github.com/tbillington/kondo), [dua](https://github.com/Byron/dua-cli), and [dust](https://github.com/bootandy/dust).
+[MIT licensed](LICENSE).

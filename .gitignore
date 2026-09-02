@@ -41,18 +41,9 @@ service-account*.json
 .aws/
 .ssh/
 
-# Local reports can contain file paths, scan results or signing details.
+# Local benchmark output and logs.
 /benchmarks/local/
-/research/
-/docs/local/
 *.log
-
-# Internal architecture, planning, and research notes stay local.
-/MVP.md
-/docs/ARCHITECTURE.md
-/docs/DESIGN.md
-/docs/PERFORMANCE.md
-/docs/REFERENCE-STUDY.md
 
 # Editor, agent and system state.
 .DS_Store
