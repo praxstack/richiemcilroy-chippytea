@@ -5,9 +5,54 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+/// Derived findings are intentionally bounded independently of the durable
+/// cleanup and event ledgers. These defaults are policy limits, not a claim
+/// about the physical size of the SQLite database.
+pub(crate) const DEFAULT_MAX_CANDIDATE_ROWS: u64 = 50_000;
+pub(crate) const DEFAULT_MAX_CANDIDATE_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_CANDIDATE_JSON_BYTES: usize = 16 * 1024;
+const CANDIDATE_PAYLOAD_OVERHEAD: u64 = 64;
+const DERIVED_USAGE_VERSION: u32 = 1;
+const WAL_AUTOCHECKPOINT_PAGES: u32 = 1_000;
+const WAL_SIZE_HINT_BYTES: u32 = 4 * 1024 * 1024;
+const DERIVED_MAINTENANCE_ROWS: usize = 256;
+
 pub struct Store {
     pub conn: Connection,
     visible_candidates: RefCell<Option<Vec<Candidate>>>,
+    database_path: PathBuf,
+    derived_limits: DerivedLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DerivedLimits {
+    pub max_candidate_rows: u64,
+    pub max_candidate_payload_bytes: u64,
+    pub max_candidate_json_bytes: usize,
+}
+
+impl Default for DerivedLimits {
+    fn default() -> Self {
+        Self {
+            max_candidate_rows: DEFAULT_MAX_CANDIDATE_ROWS,
+            max_candidate_payload_bytes: DEFAULT_MAX_CANDIDATE_PAYLOAD_BYTES,
+            max_candidate_json_bytes: DEFAULT_MAX_CANDIDATE_JSON_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub(crate) struct DerivedUsage {
+    pub candidate_rows: u64,
+    pub candidate_payload_bytes: u64,
+    /// Size of the SQLite database file. This is telemetry only: it includes
+    /// durable truth and therefore is not a derived-storage quota.
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub wal_shm_bytes: u64,
+    pub wal_frames: u64,
+    pub wal_checkpointed: u64,
+    pub wal_busy: bool,
 }
 
 pub type StoredOperation = (Root, Candidate, Receipt, Option<Identity>, Option<PathBuf>);
@@ -69,7 +114,8 @@ impl Store {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.busy_timeout(Duration::from_secs(3))
             .map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+        conn.execute_batch(&format!("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+            PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit={WAL_SIZE_HINT_BYTES};
             CREATE TABLE IF NOT EXISTS roots(id TEXT PRIMARY KEY, path TEXT UNIQUE NOT NULL, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidates(id TEXT PRIMARY KEY, root_id TEXT NOT NULL, path TEXT UNIQUE NOT NULL, json TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS candidate_roots ON candidates(root_id);
@@ -83,12 +129,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS earnings(operation_id TEXT PRIMARY KEY REFERENCES operations(id), coins INTEGER NOT NULL, collected INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS wallet(id INTEGER PRIMARY KEY CHECK(id=1), collected INTEGER NOT NULL, remainder INTEGER NOT NULL, credited INTEGER NOT NULL);
             INSERT OR IGNORE INTO wallet VALUES(1,0,0,0);
-            PRAGMA user_version=2;").map_err(|e| e.to_string())?;
+            PRAGMA user_version=2;")).map_err(|e| e.to_string())?;
         conn.execute_batch(&format!(
             "PRAGMA cache_size=-8192;
             DROP INDEX IF EXISTS candidate_suggestions_v2;
             DROP INDEX IF EXISTS candidate_suggestions_v3;
-            CREATE INDEX IF NOT EXISTS candidate_suggestions_v4 ON candidates(
+            DROP INDEX IF EXISTS candidate_suggestions_v4;
+            CREATE INDEX IF NOT EXISTS candidate_suggestions_v5 ON candidates(
                 {},
                 json_extract(json,'$.allocated_bytes') DESC, path)
                 WHERE json_extract(json,'$.suggestion_eligible')=1
@@ -113,7 +160,70 @@ impl Store {
             CREATE TABLE IF NOT EXISTS refresh_seen(root_id TEXT NOT NULL, generation TEXT NOT NULL, candidate_id TEXT NOT NULL, seen INTEGER NOT NULL CHECK(seen IN (0,1)), PRIMARY KEY(root_id,generation,candidate_id));
             CREATE INDEX IF NOT EXISTS refresh_unseen ON refresh_seen(root_id,generation,seen,candidate_id);
             CREATE TABLE IF NOT EXISTS candidate_tombstones(id TEXT PRIMARY KEY, root_id TEXT, path TEXT);
-            CREATE INDEX IF NOT EXISTS tombstone_paths ON candidate_tombstones(root_id,path);").map_err(err)?;
+            CREATE INDEX IF NOT EXISTS tombstone_paths ON candidate_tombstones(root_id,path);
+            CREATE TABLE IF NOT EXISTS derived_usage(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                candidate_rows INTEGER NOT NULL CHECK(candidate_rows>=0),
+                candidate_payload_bytes INTEGER NOT NULL CHECK(candidate_payload_bytes>=0));
+            INSERT OR IGNORE INTO derived_usage VALUES(1,0,0);
+            CREATE TABLE IF NOT EXISTS derived_admission_pressure(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                row_headroom INTEGER NOT NULL CHECK(row_headroom>=0),
+                byte_headroom INTEGER NOT NULL CHECK(byte_headroom>=0));
+            INSERT OR IGNORE INTO derived_admission_pressure VALUES(1,0,0);
+            CREATE TABLE IF NOT EXISTS derived_usage_version(
+                id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
+            INSERT OR IGNORE INTO derived_usage_version VALUES(1,0);
+            CREATE TABLE IF NOT EXISTS derived_limited_roots(
+                root_id TEXT PRIMARY KEY,
+                omitted_rows INTEGER NOT NULL CHECK(omitted_rows>=0),
+                omitted_bytes INTEGER NOT NULL CHECK(omitted_bytes>=0),
+                reason TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS refresh_admission(
+                root_id TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                omitted_rows INTEGER NOT NULL CHECK(omitted_rows>=0),
+                omitted_bytes INTEGER NOT NULL CHECK(omitted_bytes>=0),
+                reason TEXT NOT NULL,
+                PRIMARY KEY(root_id,generation));
+            CREATE TRIGGER IF NOT EXISTS candidates_usage_insert AFTER INSERT ON candidates BEGIN
+                UPDATE derived_usage SET candidate_rows=candidate_rows+1,
+                    candidate_payload_bytes=candidate_payload_bytes+
+                        length(CAST(NEW.json AS BLOB))+length(CAST(NEW.path AS BLOB))+64
+                    WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS candidates_usage_delete AFTER DELETE ON candidates BEGIN
+                UPDATE derived_usage SET candidate_rows=candidate_rows-1,
+                    candidate_payload_bytes=candidate_payload_bytes-
+                        length(CAST(OLD.json AS BLOB))-length(CAST(OLD.path AS BLOB))-64
+                    WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS candidates_usage_update AFTER UPDATE OF path,json ON candidates
+                WHEN OLD.path != NEW.path OR OLD.json != NEW.json BEGIN
+                UPDATE derived_usage SET candidate_payload_bytes=candidate_payload_bytes-
+                        length(CAST(OLD.json AS BLOB))-length(CAST(OLD.path AS BLOB))-64+
+                        length(CAST(NEW.json AS BLOB))+length(CAST(NEW.path AS BLOB))+64
+                    WHERE id=1;
+            END;").map_err(err)?;
+        {
+            let version: u32 = conn
+                .query_row(
+                    "SELECT version FROM derived_usage_version WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(err)?;
+            if version != DERIVED_USAGE_VERSION {
+                let tx = conn.unchecked_transaction().map_err(err)?;
+                recount_derived_usage_in(&tx)?;
+                tx.execute(
+                    "UPDATE derived_usage_version SET version=?1 WHERE id=1",
+                    [DERIVED_USAGE_VERSION],
+                )
+                .map_err(err)?;
+                tx.commit().map_err(err)?;
+            }
+        }
         let version: u32 = conn
             .query_row("SELECT version FROM index_version WHERE id=1", [], |r| {
                 r.get(0)
@@ -144,14 +254,123 @@ impl Store {
         let mut store = Self {
             conn,
             visible_candidates: RefCell::new(None),
+            database_path: path.to_path_buf(),
+            derived_limits: DerivedLimits::default(),
         };
         store.recover_discovery()?;
         Ok(store)
     }
 
-    /// A cursor cannot survive process exit. Requeue only the interrupted scopes;
-    /// completed findings remain usable until their replacement pass finishes.
-    fn recover_discovery(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn with_derived_limits(mut self, limits: DerivedLimits) -> Self {
+        self.derived_limits = limits;
+        self
+    }
+
+    /// Return O(1) derived counters together with physical SQLite side-file
+    /// sizes. Durable tables are deliberately excluded from these counters.
+    pub(crate) fn derived_usage(&self) -> Result<DerivedUsage> {
+        let (candidate_rows, candidate_payload_bytes): (u64, u64) = self
+            .conn
+            .query_row(
+                "SELECT candidate_rows,candidate_payload_bytes FROM derived_usage WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(err)?;
+        let wal = self.wal_sizes()?;
+        Ok(DerivedUsage {
+            candidate_rows,
+            candidate_payload_bytes,
+            database_bytes: wal.0,
+            wal_bytes: wal.1,
+            wal_shm_bytes: wal.2,
+            ..Default::default()
+        })
+    }
+
+    /// A non-blocking checkpoint for maintenance telemetry. PASSIVE never
+    /// waits for readers; `wal_busy` reports that a later truncate is needed.
+    pub(crate) fn passive_checkpoint(&self) -> Result<DerivedUsage> {
+        self.checkpoint_wal("PASSIVE")
+    }
+
+    /// TRUNCATE is only for an explicit idle maintenance call. It is never
+    /// part of discovery, cleanup, accounting, or crash recovery.
+    pub(crate) fn truncate_wal(&self) -> Result<DerivedUsage> {
+        self.checkpoint_wal("TRUNCATE")
+    }
+
+    fn wal_sizes(&self) -> Result<(u64, u64, u64)> {
+        fn size(path: PathBuf) -> Result<u64> {
+            match std::fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        let database = size(self.database_path.clone())?;
+        let mut wal = self.database_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let mut shm = self.database_path.as_os_str().to_os_string();
+        shm.push("-shm");
+        Ok((
+            database,
+            size(PathBuf::from(wal))?,
+            size(PathBuf::from(shm))?,
+        ))
+    }
+
+    fn checkpoint_wal(&self, mode: &str) -> Result<DerivedUsage> {
+        let old_timeout: i64 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .map_err(err)?;
+        self.conn.busy_timeout(Duration::ZERO).map_err(err)?;
+        let checkpoint =
+            self.conn
+                .query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                });
+        let restore = self
+            .conn
+            .busy_timeout(Duration::from_millis(old_timeout.max(0) as u64));
+        restore.map_err(err)?;
+        let (busy, frames, checkpointed) = match checkpoint {
+            Ok((busy, frames, checkpointed)) => (busy != 0, frames, checkpointed),
+            Err(error) if error.to_string().contains("locked") => (true, 0, 0),
+            Err(error) => return Err(err(error)),
+        };
+        let (database_bytes, wal_bytes, wal_shm_bytes) = self.wal_sizes()?;
+        let (candidate_rows, candidate_payload_bytes): (u64, u64) = self
+            .conn
+            .query_row(
+                "SELECT candidate_rows,candidate_payload_bytes FROM derived_usage WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(err)?;
+        Ok(DerivedUsage {
+            candidate_rows,
+            candidate_payload_bytes,
+            database_bytes,
+            wal_bytes,
+            wal_shm_bytes,
+            wal_frames: frames.max(0) as u64,
+            wal_checkpointed: checkpointed.max(0) as u64,
+            wal_busy: busy,
+        })
+    }
+
+    /// Recover abandoned read claims after process exit or after the sole
+    /// coordinator has stopped and discarded every helper receiver. Never call
+    /// this while another reader still has publication authority. No findings
+    /// are pruned, and a failed transaction leaves the replay journal intact.
+    pub(crate) fn recover_discovery(&mut self) -> Result<()> {
         let tx = self.conn.transaction().map_err(err)?;
         loop {
             let active: Option<(String, String)> = tx
@@ -165,6 +384,10 @@ impl Store {
             let Some((root, path)) = active else { break };
             enqueue_scope_in(&tx, &root, Path::new(&path))?;
             tx.execute("INSERT OR IGNORE INTO incomplete_roots VALUES(?1)", [&root])
+                .map_err(err)?;
+            // The persistent derived_limited_roots warning survives restart;
+            // only this abandoned generation's temporary marker is discarded.
+            tx.execute("DELETE FROM refresh_admission WHERE root_id=?1", [&root])
                 .map_err(err)?;
             tx.execute(
                 "DELETE FROM active_scopes WHERE root_id=?1 AND path=?2",
@@ -187,6 +410,8 @@ impl Store {
             enqueue_scope_in(&tx, &root, Path::new(&path))?;
             tx.execute("INSERT OR IGNORE INTO incomplete_roots VALUES(?1)", [&root])
                 .map_err(err)?;
+            tx.execute("DELETE FROM refresh_admission WHERE root_id=?1", [&root])
+                .map_err(err)?;
             tx.execute("DELETE FROM refreshes WHERE root_id=?1", [&root])
                 .map_err(err)?;
         }
@@ -194,6 +419,7 @@ impl Store {
             "DELETE FROM active_scopes;
              DELETE FROM refreshes;
              DELETE FROM refresh_seen;
+             DELETE FROM refresh_admission;
              DELETE FROM pending_scopes WHERE NOT EXISTS(SELECT 1 FROM roots WHERE id=pending_scopes.root_id);",
         )
         .map_err(err)?;
@@ -252,6 +478,28 @@ impl Store {
     pub fn roots(&self) -> Result<Vec<Root>> {
         self.json_rows("SELECT json FROM roots ORDER BY path")
     }
+
+    /// Reconcile an event-history loss boundary atomically. The caller must
+    /// have created `event_cursor` during engine initialization. Every root is
+    /// re-enqueued before the cursor is advanced, so a failed queue write
+    /// leaves the old cursor intact and the event source will retry.
+    pub(crate) fn reconcile_events(&mut self, cursor: u64) -> Result<()> {
+        // Capture grants before opening the write transaction; this avoids
+        // holding a mutable transaction while deserializing arbitrary roots.
+        let roots = self.roots()?;
+        let tx = self.conn.transaction().map_err(err)?;
+        for root in roots {
+            enqueue_scope_in(&tx, &root.id, &root.path)?;
+        }
+        let updated = tx
+            .execute("UPDATE event_cursor SET cursor=?1 WHERE id=1", [cursor])
+            .map_err(err)?;
+        if updated != 1 {
+            return Err("The durable event cursor row is missing".into());
+        }
+        tx.commit().map_err(err)
+    }
+
     pub fn root(&self, id: &str) -> Result<Root> {
         let json: String = self
             .conn
@@ -404,6 +652,10 @@ impl Store {
                 .map_err(err)?;
             tx.execute("DELETE FROM incomplete_roots WHERE root_id=?1", [id])
                 .map_err(err)?;
+            tx.execute("DELETE FROM derived_limited_roots WHERE root_id=?1", [id])
+                .map_err(err)?;
+            tx.execute("DELETE FROM refresh_admission WHERE root_id=?1", [id])
+                .map_err(err)?;
             tx.execute("DELETE FROM roots WHERE id=?1", [id])
                 .map_err(err)?;
         }
@@ -441,6 +693,10 @@ impl Store {
         tx.execute("DELETE FROM scans WHERE root_id=?1", [id])
             .map_err(err)?;
         tx.execute("DELETE FROM incomplete_roots WHERE root_id=?1", [id])
+            .map_err(err)?;
+        tx.execute("DELETE FROM derived_limited_roots WHERE root_id=?1", [id])
+            .map_err(err)?;
+        tx.execute("DELETE FROM refresh_admission WHERE root_id=?1", [id])
             .map_err(err)?;
         let removed = tx
             .execute("DELETE FROM roots WHERE id=?1", [id])
@@ -512,19 +768,38 @@ impl Store {
             .map_err(err)
     }
 
+    pub(crate) fn has_active_scopes(&self) -> Result<bool> {
+        self.conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM active_scopes)", [], |row| {
+                row.get(0)
+            })
+            .map_err(err)
+    }
+
     /// Claim one durable work item. Only one scanner owns an active scope; a
     /// second claim leaves pending work untouched until the first is finished.
     pub fn take_scope(&mut self) -> Result<Option<(String, PathBuf)>> {
+        self.take_scope_bounded(1)
+    }
+
+    /// Bounded parallel readers may own distinct roots, never two generations
+    /// for the same root. Root authorization already excludes same-volume
+    /// overlapping grants; separately granted mounts remain separate readers.
+    pub(crate) fn take_scope_bounded(&mut self, limit: usize) -> Result<Option<(String, PathBuf)>> {
+        if !(1..=2).contains(&limit) {
+            return Err("Invalid read-only discovery admission limit".into());
+        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(err)?;
         let next: Option<(String, String)> = tx
             .query_row(
-                "SELECT root_id,path FROM pending_scopes
-                 WHERE NOT EXISTS(SELECT 1 FROM active_scopes)
-                 ORDER BY rowid LIMIT 1",
-                [],
+                "SELECT p.root_id,p.path FROM pending_scopes p
+                 WHERE (SELECT count(*) FROM active_scopes) < ?1
+                   AND NOT EXISTS(SELECT 1 FROM active_scopes a WHERE a.root_id=p.root_id)
+                 ORDER BY p.rowid LIMIT 1",
+                [limit as u32],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -716,14 +991,38 @@ impl Store {
         if !matches {
             return Err("The completed refresh does not match its active generation".into());
         }
-        let removed = finish_refresh_in(&tx, &refresh.root, &refresh.generation, stats.complete)?;
+        let limited: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM refresh_admission
+                 WHERE root_id=?1 AND generation=?2)",
+                params![refresh.root, refresh.generation],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        let complete = stats.complete && !limited;
+        let removed = finish_refresh_in(&tx, &refresh.root, &refresh.generation, complete)?;
         save_stats_in(&tx, &refresh.root, stats)?;
-        if stats.complete && (refresh.scope.is_none() || !refresh.was_incomplete) {
+        tx.execute(
+            "DELETE FROM refresh_admission WHERE root_id=?1 AND generation=?2",
+            params![refresh.root, refresh.generation],
+        )
+        .map_err(err)?;
+        if complete && (refresh.scope.is_none() || !refresh.was_incomplete) {
             tx.execute(
                 "DELETE FROM incomplete_roots WHERE root_id=?1",
                 [&refresh.root],
             )
             .map_err(err)?;
+            // A successful full pass is the only operation that clears a
+            // persistent admission warning. Scoped passes cannot prove that
+            // omitted observations elsewhere in this root are now present.
+            if refresh.scope.is_none() {
+                tx.execute(
+                    "DELETE FROM derived_limited_roots WHERE root_id=?1",
+                    [&refresh.root],
+                )
+                .map_err(err)?;
+            }
         }
         if requeue {
             enqueue_scope_in(&tx, &refresh.root, Path::new(&refresh.claimed))?;
@@ -738,6 +1037,7 @@ impl Store {
 
     /// Cancellation before begin-refresh still leaves incomplete coverage and
     /// durable replay work, with no gap between requeue and acknowledgement.
+    #[cfg(test)]
     pub(crate) fn cancel_claimed_scope(&mut self, root: &str, claimed: &Path) -> Result<()> {
         let claimed = scope_path(claimed)?;
         let tx = self.conn.transaction().map_err(err)?;
@@ -782,13 +1082,33 @@ impl Store {
             return Ok(());
         }
         let tx = self.conn.transaction().map_err(err)?;
+        let (mut candidate_rows, mut candidate_payload_bytes): (u64, u64) = tx
+            .query_row(
+                "SELECT candidate_rows,candidate_payload_bytes FROM derived_usage WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(err)?;
         let mut changed = false;
         {
+            let mut remove_path_conflict = tx
+                .prepare_cached(
+                    "DELETE FROM candidates
+                     WHERE path=?1 AND id!=?2
+                       AND NOT EXISTS(SELECT 1 FROM candidate_tombstones WHERE id=?2)",
+                )
+                .map_err(err)?;
             let mut insert = tx
                 .prepare_cached(
-                    "INSERT OR REPLACE INTO candidates
-                     SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM candidate_tombstones WHERE id=?1)",
+                    "INSERT INTO candidates(id,root_id,path,json)
+                     SELECT ?1,?2,?3,?4
+                     WHERE NOT EXISTS(SELECT 1 FROM candidate_tombstones WHERE id=?1)
+                     ON CONFLICT(id) DO UPDATE SET
+                       root_id=excluded.root_id,path=excluded.path,json=excluded.json",
                 )
+                .map_err(err)?;
+            let mut existing = tx
+                .prepare_cached("SELECT path,json FROM candidates WHERE id=?1 OR path=?2")
                 .map_err(err)?;
             let mut seen = tx
                 .prepare_cached(
@@ -801,24 +1121,138 @@ impl Store {
                     "UPDATE candidate_tombstones SET root_id=?2,path=?3 WHERE id=?1 AND root_id IS NULL",
                 )
                 .map_err(err)?;
+            let mut limited = tx
+                .prepare_cached(
+                    "INSERT INTO refresh_admission(root_id,generation,omitted_rows,omitted_bytes,reason)
+                     VALUES(?1,?2,?3,?4,?5)
+                     ON CONFLICT(root_id,generation) DO UPDATE SET
+                       omitted_rows=omitted_rows+excluded.omitted_rows,
+                       omitted_bytes=omitted_bytes+excluded.omitted_bytes,
+                       reason=excluded.reason",
+                )
+                .map_err(err)?;
+            let mut root_limited = tx
+                .prepare_cached(
+                    "INSERT INTO derived_limited_roots(root_id,omitted_rows,omitted_bytes,reason)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(root_id) DO UPDATE SET
+                       omitted_rows=omitted_rows+excluded.omitted_rows,
+                       omitted_bytes=omitted_bytes+excluded.omitted_bytes,
+                       reason=excluded.reason",
+                )
+                .map_err(err)?;
+            let mut mark_incomplete = tx
+                .prepare_cached("INSERT OR IGNORE INTO incomplete_roots VALUES(?1)")
+                .map_err(err)?;
             for c in &batch.candidates {
                 let path = scope_path(&c.path)?;
-                seen.execute(params![c.id, c.root_id]).map_err(err)?;
                 // A defensive suppression of an already-missing ID can acquire
                 // its scope from a late batch, while still rejecting that batch.
                 locate_tombstone
                     .execute(params![c.id, c.root_id, path])
                     .map_err(err)?;
-                if !c.provisional {
-                    changed |= insert
-                        .execute(params![
-                            c.id,
-                            c.root_id,
-                            path,
-                            serde_json::to_string(c).map_err(err)?
-                        ])
-                        .map_err(err)?
-                        != 0;
+                if c.provisional {
+                    seen.execute(params![c.id, c.root_id]).map_err(err)?;
+                    continue;
+                }
+                let json = serde_json::to_string(c).map_err(err)?;
+                let weight = candidate_payload_weight(json.as_bytes(), Path::new(&path))?;
+                let mut old_rows = 0u64;
+                let mut old_weight = 0u64;
+                let mut unchanged = false;
+                let mut rows = existing.query(params![c.id, path]).map_err(err)?;
+                while let Some(row) = rows.next().map_err(err)? {
+                    let old_path: String = row.get(0).map_err(err)?;
+                    let old_json: String = row.get(1).map_err(err)?;
+                    old_rows = old_rows.saturating_add(1);
+                    old_weight = old_weight
+                        .checked_add(candidate_payload_weight(
+                            old_json.as_bytes(),
+                            Path::new(&old_path),
+                        )?)
+                        .ok_or("Derived candidate payload overflow")?;
+                    unchanged |= old_path == path && old_json.as_bytes() == json.as_bytes();
+                }
+                let projected_rows = candidate_rows.saturating_sub(old_rows).saturating_add(1);
+                let projected_bytes = candidate_payload_bytes
+                    .saturating_sub(old_weight)
+                    .checked_add(weight)
+                    .ok_or("Derived candidate payload overflow")?;
+                // An unchanged row consumes no additional budget and must be
+                // acknowledged by the active refresh even when retention has
+                // left the existing derived set temporarily over limit.
+                if unchanged {
+                    seen.execute(params![c.id, c.root_id]).map_err(err)?;
+                    continue;
+                }
+                if json.len() > self.derived_limits.max_candidate_json_bytes
+                    || projected_rows > self.derived_limits.max_candidate_rows
+                    || projected_bytes > self.derived_limits.max_candidate_payload_bytes
+                {
+                    // Reserve headroom only for a finding that could fit on
+                    // its own. Oversized rows must not evict useful findings.
+                    // This pressure is separate from the persistent coverage
+                    // warning and is consumed after one low-water target.
+                    if json.len() <= self.derived_limits.max_candidate_json_bytes
+                        && weight <= self.derived_limits.max_candidate_payload_bytes
+                        && self.derived_limits.max_candidate_rows != 0
+                    {
+                        let row_headroom =
+                            if projected_rows > self.derived_limits.max_candidate_rows {
+                                projected_rows.saturating_sub(candidate_rows)
+                            } else {
+                                0
+                            };
+                        let byte_headroom =
+                            if projected_bytes > self.derived_limits.max_candidate_payload_bytes {
+                                weight.saturating_sub(old_weight)
+                            } else {
+                                0
+                            };
+                        tx.execute(
+                            "UPDATE derived_admission_pressure SET
+                             row_headroom=MAX(row_headroom,?1),byte_headroom=MAX(byte_headroom,?2)
+                             WHERE id=1",
+                            params![row_headroom, byte_headroom],
+                        )
+                        .map_err(err)?;
+                    }
+                    let reason = if json.len() > self.derived_limits.max_candidate_json_bytes {
+                        "candidate row exceeds the derived JSON limit"
+                    } else {
+                        "derived candidate budget is full"
+                    };
+                    let omitted_bytes = weight;
+                    let refresh_generation: Option<String> = tx
+                        .query_row(
+                            "SELECT generation FROM refreshes WHERE root_id=?1",
+                            [&c.root_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(err)?;
+                    if let Some(generation) = refresh_generation {
+                        limited
+                            .execute(params![c.root_id, generation, 1u64, omitted_bytes, reason])
+                            .map_err(err)?;
+                    }
+                    root_limited
+                        .execute(params![c.root_id, 1u64, omitted_bytes, reason])
+                        .map_err(err)?;
+                    mark_incomplete.execute([&c.root_id]).map_err(err)?;
+                    continue;
+                }
+                seen.execute(params![c.id, c.root_id]).map_err(err)?;
+                remove_path_conflict
+                    .execute(params![path, c.id])
+                    .map_err(err)?;
+                let inserted = insert
+                    .execute(params![c.id, c.root_id, path, json])
+                    .map_err(err)?;
+                changed |= inserted != 0;
+                if inserted != 0 {
+                    candidate_rows = projected_rows;
+                    candidate_payload_bytes = projected_bytes;
                 }
             }
         }
@@ -827,6 +1261,121 @@ impl Store {
             self.invalidate_candidates();
         }
         Ok(())
+    }
+
+    /// Remove only expendable candidate rows, in a small bounded transaction.
+    /// Eviction itself invalidates the affected roots; no refresh is enqueued
+    /// here, so a full budget cannot create a retry storm.
+    pub(crate) fn maintain_derived(
+        &mut self,
+        protected_candidate_ids: &[String],
+    ) -> Result<DerivedUsage> {
+        let limits = self.derived_limits;
+        let tx = self.conn.transaction().map_err(err)?;
+        let usage: (u64, u64) = tx
+            .query_row(
+                "SELECT candidate_rows,candidate_payload_bytes FROM derived_usage WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(err)?;
+        let pressure: (u64, u64) = tx
+            .query_row(
+                "SELECT row_headroom,byte_headroom FROM derived_admission_pressure WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(err)?;
+        let row_target = limits.max_candidate_rows.saturating_sub(pressure.0);
+        let byte_target = limits
+            .max_candidate_payload_bytes
+            .saturating_sub(pressure.1);
+        if usage.0 <= row_target && usage.1 <= byte_target {
+            if pressure != (0, 0) {
+                tx.execute("UPDATE derived_admission_pressure SET row_headroom=0,byte_headroom=0 WHERE id=1", []).map_err(err)?;
+            }
+            tx.commit().map_err(err)?;
+            return self.derived_usage();
+        }
+        let mut query = tx
+            .prepare(
+                "SELECT c.id,c.root_id,c.path,
+                         length(CAST(c.json AS BLOB))+length(CAST(c.path AS BLOB))+64 FROM candidates c
+                 WHERE NOT EXISTS(SELECT 1 FROM active_scopes a
+                     WHERE a.root_id=c.root_id AND (a.path=c.path
+                         OR c.path>=a.path||'/' AND c.path<a.path||'0'))
+                   AND NOT EXISTS(SELECT 1 FROM kept k WHERE c.path=k.path
+                     OR substr(c.path,1,length(k.path)+1)=k.path||'/'
+                     OR substr(k.path,1,length(c.path)+1)=c.path||'/')
+                 ORDER BY c.rowid LIMIT ?1",
+            )
+            .map_err(err)?;
+        let mut rows = query
+            .query([DERIVED_MAINTENANCE_ROWS as u64])
+            .map_err(err)?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().map_err(err)? {
+            candidates.push((
+                row.get::<_, String>(0).map_err(err)?,
+                row.get::<_, String>(1).map_err(err)?,
+                row.get::<_, String>(2).map_err(err)?,
+                row.get::<_, u64>(3).map_err(err)?,
+            ));
+        }
+        drop(rows);
+        drop(query);
+        let mut evicted = 0usize;
+        let mut affected_roots = std::collections::BTreeSet::new();
+        let mut remaining_bytes = usage.1;
+        for (id, root, path, weight) in candidates {
+            let over = usage.0.saturating_sub(evicted as u64) > row_target
+                || remaining_bytes > byte_target;
+            if !over {
+                break;
+            }
+            if protected_candidate_ids
+                .iter()
+                .any(|protected| protected == &id)
+            {
+                affected_roots.insert(root);
+                continue;
+            }
+            let removed = tx
+                .execute("DELETE FROM candidates WHERE id=?1", [&id])
+                .map_err(err)?;
+            if removed != 0 {
+                evicted += 1;
+                remaining_bytes = remaining_bytes.saturating_sub(weight);
+                affected_roots.insert(root);
+            }
+            let _ = path;
+        }
+        for root in affected_roots {
+            tx.execute("INSERT OR IGNORE INTO incomplete_roots VALUES(?1)", [&root])
+                .map_err(err)?;
+            tx.execute(
+                "INSERT INTO derived_limited_roots(root_id,omitted_rows,omitted_bytes,reason)
+                 VALUES(?1,0,0,?2)
+                 ON CONFLICT(root_id) DO UPDATE SET reason=excluded.reason",
+                params![root, "derived retention protected or evicted observations"],
+            )
+            .map_err(err)?;
+        }
+        if pressure != (0, 0)
+            && usage.0.saturating_sub(evicted as u64) <= row_target
+            && remaining_bytes <= byte_target
+        {
+            tx.execute(
+                "UPDATE derived_admission_pressure SET row_headroom=0,byte_headroom=0 WHERE id=1",
+                [],
+            )
+            .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        if evicted != 0 {
+            self.invalidate_candidates();
+        }
+        self.derived_usage()
     }
     pub fn save_stats(&self, id: &str, stats: &ScanStats) -> Result<()> {
         save_stats_in(&self.conn, id, stats)
@@ -964,6 +1513,49 @@ impl Store {
                 stats.message = format!(
                     "{count} authorized location(s) still need complete reconciliation. {} entries checked in the latest pass.",
                     stats.entries
+                );
+            }
+        }
+        let limited: Option<(u64, u64)> = self
+            .conn
+            .query_row(
+                "SELECT coalesce(sum(omitted_rows),0),coalesce(sum(omitted_bytes),0)
+                 FROM derived_limited_roots HAVING count(*)>0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        if let Some((omitted_rows, omitted_bytes)) = limited {
+            stats.complete = false;
+            if !stats.cancelled {
+                stats.message = format!(
+                    "Derived findings are storage-limited ({omitted_rows} observations / {omitted_bytes} payload bytes omitted); complete reconciliation is required."
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A storage-limited result cannot report complete findings. Ordinary
+    /// root-wide incompleteness is overlaid only on the aggregate snapshot: an
+    /// incremental scope can finish correctly while the rest of its root is
+    /// still awaiting reconciliation.
+    pub(crate) fn apply_root_coverage(&self, root: &str, stats: &mut ScanStats) -> Result<()> {
+        let limited: Option<(u64, u64)> = self
+            .conn
+            .query_row(
+                "SELECT omitted_rows,omitted_bytes FROM derived_limited_roots WHERE root_id=?1",
+                [root],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        if let Some((omitted_rows, omitted_bytes)) = limited {
+            stats.complete = false;
+            if !stats.cancelled {
+                stats.message = format!(
+                    "Derived findings are storage-limited for {root} ({omitted_rows} observations / {omitted_bytes} payload bytes omitted); complete reconciliation is required."
                 );
             }
         }
@@ -1378,6 +1970,25 @@ fn save_stats_in(conn: &Connection, root: &str, stats: &ScanStats) -> Result<()>
     )
     .map_err(err)?;
     Ok(())
+}
+
+fn recount_derived_usage_in(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE derived_usage SET candidate_rows=(SELECT count(*) FROM candidates),
+            candidate_payload_bytes=(SELECT coalesce(sum(length(CAST(json AS BLOB))+
+                length(CAST(path AS BLOB))+64),0) FROM candidates) WHERE id=1",
+        [],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+fn candidate_payload_weight(json: &[u8], path: &Path) -> Result<u64> {
+    let json = u64::try_from(json.len()).map_err(err)?;
+    let path = u64::try_from(path.as_os_str().len()).map_err(err)?;
+    json.checked_add(path)
+        .and_then(|bytes| bytes.checked_add(CANDIDATE_PAYLOAD_OVERHEAD))
+        .ok_or_else(|| "Derived candidate payload overflow".into())
 }
 
 fn acknowledge_scope_in(conn: &Connection, root: &str, claimed: &str) -> Result<()> {
@@ -3094,8 +3705,8 @@ mod tests {
                 blocked,
             ],
         );
-        // Cleanup artifacts share the first group; size orders that group.
-        // Personal-file review cannot displace those cleanup opportunities.
+        // Prefer cheap regenerated caches, then rebuild output, then artifacts
+        // likely to need network downloads. Size orders within each cost class.
         assert_eq!(
             store
                 .candidates()
@@ -3103,12 +3714,12 @@ mod tests {
                 .iter()
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>(),
-            ["venv", "webcache", "node", "cargo", "personal"]
+            ["webcache", "cargo", "venv", "node", "personal"]
         );
         store.keep("/root/cargo", true).unwrap();
         assert_eq!(store.candidates().unwrap().len(), 4);
         store.keep("/root/cargo", false).unwrap();
-        assert_eq!(store.candidates().unwrap()[0].id, "venv");
+        assert_eq!(store.candidates().unwrap()[0].id, "webcache");
         let mut changed = store.candidate("cargo").unwrap();
         changed.suggestion_eligible = false;
         save(&mut store, vec![changed]);
@@ -3157,10 +3768,10 @@ mod tests {
                 .map(|row| row.kind.as_str())
                 .collect::<Vec<_>>(),
             [
-                "xcode",
-                "cache",
                 "log",
                 "crashreport",
+                "cache",
+                "xcode",
                 "installer",
                 "download",
                 "archive",
@@ -3616,7 +4227,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(details.contains("candidate_suggestions_v4"), "{details}");
+        assert!(details.contains("candidate_suggestions_v5"), "{details}");
         assert!(!details.contains("USE TEMP B-TREE"), "{details}");
     }
     #[test]
@@ -3888,5 +4499,292 @@ mod tests {
         store.reconcile().unwrap();
         assert_eq!(store.history().unwrap()[0].detail, recovered.detail);
         assert_eq!(store.wallet().unwrap().pending_coins, 0);
+    }
+
+    #[test]
+    fn derived_usage_counts_utf8_payload_and_unchanged_batches_do_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let candidate = item("🪙", "/root/🪙", "cargo", 100_000_000, true);
+        save(&mut store, vec![candidate.clone()]);
+        let usage = store.derived_usage().unwrap();
+        assert_eq!(usage.candidate_rows, 1);
+        assert_eq!(
+            usage.candidate_payload_bytes,
+            candidate_payload_weight(
+                serde_json::to_string(&candidate).unwrap().as_bytes(),
+                &candidate.path
+            )
+            .unwrap()
+        );
+        let before = store.conn.total_changes();
+        save(&mut store, vec![candidate]);
+        assert_eq!(store.conn.total_changes(), before);
+
+        let mut changed = item("🪙", "/root/🪙", "cargo", 200_000_000, true);
+        changed.title = "changed".into();
+        let before = store.conn.total_changes();
+        save(&mut store, vec![changed.clone()]);
+        assert!(store.conn.total_changes() > before);
+        let usage = store.derived_usage().unwrap();
+        assert_eq!(usage.candidate_rows, 1);
+        assert_eq!(
+            usage.candidate_payload_bytes,
+            candidate_payload_weight(
+                serde_json::to_string(&changed).unwrap().as_bytes(),
+                &changed.path
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn limited_refresh_retains_old_findings_and_marks_coverage_incomplete() {
+        for byte_pressure in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let old = item("old", "/root/old", "cargo", 100_000_000, true);
+            let weight = candidate_payload_weight(
+                serde_json::to_string(&old).unwrap().as_bytes(),
+                &old.path,
+            )
+            .unwrap();
+            let limits = DerivedLimits {
+                max_candidate_rows: if byte_pressure { 50_000 } else { 1 },
+                max_candidate_payload_bytes: if byte_pressure { weight } else { u64::MAX },
+                max_candidate_json_bytes: DEFAULT_MAX_CANDIDATE_JSON_BYTES,
+            };
+            let mut store = Store::open(&dir.path().join("db"))
+                .unwrap()
+                .with_derived_limits(limits);
+            discovery_root(&mut store);
+            save(&mut store, vec![old.clone()]);
+            let root = store.root("root").unwrap();
+            claim(&mut store, &root.path);
+            let refresh = store.begin_scope_refresh(&root, &root.path, None).unwrap();
+            let newer = item("new", "/root/new", "cargo", 100_000_000, true);
+            store
+                .save_batch(&ScanBatch {
+                    candidates: vec![newer.clone()],
+                    stats: ScanStats::default(),
+                })
+                .unwrap();
+            store
+                .finish_scope_refresh(
+                    &refresh,
+                    &ScanStats {
+                        complete: true,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+            assert_eq!(store.candidate("old").unwrap(), old);
+            assert!(store.incomplete("root").unwrap());
+            let mut stats = ScanStats {
+                complete: true,
+                ..Default::default()
+            };
+            store.apply_coverage(&mut stats).unwrap();
+            assert!(!stats.complete);
+            assert!(stats.message.contains("storage-limited"));
+            drop(store);
+            let mut restarted = Store::open(&dir.path().join("db"))
+                .unwrap()
+                .with_derived_limits(limits);
+            let mut restarted_stats = ScanStats {
+                complete: true,
+                ..Default::default()
+            };
+            restarted.apply_coverage(&mut restarted_stats).unwrap();
+            assert!(!restarted_stats.complete);
+            assert!(restarted_stats.message.contains("storage-limited"));
+            // A durable admission-pressure signal permits one bounded Tidy slice
+            // even at the cap, without letting the warning drive endless eviction.
+            assert_eq!(restarted.maintain_derived(&[]).unwrap().candidate_rows, 0);
+            assert!(!restarted.has_pending_scopes().unwrap());
+            claim(&mut restarted, &root.path);
+            let refresh = restarted
+                .begin_scope_refresh(&root, &root.path, None)
+                .unwrap();
+            save(&mut restarted, vec![newer.clone()]);
+            restarted
+                .finish_scope_refresh(
+                    &refresh,
+                    &ScanStats {
+                        complete: true,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+            assert_eq!(restarted.maintain_derived(&[]).unwrap().candidate_rows, 1);
+            drop(restarted);
+            let restarted = Store::open(&dir.path().join("db"))
+                .unwrap()
+                .with_derived_limits(limits);
+            assert_eq!(restarted.candidate("new").unwrap(), newer);
+            assert!(restarted.candidate("old").is_err());
+            assert!(!restarted.incomplete("root").unwrap());
+            let mut stats = ScanStats {
+                complete: true,
+                ..Default::default()
+            };
+            restarted.apply_coverage(&mut stats).unwrap();
+            assert!(stats.complete);
+            assert!(!stats.message.contains("storage-limited"));
+        }
+    }
+
+    #[test]
+    fn admission_pressure_preserves_protected_rows_and_is_consumed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        save(
+            &mut store,
+            vec![
+                item("one", "/root/one", "cargo", 100_000_000, true),
+                item("two", "/root/two", "cargo", 100_000_000, true),
+            ],
+        );
+        store.derived_limits.max_candidate_rows = 2;
+        store.keep("/root/two", true).unwrap();
+        save(
+            &mut store,
+            vec![item("new", "/root/new", "cargo", 100_000_000, true)],
+        );
+        let wallet = store.wallet().unwrap();
+        let pending = store.has_pending_scopes().unwrap();
+        store
+            .conn
+            .execute("INSERT INTO active_scopes VALUES('root','/root/one')", [])
+            .unwrap();
+        assert_eq!(store.maintain_derived(&[]).unwrap().candidate_rows, 2);
+        store.conn.execute("DELETE FROM active_scopes", []).unwrap();
+        assert_eq!(
+            store
+                .maintain_derived(&["one".into()])
+                .unwrap()
+                .candidate_rows,
+            2
+        );
+        assert_eq!(store.maintain_derived(&[]).unwrap().candidate_rows, 1);
+        assert!(store.candidate("two").is_ok());
+        store.keep("/root/two", false).unwrap();
+        // Persisted incomplete/limited coverage cannot by itself evict again.
+        assert_eq!(store.maintain_derived(&[]).unwrap().candidate_rows, 1);
+        assert_eq!(
+            store.wallet().unwrap().credited_bytes,
+            wallet.credited_bytes
+        );
+        assert_eq!(store.has_pending_scopes().unwrap(), pending);
+        let mut oversized = item("large", "/root/large", "cargo", 100_000_000, true);
+        oversized.title = "x".repeat(DEFAULT_MAX_CANDIDATE_JSON_BYTES);
+        save(&mut store, vec![oversized]);
+        assert_eq!(store.maintain_derived(&[]).unwrap().candidate_rows, 1);
+    }
+
+    #[test]
+    fn derived_retention_preserves_durable_truth_and_never_requeues_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        save(
+            &mut store,
+            vec![
+                item("one", "/root/one", "cargo", 100_000_000, true),
+                item("two", "/root/two", "cargo", 100_000_000, true),
+            ],
+        );
+        store.derived_limits.max_candidate_rows = 1;
+        store.keep("/root/two", true).unwrap();
+        let before = store.wallet().unwrap();
+        let pending_before = store.has_pending_scopes().unwrap();
+        let usage = store.maintain_derived(&[]).unwrap();
+        assert!(usage.candidate_rows >= 1);
+        assert!(
+            store.candidate("two").is_ok(),
+            "Keep-protected rows survive"
+        );
+        assert_eq!(
+            store.wallet().unwrap().credited_bytes,
+            before.credited_bytes
+        );
+        assert_eq!(store.has_pending_scopes().unwrap(), pending_before);
+        assert!(store.incomplete("root").unwrap());
+    }
+
+    #[test]
+    fn root_coverage_overlay_does_not_leak_sibling_incomplete_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        store
+            .add_root(&Root {
+                id: "other".into(),
+                path: "/other".into(),
+                kind: "projects".into(),
+                identity: item("other", "/other", "cargo", 1, false).identity,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM incomplete_roots WHERE root_id='other'", [])
+            .unwrap();
+        let mut stats = ScanStats {
+            complete: true,
+            ..Default::default()
+        };
+        store.apply_root_coverage("other", &mut stats).unwrap();
+        assert!(stats.complete);
+        store.apply_root_coverage("root", &mut stats).unwrap();
+        assert!(
+            stats.complete,
+            "A finished scope can coexist with an incomplete root"
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO derived_limited_roots VALUES('root',1,1024,'disposable limit')",
+                [],
+            )
+            .unwrap();
+        store.apply_root_coverage("other", &mut stats).unwrap();
+        assert!(stats.complete);
+        store.apply_root_coverage("root", &mut stats).unwrap();
+        assert!(!stats.complete);
+    }
+
+    #[test]
+    fn event_loss_requeues_every_root_before_setting_exact_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE event_cursor(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL);
+                 INSERT INTO event_cursor VALUES(1,99);",
+            )
+            .unwrap();
+        store.reconcile_events(7).unwrap();
+        let cursor: u64 = store
+            .conn
+            .query_row("SELECT cursor FROM event_cursor WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cursor, 7);
+        assert!(store.has_pending_scopes().unwrap());
+        assert!(store.incomplete("root").unwrap());
+
+        store
+            .conn
+            .execute("DELETE FROM pending_scopes", [])
+            .unwrap();
+        store.conn.execute("DELETE FROM event_cursor", []).unwrap();
+        assert!(store.reconcile_events(8).is_err());
+        assert!(!store.has_pending_scopes().unwrap());
     }
 }
