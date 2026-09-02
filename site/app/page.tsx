@@ -72,7 +72,7 @@ export default function Page() {
             <DemoPanel />
             <p className="mx-auto mt-3.5 max-w-[350px] text-center text-xs leading-[1.55] text-ink-soft">
               An illustrated demo using fictional files and example cleanup results.
-              Select an item to review it. Nothing on your Mac is scanned or changed.
+              Choose Clean up to review an item. Nothing on your Mac is scanned or changed.
             </p>
           </div>
         </section>
