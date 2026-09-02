@@ -75,6 +75,7 @@ enum ScanLaunch {
 }
 
 const BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(600);
+const INTERACTIVE_BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(300);
 
 impl ForegroundRequest {
     fn new(generation: u64, roots: &[Root], context: i64) -> Self {
@@ -244,6 +245,7 @@ pub struct Engine {
     mutation_cancel: AtomicBool,
     cancel_generation: AtomicU64,
     discovery_urgency: AtomicU64,
+    interactive: AtomicBool,
     pause_requested: AtomicBool,
     parked: Mutex<bool>,
     pause_changed: Condvar,
@@ -299,6 +301,7 @@ impl Engine {
             mutation_cancel: AtomicBool::new(false),
             cancel_generation: AtomicU64::new(0),
             discovery_urgency: AtomicU64::new(0),
+            interactive: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             parked: Mutex::new(false),
             pause_changed: Condvar::new(),
@@ -354,6 +357,20 @@ impl Engine {
             .ok_or("Missing action")?;
         match action {
             "snapshot" => serde_json::to_value(self.snapshot()?).map_err(store::err),
+            "set_interactive" => {
+                let active = request
+                    .get("active")
+                    .and_then(Value::as_bool)
+                    .ok_or("set_interactive requires a boolean active")?;
+                let was_active = self.interactive.swap(active, Ordering::AcqRel);
+                if active && !was_active {
+                    // Advisory UI state neither schedules work nor touches an
+                    // admission lock. Advancing the existing wait predicate
+                    // only wakes a background worker that was already batching.
+                    self.expedite_discovery();
+                }
+                Ok(json!({"ok":true}))
+            }
             "cleanup_progress" => {
                 serde_json::to_value(&*self.cleanup_progress.lock().map_err(store::err)?)
                     .map_err(store::err)
@@ -925,9 +942,11 @@ impl Engine {
         self.pause_changed.notify_all();
     }
 
-    /// The caller holds runtime, serializing urgency with worker acquisition.
-    /// Change the predicate under the wait mutex so a request before the worker
-    /// starts waiting is remembered, and a request at the wait cannot be lost.
+    /// Scan callers hold runtime while changing this predicate. The interactive
+    /// hint stays independent of long-running request locks; worker acquisition
+    /// captures urgency before the hint, so either it selects the short deadline
+    /// or this change remains visible and interrupts the wait. Change the
+    /// predicate under the wait mutex so no notification can be lost.
     fn expedite_discovery(&self) {
         let _parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         self.discovery_urgency.fetch_add(1, Ordering::AcqRel);
@@ -1035,6 +1054,7 @@ impl Engine {
         runtime.stats.message = "Looking for useful opportunities…".into();
         // Capture once at worker acquisition, rather than thread startup. Later
         // event batches neither extend the deadline nor consume user urgency.
+        let debounce_urgency = self.discovery_urgency.load(Ordering::Acquire);
         let debounce = (launch == ScanLaunch::Background
             && !runtime
                 .foreground
@@ -1042,8 +1062,13 @@ impl Engine {
                 .is_some_and(|scan| scan.snapshot.active))
         .then(|| {
             (
-                Instant::now() + BACKGROUND_BATCH_DELAY,
-                self.discovery_urgency.load(Ordering::Acquire),
+                Instant::now()
+                    + if self.interactive.load(Ordering::Acquire) {
+                        INTERACTIVE_BACKGROUND_BATCH_DELAY
+                    } else {
+                        BACKGROUND_BATCH_DELAY
+                    },
+                debounce_urgency,
             )
         });
         drop(runtime);
@@ -1821,6 +1846,158 @@ mod controller_tests {
             assert!(waiting.try_recv().is_err());
             assert!(!engine.scanning.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn interactive_hint_is_required_and_inert_without_discovery_work() {
+        let (_temp, engine, _roots) = foreground_fixture(1);
+        let before = serde_json::to_value(engine.snapshot().unwrap()).unwrap();
+        let urgency = engine.discovery_urgency.load(Ordering::Acquire);
+        for request in [
+            json!({"action":"set_interactive"}),
+            json!({"action":"set_interactive","active":null}),
+            json!({"action":"set_interactive","active":"true"}),
+        ] {
+            assert_eq!(
+                engine.request(request).unwrap_err(),
+                "set_interactive requires a boolean active"
+            );
+        }
+        assert!(!engine.interactive.load(Ordering::Acquire));
+        assert_eq!(
+            engine
+                .request(json!({"action":"set_interactive","active":true}))
+                .unwrap(),
+            json!({"ok":true})
+        );
+        let opened_urgency = engine.discovery_urgency.load(Ordering::Acquire);
+        assert_ne!(opened_urgency, urgency);
+        // Repeated visibility delivery is idempotent and cannot keep changing a
+        // future worker's captured urgency.
+        engine
+            .request(json!({"action":"set_interactive","active":true}))
+            .unwrap();
+        assert_eq!(
+            engine.discovery_urgency.load(Ordering::Acquire),
+            opened_urgency
+        );
+        engine
+            .request(json!({"action":"set_interactive","active":false}))
+            .unwrap();
+        assert!(!engine.interactive.load(Ordering::Acquire));
+        assert_eq!(
+            engine.discovery_urgency.load(Ordering::Acquire),
+            opened_urgency
+        );
+        assert!(!engine.busy.load(Ordering::Acquire));
+        assert!(!engine.scanning.load(Ordering::Acquire));
+        assert!(!engine.store.lock().unwrap().has_pending_scopes().unwrap());
+        assert!(engine.runtime.lock().unwrap().foreground.is_none());
+        assert_eq!(
+            serde_json::to_value(engine.snapshot().unwrap()).unwrap(),
+            before,
+            "An advisory visibility hint must not alter grants, foreground state, findings or the ledger"
+        );
+    }
+
+    #[test]
+    fn becoming_interactive_wakes_an_existing_background_wait() {
+        let (_temp, engine, _roots) = foreground_fixture(0);
+        let before = serde_json::to_value(engine.snapshot().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (waiting, finished, worker) = debounce_worker(&engine, deadline);
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            deadline
+        );
+        engine
+            .request(json!({"action":"set_interactive","active":true}))
+            .unwrap();
+        let woke = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        if !woke {
+            engine.cancel_scan();
+        }
+        worker.join().unwrap();
+        assert!(
+            woke,
+            "Opening the app must wake an existing background batch"
+        );
+        assert!(engine.interactive.load(Ordering::Acquire));
+        assert!(!engine.busy.load(Ordering::Acquire));
+        assert!(!engine.scanning.load(Ordering::Acquire));
+        assert!(!engine.store.lock().unwrap().has_pending_scopes().unwrap());
+        assert_eq!(
+            serde_json::to_value(engine.snapshot().unwrap()).unwrap(),
+            before,
+            "Waking an empty debounce must not manufacture foreground work or ledger state"
+        );
+    }
+
+    #[test]
+    fn closing_preserves_the_current_deadline_and_batches_later_workers() {
+        let (_temp, engine, roots) = foreground_fixture(1);
+        let root = &roots[0];
+        let scope = root.path.join("child");
+        engine
+            .request(json!({"action":"set_interactive","active":true}))
+            .unwrap();
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .enqueue_scope(&root.id, &scope)
+            .unwrap();
+        let (interactive_send, interactive_waiting) = std::sync::mpsc::channel();
+        *engine.debounce_wait_observer.lock().unwrap() = Some(interactive_send);
+        let interactive_started = Instant::now();
+        engine.launch_scan(ScanLaunch::Background).unwrap();
+        let interactive_deadline = interactive_waiting
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        engine
+            .request(json!({"action":"set_interactive","active":false}))
+            .unwrap();
+        engine.wake_discovery();
+        assert_eq!(
+            interactive_waiting
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            interactive_deadline,
+            "Closing must not replace or extend a deadline already captured while visible"
+        );
+        assert!(engine.scanning.load(Ordering::Acquire));
+        let interactive_window =
+            interactive_deadline.saturating_duration_since(interactive_started);
+        engine.cancel_scan();
+        wait_for_discovery_idle(&engine);
+        assert!(engine.store.lock().unwrap().has_pending_scopes().unwrap());
+
+        // Resume the still-durable scope as a later background launch, not an
+        // explicit user request that would intentionally bypass batching.
+        engine.scan_paused.store(false, Ordering::Release);
+        let (closed_send, closed_waiting) = std::sync::mpsc::channel();
+        *engine.debounce_wait_observer.lock().unwrap() = Some(closed_send);
+        let closed_started = Instant::now();
+        engine.launch_scan(ScanLaunch::Background).unwrap();
+        let closed_deadline = closed_waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let closed_window = closed_deadline.saturating_duration_since(closed_started);
+        assert!(
+            closed_window > interactive_window + Duration::from_millis(150),
+            "A later hidden worker must retain a materially longer coalescing window"
+        );
+        assert!(engine.scanning.load(Ordering::Acquire));
+        engine.cancel_scan();
+        wait_for_discovery_idle(&engine);
+        assert!(engine.runtime.lock().unwrap().foreground.is_none());
+        assert!(engine.store.lock().unwrap().has_pending_scopes().unwrap());
+        let snapshot = engine.snapshot().unwrap();
+        assert!(snapshot.history.is_empty());
+        assert_eq!(snapshot.wallet.credited_bytes, 0);
+        assert_eq!(
+            fs::read(scope.join("preserve.txt")).unwrap(),
+            b"disposable source"
+        );
     }
 
     #[test]
