@@ -26,12 +26,223 @@ struct FolderEvent {
     let kind: String
     let recursive: Bool
     var request: [String: Any] { ["path": path, "kind": kind, "recursive": recursive] }
+
+    /// A conservative bound for the retained Swift payload and its eventual
+    /// JSON representation. The fixed allowance keeps object/dictionary
+    /// overhead bounded without serializing the event twice.
+    var ingressBytes: Int { path.utf8.count + 64 }
 }
 
 struct FolderEventBatch {
     let events: [FolderEvent]
     let last: UInt64
     let historyLost: Bool
+    let ingressBytes: Int
+
+    init(events: [FolderEvent], last: UInt64, historyLost: Bool) {
+        self.events = events
+        self.last = last
+        self.historyLost = historyLost
+        ingressBytes = events.reduce(0) { $0 + $1.ingressBytes }
+    }
+}
+
+struct FolderEventIngressLimits: Equatable {
+    let maximumBatchEvents: Int
+    let maximumBatchBytes: Int
+    let maximumQueuedBatches: Int
+    let maximumQueuedBytes: Int
+
+    static let production = FolderEventIngressLimits(
+        maximumBatchEvents: 512,
+        maximumBatchBytes: 256 * 1024,
+        // Includes the currently processing batch, not just pending work.
+        maximumQueuedBatches: 16,
+        maximumQueuedBytes: 4 * 1024 * 1024)
+
+    init(maximumBatchEvents: Int, maximumBatchBytes: Int,
+         maximumQueuedBatches: Int, maximumQueuedBytes: Int) {
+        self.maximumBatchEvents = max(1, maximumBatchEvents)
+        self.maximumBatchBytes = max(1, maximumBatchBytes)
+        // Even the smallest test limit must retain an active item and a loss
+        // barrier: silently dropping the barrier could acknowledge lost work.
+        self.maximumQueuedBatches = max(2, maximumQueuedBatches)
+        self.maximumQueuedBytes = max(1, maximumQueuedBytes)
+    }
+}
+
+struct FolderEventWork {
+    let batch: FolderEventBatch
+    let revision: Int
+}
+
+enum FolderEventEnqueueResult: Equatable {
+    case accepted
+    case coalesced
+    case lossBarrier
+    case overflow
+}
+
+/// A deterministic bounded FIFO. The active item remains accounted for while
+/// the engine awaits its durable dirty writes, so the total retained payload is
+/// bounded rather than merely bounding the not-yet-started queue.
+struct BoundedFolderEventIngress {
+    private let limits: FolderEventIngressLimits
+    private var pending: [FolderEventWork] = []
+    private var active: FolderEventWork?
+    private(set) var queuedEventCount = 0
+    private(set) var queuedEventBytes = 0
+
+    init(limits: FolderEventIngressLimits = .production) { self.limits = limits }
+
+    var count: Int { pending.count + (active == nil ? 0 : 1) }
+    var isEmpty: Bool { pending.isEmpty && active == nil }
+
+    func containsChanges(overlapping paths: [String]) -> Bool {
+        func overlaps(_ work: FolderEventWork) -> Bool {
+            work.batch.historyLost || work.batch.events.contains { event in
+                paths.contains { path in
+                    event.path == path || event.path.hasPrefix(path + "/") || path.hasPrefix(event.path + "/")
+                }
+            }
+        }
+        return active.map(overlaps) == true || pending.contains(where: overlaps)
+    }
+
+    mutating func enqueue(_ work: FolderEventWork) -> FolderEventEnqueueResult {
+        let batch = work.batch
+        if batch.historyLost {
+            replacePending(with: FolderEventWork(
+                batch: FolderEventBatch(events: [], last: batch.last, historyLost: true),
+                revision: work.revision))
+            return .lossBarrier
+        }
+        guard batch.events.count <= limits.maximumBatchEvents,
+              batch.ingressBytes <= limits.maximumBatchBytes else {
+            return overflow(with: work)
+        }
+
+        if let index = pending.indices.last,
+           pending[index].revision == work.revision,
+           !pending[index].batch.historyLost {
+            let existing = pending[index].batch
+            let combinedCount = existing.events.count + batch.events.count
+            let combinedBytes = existing.ingressBytes + batch.ingressBytes
+            if combinedCount <= limits.maximumBatchEvents && combinedBytes <= limits.maximumBatchBytes
+                && queuedEventBytes + batch.ingressBytes <= limits.maximumQueuedBytes {
+                let merged = FolderEventBatch(events: existing.events + batch.events,
+                                              last: max(existing.last, batch.last), historyLost: false)
+                queuedEventCount += batch.events.count
+                queuedEventBytes += batch.ingressBytes
+                pending[index] = FolderEventWork(batch: merged, revision: work.revision)
+                return .coalesced
+            }
+        }
+        guard count < limits.maximumQueuedBatches,
+              queuedEventBytes + batch.ingressBytes <= limits.maximumQueuedBytes else {
+            return overflow(with: work)
+        }
+        pending.append(work)
+        queuedEventCount += batch.events.count
+        queuedEventBytes += batch.ingressBytes
+        return .accepted
+    }
+
+    mutating func startNext() -> FolderEventWork? {
+        guard active == nil, !pending.isEmpty else { return nil }
+        active = pending.removeFirst()
+        return active
+    }
+
+    mutating func finishActive() {
+        guard let active else { return }
+        queuedEventCount -= active.batch.events.count
+        queuedEventBytes -= active.batch.ingressBytes
+        self.active = nil
+    }
+
+    private mutating func overflow(with work: FolderEventWork) -> FolderEventEnqueueResult {
+        replacePending(with: FolderEventWork(
+            batch: FolderEventBatch(events: [], last: work.batch.last, historyLost: true),
+            revision: work.revision))
+        return .overflow
+    }
+
+    private mutating func replacePending(with work: FolderEventWork) {
+        queuedEventCount -= pending.reduce(0) { $0 + $1.batch.events.count }
+        queuedEventBytes -= pending.reduce(0) { $0 + $1.batch.ingressBytes }
+        pending.removeAll(keepingCapacity: true)
+        pending.append(work)
+        queuedEventCount += work.batch.events.count
+        queuedEventBytes += work.batch.ingressBytes
+    }
+}
+
+/// The bound lives on the producer side of the actor hop. A filesystem storm
+/// can schedule only one drain task, even while the main actor is busy. Every
+/// retained payload (including active work) lives in the bounded FIFO above.
+final class FolderEventMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ingress: BoundedFolderEventIngress
+    private var scheduled = false
+    private var invalidation: UInt64 = 0
+    private var revision = 0
+
+    init(limits: FolderEventIngressLimits = .production) {
+        ingress = BoundedFolderEventIngress(limits: limits)
+    }
+
+    func activate(revision: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.revision = revision
+    }
+
+    /// True only when the caller must schedule the single main-actor drain.
+    func enqueue(_ work: FolderEventWork) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        // Late callbacks from an invalidated stream must not replace pending
+        // current-generation paths with a barrier the consumer would ignore.
+        guard work.revision == revision else { return false }
+        if work.batch.historyLost || !work.batch.events.isEmpty { invalidation &+= 1 }
+        _ = ingress.enqueue(work)
+        guard !scheduled else { return false }
+        scheduled = true
+        return true
+    }
+
+    func startNext() -> FolderEventWork? {
+        lock.lock()
+        defer { lock.unlock() }
+        let work = ingress.startNext()
+        if work == nil && ingress.isEmpty { scheduled = false }
+        return work
+    }
+
+    func finishActive() {
+        lock.lock()
+        defer { lock.unlock() }
+        ingress.finishActive()
+    }
+
+    var invalidationRevision: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return invalidation
+    }
+
+    func containsChanges(overlapping paths: [String]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ingress.containsChanges(overlapping: paths)
+    }
+
+    var retainedWork: (batches: Int, events: Int, bytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (ingress.count, ingress.queuedEventCount, ingress.queuedEventBytes)
+    }
 }
 
 /// Decodes borrowed callback values before retaining paths for the engine queue.
@@ -67,15 +278,20 @@ struct FolderEventDecoder {
     }
 
     func decode(paths: NSArray, flags: UnsafeBufferPointer<FSEventStreamEventFlags>,
-                ids: UnsafeBufferPointer<FSEventStreamEventId>) -> FolderEventBatch? {
+                ids: UnsafeBufferPointer<FSEventStreamEventId>,
+                limits: FolderEventIngressLimits = .production) -> FolderEventBatch? {
         let last = ids.max() ?? 0
         let dropped = FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped)
         // Loss flags apply even when every path is excluded. The bridge responds
         // by refreshing all roots, so there is no need to retain individual paths.
         if flags.count != ids.count || flags.contains(where: { $0 & dropped != 0 }) {
-            return FolderEventBatch(events: [], last: last, historyLost: true)
+            // After an ID wrap the numerical maximum may belong to the old
+            // epoch. The final delivered event is the reconciliation boundary.
+            let wrapped = flags.contains { $0 & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped) != 0 }
+            return FolderEventBatch(events: [], last: wrapped ? ids.last ?? 0 : last, historyLost: true)
         }
         var changed: [FolderEvent] = []
+        var retainedBytes = 0
         var filteredInternal = false
         for index in ids.indices {
             let flag = flags[index]
@@ -95,7 +311,13 @@ struct FolderEventDecoder {
             let subtree = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged)
             let structural = FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemRenamed)
             let recursive = flag & subtree != 0 || (kind != "file" && flag & structural != 0)
-            changed.append(FolderEvent(path: path, kind: kind, recursive: recursive))
+            let event = FolderEvent(path: path, kind: kind, recursive: recursive)
+            guard changed.count < limits.maximumBatchEvents,
+                  retainedBytes + event.ingressBytes <= limits.maximumBatchBytes else {
+                return FolderEventBatch(events: [], last: last, historyLost: true)
+            }
+            retainedBytes += event.ingressBytes
+            changed.append(event)
         }
         // Internal-only batches still acknowledge their cursor. State-only
         // batches must stay silent or the cursor write would feed back forever.
@@ -131,8 +353,7 @@ struct FolderEventDecoder {
                     if !internalComponent {
                         // These names resolve a scope before Rust reaches a later
                         // .chippytea- component. Preserve those invalidations.
-                        if component.elementsEqual("target".utf8) || component.elementsEqual("node_modules".utf8)
-                            || component.elementsEqual(".git".utf8) || component.elementsEqual(".cargo".utf8) { return false }
+                        if Self.scopeBoundaryNames.contains(where: { component.elementsEqual($0) }) { return false }
                         internalComponent = component.starts(with: ".chippytea-".utf8)
                     }
                     if offset == bytes.count { break }
@@ -146,6 +367,13 @@ struct FolderEventDecoder {
             return matchedRoot
         }
     }
+
+    // Mirror Rust's lexical artifact boundaries, not its ownership decisions.
+    // A change beneath any possible artifact must reach Rust for validation.
+    private static let scopeBoundaryNames: [[UInt8]] = [
+        "target", "node_modules", ".git", ".cargo", ".venv", "venv", ".next", ".nuxt",
+        ".turbo", ".parcel-cache", ".build", ".dart_tool", ".zig-cache", "build", ".gradle", "bin", "obj"
+    ].map { Array($0.utf8) }
 }
 
 /// Receives and flushes on the watcher's serial queue. Only a cursor is retained;
