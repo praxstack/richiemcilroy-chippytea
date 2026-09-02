@@ -757,7 +757,25 @@ pub(crate) fn check_scope_policy(root: &Root, path: &Path) -> Result<()> {
     if !path.starts_with(&root.path) {
         return Err("The path is outside its authorized folder".into());
     }
-    check_path_policy(path)?;
+    if crate::recommendations::library_route_allowed(root, path) {
+        // The Home grant, not a name anywhere on disk, authorizes these exact
+        // user routes. All other protected components remain protected, even
+        // inside a cache. Physical ancestry is verified by the callers as usual.
+        check_path_policy(&root.path)?;
+        let relative = path.strip_prefix(&root.path).unwrap();
+        let names = relative.components().collect::<Vec<_>>();
+        if names
+            .first()
+            .is_none_or(|part| part.as_os_str() != "Library")
+            || names.iter().skip(1).any(|part| {
+                !matches!(part, Component::Normal(_)) || excluded_name(part.as_os_str(), true)
+            })
+        {
+            return Err("Protected content inside this Library route is excluded".into());
+        }
+    } else {
+        check_path_policy(path)?;
+    }
     if excluded_home_media(root, path) {
         return Err("Personal media folders are excluded from Home discovery".into());
     }
@@ -1216,6 +1234,29 @@ pub(crate) struct DiscoveryStep {
     pub finished: bool,
 }
 
+#[derive(Clone, Copy)]
+enum DiscoveryFiles {
+    None,
+    Personal,
+    Library { cache_root: bool },
+}
+
+impl DiscoveryFiles {
+    fn includes(self, name: &OsStr) -> bool {
+        match self {
+            Self::None => false,
+            Self::Personal => crate::recommendations::personal_file_name(name),
+            Self::Library { .. } => true,
+        }
+    }
+
+    fn excludes_before_metadata(self, name: &OsStr) -> bool {
+        matches!(self, Self::Library { cache_root }
+            if excluded_name(name, true)
+                || (cache_root && crate::recommendations::managed_cache(name)))
+    }
+}
+
 fn directory_entry_path(directory: &Path, name: &OsStr) -> PathBuf {
     let parent = directory.as_os_str().as_bytes();
     let separator = usize::from(!parent.is_empty() && !parent.ends_with(b"/"));
@@ -1341,6 +1382,35 @@ impl Directory {
         cancel: &AtomicBool,
         home_children: bool,
     ) -> Result<DiscoveryStep> {
+        self.next_discovery_filtered(cancel, home_children, DiscoveryFiles::None)
+    }
+
+    /// Personal-file discovery keeps the same bounded names pass, requesting
+    /// metadata only for relevant document, media and archive formats.
+    pub(crate) fn next_personal_discovery(
+        &mut self,
+        cancel: &AtomicBool,
+        home_children: bool,
+    ) -> Result<DiscoveryStep> {
+        self.next_discovery_filtered(cancel, home_children, DiscoveryFiles::Personal)
+    }
+
+    /// Targeted Library routes need regular-file metadata, but still reject
+    /// protected names and manager-owned cache stores before a stat or open.
+    pub(crate) fn next_library_discovery(
+        &mut self,
+        cancel: &AtomicBool,
+        cache_root: bool,
+    ) -> Result<DiscoveryStep> {
+        self.next_discovery_filtered(cancel, false, DiscoveryFiles::Library { cache_root })
+    }
+
+    fn next_discovery_filtered(
+        &mut self,
+        cancel: &AtomicBool,
+        home_children: bool,
+        files: DiscoveryFiles,
+    ) -> Result<DiscoveryStep> {
         self.initialize_names(cancel)?;
         let mut step = DiscoveryStep {
             entry: None,
@@ -1367,6 +1437,12 @@ impl Directory {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
+            let name = OsStr::from_bytes(bytes);
+            if files.excludes_before_metadata(name) {
+                step.skipped += 1;
+                step.metadata_skipped += 1;
+                continue;
+            }
             let entry_type = unsafe { (*record).d_type };
             #[cfg(test)]
             let entry_type = if self.force_unknown_types {
@@ -1376,6 +1452,13 @@ impl Directory {
             };
             match entry_type {
                 libc::DT_REG => {
+                    if files.includes(name) {
+                        step.entry = Some(DiscoveryEntry::Metadata(Entry {
+                            path: directory_entry_path(&self.path, name),
+                            meta: stat_child(self.fd(), name)?,
+                        }));
+                        break;
+                    }
                     step.files += 1;
                     step.metadata_skipped += 1;
                 }
@@ -1396,7 +1479,7 @@ impl Directory {
                         break;
                     }
                     let meta = stat_child(self.fd(), name)?;
-                    if meta.is_dir() {
+                    if meta.is_dir() || (meta.is_file() && files.includes(name)) {
                         step.entry = Some(DiscoveryEntry::Metadata(Entry {
                             path: directory_entry_path(&self.path, name),
                             meta,
@@ -4307,6 +4390,98 @@ pub(crate) mod tests {
                 .next_discovery(&AtomicBool::new(true), false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn personal_names_only_request_metadata_for_reviewable_formats() {
+        let (_temp, base) = fixture();
+        for index in 0..600 {
+            std::fs::write(base.join(format!("source-{index}.rs")), b"source").unwrap();
+        }
+        for name in ["report.pdf", "recording.MOV", ".hidden.zip"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+        std::fs::create_dir(base.join("Library")).unwrap();
+        symlink("report.pdf", base.join("linked.pdf")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut directory = Directory::open(&base).unwrap();
+        let before = CHILD_METADATA_CALLS.with(std::cell::Cell::get);
+        let (mut files, mut skipped) = (0, 0);
+        let mut selected = Vec::new();
+        loop {
+            let step = directory.next_personal_discovery(&cancel, false).unwrap();
+            assert!(step.files + step.skipped + u64::from(step.entry.is_some()) <= 256);
+            files += step.files;
+            skipped += step.skipped;
+            if let Some(entry) = step.entry {
+                let DiscoveryEntry::Metadata(entry) = entry else {
+                    panic!("Only the two ordinary personal files should be selected");
+                };
+                assert!(entry.meta.is_file() && !entry.meta.is_symlink());
+                selected.push(entry.path.file_name().unwrap().to_owned());
+            }
+            if step.finished {
+                break;
+            }
+        }
+        selected.sort();
+        assert_eq!(
+            selected,
+            [OsStr::new("recording.MOV"), OsStr::new("report.pdf")]
+        );
+        assert_eq!((files, skipped), (601, 2));
+        assert_eq!(CHILD_METADATA_CALLS.with(std::cell::Cell::get) - before, 2);
+        assert!(
+            directory
+                .next_personal_discovery(&AtomicBool::new(true), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn library_names_exclude_protected_and_managed_entries_before_metadata() {
+        let (_temp, base) = fixture();
+        let excluded = [".git", "Library", "Dropbox", "Homebrew", "uv", "pip"];
+        for name in excluded {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
+        std::fs::create_dir(base.join("com.example.browser")).unwrap();
+        std::fs::write(base.join("ordinary.log"), b"fixture").unwrap();
+        symlink("ordinary.log", base.join("linked.log")).unwrap();
+        for unknown_types in [false, true] {
+            let mut directory = Directory::open(&base).unwrap();
+            directory.force_unknown_types = unknown_types;
+            let before = CHILD_METADATA_CALLS.with(std::cell::Cell::get);
+            let mut selected = Vec::new();
+            let mut skipped = 0;
+            loop {
+                let step = directory
+                    .next_library_discovery(&AtomicBool::new(false), true)
+                    .unwrap();
+                skipped += step.skipped;
+                if let Some(entry) = step.entry {
+                    selected.push(match entry {
+                        DiscoveryEntry::Directory(path) => path,
+                        DiscoveryEntry::Metadata(entry) => entry.path,
+                    });
+                }
+                if step.finished {
+                    break;
+                }
+            }
+            selected.sort();
+            assert_eq!(
+                selected,
+                [base.join("com.example.browser"), base.join("ordinary.log")]
+            );
+            assert_eq!(skipped, excluded.len() as u64 + 1);
+            // Unknown types need a no-follow stat for the ordinary directory
+            // and link too; protected names never need one in either mode.
+            assert_eq!(
+                CHILD_METADATA_CALLS.with(std::cell::Cell::get) - before,
+                if unknown_types { 3 } else { 1 }
+            );
+        }
     }
 
     #[test]
