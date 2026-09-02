@@ -35,11 +35,13 @@ chippytea runs locally from your menu bar. No account, no telemetry, no automati
 
 ## How it works
 
-1. **Find cleanup opportunities.** Scan folders you choose, or use the guided home-folder scan. Old `target` and `node_modules` folders are good places to start.
-2. **Check before you clean.** Review the files, estimated size, and consequences. Tracked files, active projects, cloud-managed items, and uncertain candidates stay out.
+1. **Find cleanup opportunities.** Scan folders you choose, or use the guided home-folder scan for old app caches, logs, Xcode data, build folders, downloads and large personal files.
+2. **Check before you clean.** Review the files, estimated size, and consequences. Git and activity checks vary by category; personal files and caches without an identified owning app still need your judgment.
 3. **Choose what to remove.** Move files to Trash, or permanently remove eligible build files and dependencies. Review the outcome and any credited space in the cleanup history.
 
-Moving files to **Trash does not free storage**. Downloads and installers are Trash-only.
+**Check duplicate files** compares already-indexed old/large personal-file suggestions when you ask. It verifies contents, lets you choose one copy to keep and one to review, and rechecks both before moving the selected copy to Trash. This is a bounded check, not a whole-Mac duplicate search; ordinary scans never hash personal-file contents.
+
+Moving files to **Trash does not free storage**. App caches, logs, Xcode DerivedData, downloads and personal files are review/Trash-only; they never earn chips. Permanent cleanup is limited to verified, eligible developer build files and dependencies.
 
 This is early software that can permanently delete files. Start with a disposable test folder and keep backups. Full Disk Access is optional. The [recommendation policy](docs/SUGGESTIONS.md) explains what qualifies, what stays out, and where the checks have limits.
 
