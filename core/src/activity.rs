@@ -161,6 +161,31 @@ impl ActivitySnapshot {
         location: &Path,
         cancel: &AtomicBool,
     ) -> Option<String> {
+        // A global managed host can load project output named only in its
+        // arguments or open handles while its cwd is elsewhere. We do not
+        // inspect those private arguments or infer which project it uses.
+        // For the additional review-only ecosystems, known hosts therefore
+        // make activity ambiguous even when the path-overlap check is clear.
+        if crate::recommendations::review_project_kind(kind)
+            && self.executable_paths.iter().any(|path| {
+                let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                    return false;
+                };
+                matches!(
+                    (kind, name),
+                    ("dotnet", "dotnet")
+                        | ("gradle", "java" | "gradle")
+                        | (
+                            "dart" | "flutter",
+                            "dart" | "dartaotruntime" | "flutter_tester"
+                        )
+                        | ("swiftpm", "swift" | "swift-frontend" | "swift-build")
+                        | ("zig", "zig")
+                )
+            })
+        {
+            return Some("A runtime or build tool for this ecosystem is running. Its project references cannot be attributed reliably; close it before reviewing this generated data for cleanup".into());
+        }
         if kind == "xcode"
             && self.executable_paths.iter().any(|path| {
                 path.file_name()
@@ -699,6 +724,42 @@ mod tests {
                 .iter()
                 .map(|id| (*id).into())
                 .collect())),
+        }
+    }
+
+    #[test]
+    fn review_ecosystems_withhold_cleanup_for_external_managed_hosts() {
+        let project = Path::new("/Projects/Example");
+        let cancel = AtomicBool::new(false);
+        for (kind, host) in [
+            ("dotnet", "dotnet"),
+            ("gradle", "java"),
+            ("gradle", "gradle"),
+            ("dart", "dart"),
+            ("dart", "dartaotruntime"),
+            ("flutter", "dart"),
+            ("flutter", "flutter_tester"),
+            ("swiftpm", "swift"),
+            ("swiftpm", "swift-frontend"),
+            ("swiftpm", "swift-build"),
+            ("zig", "zig"),
+        ] {
+            let mut activity = ActivitySnapshot {
+                working_directories: vec![PathBuf::from("/Unrelated")],
+                executable_paths: vec![Path::new("/Global/SDK").join(host)],
+                running_app_bundle_ids: OnceCell::new(),
+            };
+            assert!(activity.blocked(project).is_none());
+            assert!(
+                activity.blocked_for(kind, project, &cancel).is_some(),
+                "{kind} cannot attribute the external {host} runtime to an idle project"
+            );
+            assert!(activity.running_app_bundle_ids.get().is_none());
+            // This conservative ambiguity policy does not change the existing
+            // developer categories or declare all unrelated hosts active.
+            assert!(activity.blocked_for("cargo", project, &cancel).is_none());
+            activity.executable_paths.clear();
+            assert!(activity.blocked_for(kind, project, &cancel).is_none());
         }
     }
 
