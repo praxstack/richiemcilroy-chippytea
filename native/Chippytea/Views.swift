@@ -1823,6 +1823,14 @@ private struct SettingsPage: View {
                                   symbol: "trash", binding: $model.confirmBeforeDeleting)
                 }
 
+                SettingsSection(title: "Owner-managed storage", seed: 393) {
+                    ManagedStorageView(model: model)
+                }
+
+                SettingsSection(title: "chippytea’s own footprint", seed: 419) {
+                    StorageFootprintView(model: model)
+                }
+
                 SettingsSection(title: "Folders you’ve invited in", seed: 377) {
                     ForEach(model.snapshot.roots) { root in
                         HStack(spacing: 10) {
