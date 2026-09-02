@@ -52,10 +52,15 @@ def feed(path, versions=("0.2.0",), length=8, mutate=None):
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
 
-def make_zip(path, entries=(), info=None):
+def make_zip(path, entries=(), info=None, include_scan_helper=True):
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("chippytea.app/Contents/Info.plist", plistlib.dumps(info or app_info()))
         archive.writestr("chippytea.app/Contents/MacOS/chippytea", b"fixture executable")
+        if include_scan_helper:
+            helper = zipfile.ZipInfo("chippytea.app/Contents/Helpers/chippytea-scan-helper")
+            helper.create_system = 3
+            helper.external_attr = (stat.S_IFREG | 0o755) << 16
+            archive.writestr(helper, b"fixture read-only scan helper")
         for name, value, mode in entries:
             entry = zipfile.ZipInfo(name)
             entry.create_system = 3
@@ -505,6 +510,21 @@ class ArchiveTests(TemporaryTests):
                 (f"{base}/Sparkle", target, stat.S_IFLNK | 0o777)])
             with self.subTest(target=target):
                 release.validate_zip(self.path, "0.2.0")
+
+    def test_scan_helper_is_required_and_cannot_be_redirected_or_nonexecutable(self):
+        make_zip(self.path, include_scan_helper=False)
+        with self.assertRaisesRegex(release.ReleaseError, "missing the read-only scan helper"):
+            release.validate_zip(self.path, "0.2.0")
+        helper = "chippytea.app/Contents/Helpers/chippytea-scan-helper"
+        for value, mode in ((b"../MacOS/chippytea", stat.S_IFLNK | 0o777),
+                            (b"fixture helper", stat.S_IFREG | 0o644),
+                            (b"", stat.S_IFREG | 0o755)):
+            make_zip(self.path, [(helper, value, mode)], include_scan_helper=False)
+            with self.subTest(mode=mode, size=len(value)), self.assertRaises(release.ReleaseError):
+                release.validate_zip(self.path, "0.2.0")
+        make_zip(self.path, [("chippytea.app/Contents/Helpers", b"OtherHelpers", stat.S_IFLNK | 0o777)])
+        with self.assertRaisesRegex(release.ReleaseError, "must not be symlinks"):
+            release.validate_zip(self.path, "0.2.0")
 
     def test_traversal_absolute_and_unrelated_archive_entries_fail(self):
         for name in ("../escape", "/tmp/escape", "chippytea.app/../escape",

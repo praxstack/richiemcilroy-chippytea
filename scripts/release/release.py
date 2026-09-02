@@ -523,10 +523,18 @@ def validate_zip(path: Path, version: str) -> None:
                     resolved_names.add(destination)
             info_path = PurePosixPath("chippytea.app/Contents/Info.plist")
             executable = PurePosixPath("chippytea.app/Contents/MacOS/chippytea")
+            scan_helper = PurePosixPath("chippytea.app/Contents/Helpers/chippytea-scan-helper")
             require(info_path in names and executable in names, "ZIP is missing the application.")
+            require(scan_helper in names, "ZIP is missing the read-only scan helper.")
             require(archive_path_key(info_path) not in links and
-                    archive_path_key(executable) not in links,
-                    "Application metadata and executable must not be symlinks.")
+                    archive_path_key(executable) not in links and
+                    all(archive_path_key(component) not in links
+                        for component in (scan_helper, *scan_helper.parents)),
+                    "Application metadata, executable and scan helper must not be symlinks.")
+            require(stat.S_IFMT(names[scan_helper].external_attr >> 16) == stat.S_IFREG and
+                    names[scan_helper].external_attr >> 16 & 0o111 and
+                    names[scan_helper].file_size > 0,
+                    "The scan helper must be a nonempty regular executable.")
             require(names[info_path].file_size <= 1024 * 1024, "App plist is excessively large.")
             info = plistlib.loads(archive.read(names[info_path]))
             validate_plist(info, version)
