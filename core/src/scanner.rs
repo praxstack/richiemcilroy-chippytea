@@ -28,6 +28,17 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BATCH: usize = 64;
 const MAX_SHALLOW_FRONTIER: usize = 32;
 const MAX_DEFERRED_ARTIFACTS: usize = 256;
+const MAX_SCAN_LANES: usize = 4;
+const MAX_MEASUREMENT_JOB_BYTES: usize = 1024 * 1024;
+const MEASUREMENT_QUANTUM_ENTRIES: usize = 256;
+const MEASUREMENT_QUANTUM: Duration = Duration::from_millis(5);
+// Discovery and measurement retain descriptor-anchored stacks. This is a
+// process-wide scheduling ceiling. Standalone scan processes reserve this
+// budget plus non-traversal headroom before admitting filesystem work; the
+// native host's descriptor limits are never changed by discovery.
+pub(crate) const MAX_SCHEDULED_DIRECTORY_FDS: usize = MAX_SHALLOW_FRONTIER + 6 * safety::MAX_DEPTH;
+const MAX_ACTIVE_MEASUREMENTS: usize =
+    (MAX_SCHEDULED_DIRECTORY_FDS - MAX_SHALLOW_FRONTIER) / safety::MAX_DEPTH - MAX_SCAN_LANES;
 const DAY_NS: i64 = 86_400_000_000_000;
 const DEVELOPER_QUIET_DAYS: i64 = 7;
 #[cfg(test)]
@@ -1411,6 +1422,7 @@ fn evidence_with_downloads_cached(
                 name @ ("node_modules" | "target" | ".venv" | "venv" | ".next" | ".nuxt" | ".turbo"
                 | ".parcel-cache"),
             ) => Some(name),
+            Some(name) if crate::project_providers::recognizes_name(OsStr::new(name)) => Some(name),
             _ => return Ok(None),
         }
     } else {
@@ -1445,6 +1457,21 @@ fn evidence_with_downloads_cached(
             Some(".venv" | "venv") => venv_evidence(parent, path, cancel, caches),
             Some(".next" | ".nuxt" | ".turbo" | ".parcel-cache") => {
                 webcache_evidence(parent, path, cancel, caches)
+            }
+            Some(name) if crate::project_providers::recognizes_name(OsStr::new(name)) => {
+                crate::project_providers::identify(root, path, cancel).map(|found| {
+                    found.map(|found| Evidence {
+                        kind: found.kind,
+                        title: found.title,
+                        explanation: found.explanation,
+                        consequence: found.consequence,
+                        fingerprint: found.fingerprint,
+                        blocked: found.blocked,
+                        latest_modified_ns: found.latest_modified_ns,
+                        quiet_days: recommendations::quiet_days(found.kind),
+                        activity_root: Some(found.activity_root),
+                    })
+                })
             }
             _ => Ok(None),
         }
@@ -1535,19 +1562,20 @@ fn tally(stats: &mut ScanStats, links: &mut Hardlinks, meta: &EntryMeta, device:
 /// refresh invalidation so an event inside any of them remeasures the whole
 /// artifact. The conditional names below still need their positive evidence.
 pub(crate) fn artifact_component(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            "node_modules"
-                | "target"
-                | ".venv"
-                | "venv"
-                | ".next"
-                | ".nuxt"
-                | ".turbo"
-                | ".parcel-cache"
+    crate::project_providers::recognizes_name(name)
+        || matches!(
+            name.to_str(),
+            Some(
+                "node_modules"
+                    | "target"
+                    | ".venv"
+                    | "venv"
+                    | ".next"
+                    | ".nuxt"
+                    | ".turbo"
+                    | ".parcel-cache"
+            )
         )
-    )
 }
 
 fn is_artifact_name(path: &Path) -> bool {
@@ -1558,10 +1586,12 @@ fn is_artifact_name(path: &Path) -> bool {
 /// Without that evidence the directory stays ordinary and is traversed, unlike
 /// node_modules/target boundaries which never become ordinary content.
 fn is_conditional_artifact_name(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(OsStr::to_str),
-        Some(".venv" | "venv" | ".next" | ".nuxt" | ".turbo" | ".parcel-cache")
-    )
+    path.file_name()
+        .is_some_and(crate::project_providers::recognizes_name)
+        || matches!(
+            path.file_name().and_then(OsStr::to_str),
+            Some(".venv" | "venv" | ".next" | ".nuxt" | ".turbo" | ".parcel-cache")
+        )
 }
 
 /// An incremental event anywhere within a recognized artifact invalidates and
@@ -1578,6 +1608,7 @@ struct ScanDirectory {
     directory: Directory,
     depth: usize,
     classify: bool,
+    lane: usize,
 }
 
 struct DeferredArtifact {
@@ -1585,6 +1616,56 @@ struct DeferredArtifact {
     evidence: Evidence,
     early_quiet: bool,
     blocked: Option<String>,
+}
+
+struct ArtifactReview {
+    entry: Entry,
+    found: Evidence,
+    candidate: Candidate,
+    blocked: Option<String>,
+    is_dir: bool,
+    cutoff: i64,
+    can_learn: bool,
+    recent_leaf: Option<PathBuf>,
+}
+
+impl ArtifactReview {
+    fn retained_bytes(&self) -> usize {
+        let candidate = &self.candidate;
+        self.entry
+            .path
+            .as_os_str()
+            .len()
+            .saturating_add(candidate.id.len())
+            .saturating_add(candidate.root_id.len())
+            .saturating_add(candidate.path.as_os_str().len())
+            .saturating_add(candidate.title.len())
+            .saturating_add(candidate.kind.len())
+            .saturating_add(candidate.explanation.len())
+            .saturating_add(candidate.consequence.len())
+            .saturating_add(candidate.fingerprint.len())
+            .saturating_add(candidate.evidence.len())
+            .saturating_add(candidate.blocked_reason.as_ref().map_or(0, String::len))
+            .saturating_add(self.found.title.len())
+            .saturating_add(self.found.fingerprint.len())
+            .saturating_add(self.blocked.as_ref().map_or(0, String::len))
+            .saturating_add(
+                self.found
+                    .activity_root
+                    .as_ref()
+                    .map_or(0, |path| path.as_os_str().len()),
+            )
+            .saturating_add(
+                self.recent_leaf
+                    .as_ref()
+                    .map_or(0, |path| path.as_os_str().len()),
+            )
+    }
+}
+
+struct ArtifactMeasurement {
+    review: ArtifactReview,
+    cursor: safety::MeasurementCursor,
 }
 
 fn verify_deferred_artifact(
@@ -1655,6 +1736,219 @@ fn activity_reason(
     match ActivitySnapshot::capture_with_max_age(cached, max_age, cancel) {
         Ok(snapshot) => snapshot.blocked_for(kind, project, cancel),
         Err(reason) => Some(reason.clone()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_artifact_review<F: FnMut(ScanBatch)>(
+    mut review: ArtifactReview,
+    measured: Result<Measurement>,
+    root: &Root,
+    cancel: &AtomicBool,
+    stats: &mut ScanStats,
+    activity: &mut Option<(Instant, Result<ActivitySnapshot>)>,
+    caches: &mut EvidenceCaches,
+    downloads: Option<&Path>,
+    recent_files: Option<&mut RecentFileHints>,
+    publisher: &mut Publisher<F>,
+) {
+    let mut quality_reason = Some("Measurement is incomplete".to_owned());
+    match measured {
+        Ok(measured) => {
+            stats.skipped += measured.skipped;
+            stats.errors += measured.errors;
+            if measured.pruned {
+                stats.excluded_artifacts += 1;
+                if measured.errors == 0
+                    && let Some(path) = review.recent_leaf.as_deref()
+                    && let Some(hints) = recent_files
+                {
+                    hints.remember(root, &review.entry.path, path);
+                }
+            }
+            apply_measurement(&mut review.candidate, &measured);
+            quality_reason = suggestion_reason(&review.found, &measured, clock_ns());
+            review.blocked = review.blocked.or(measured.unsafe_reason);
+            if measured.pruned {
+                quality_reason = Some(
+                    "Measurement stopped when this artifact became ineligible; remaining contents were not traversed"
+                        .into(),
+                );
+            }
+        }
+        Err(reason) => {
+            review.blocked = Some(reason);
+            if safety::cancelled(cancel).is_err() {
+                stats.cancelled = true;
+            } else {
+                stats.errors += 1;
+            }
+        }
+    }
+    if recommendations::checks_git(review.found.kind)
+        && review.blocked.is_none()
+        && quality_reason.is_none()
+    {
+        let project = review.entry.path.parent().unwrap();
+        if let Err(reason) = git_untracked(root, project, &review.entry.path, cancel) {
+            review.blocked = Some(reason);
+        }
+    }
+    if recommendations::checks_activity(review.found.kind)
+        && review.blocked.is_none()
+        && quality_reason.is_none()
+    {
+        review.blocked = activity_reason(
+            activity,
+            review
+                .found
+                .activity_root
+                .as_deref()
+                .unwrap_or_else(|| review.entry.path.parent().unwrap()),
+            review.found.kind,
+            cancel,
+            SCAN_ACTIVITY_MAX_AGE,
+        );
+    }
+    // Evidence captured before a queued or yielded measurement is never enough
+    // to publish an actionable row. Re-read it after the terminal measurement.
+    if review.blocked.is_none() && quality_reason.is_none() {
+        match evidence_with_downloads_cached(
+            root,
+            &review.entry.path,
+            &review.entry.meta,
+            downloads,
+            cancel,
+            Some(caches),
+        ) {
+            Ok(Some(current))
+                if current.fingerprint == review.found.fingerprint && current.blocked.is_none() => {
+            }
+            _ => {
+                review.blocked =
+                    Some("Project evidence changed during the scan; refresh this review".into());
+            }
+        }
+    }
+    if quality_reason.is_none() && review.candidate.fingerprint.is_empty() {
+        quality_reason = Some(
+            "This was a diagnostic-only measurement; refresh to review current eligibility".into(),
+        );
+    }
+    review.candidate.blocked_reason = review.blocked;
+    review.candidate.provisional = false;
+    review.candidate.suggestion_eligible =
+        review.candidate.blocked_reason.is_none() && quality_reason.is_none() && !stats.cancelled;
+    review.candidate.eligible_permanent =
+        recommendations::permanent_kind(review.found.kind) && review.candidate.suggestion_eligible;
+    let first_finding = review.candidate.suggestion_eligible && stats.first_finding_ms.is_none();
+    if review.candidate.suggestion_eligible {
+        stats.candidates += 1;
+        stats.first_finding_ms.get_or_insert(stats.elapsed_ms);
+        review.candidate.explanation.push_str(&format!(
+            " At least {} MB is allocated locally. The {} have been unmodified for at least {} days.",
+            recommendations::minimum_bytes(review.found.kind) / 1_000_000,
+            if review.is_dir {
+                "contents and identification files"
+            } else {
+                "file contents"
+            },
+            review.found.quiet_days
+        ));
+    } else {
+        stats.skipped += 1;
+        if let Some(reason) = quality_reason {
+            review
+                .candidate
+                .explanation
+                .push_str(&format!(" Not suggested: {reason}."));
+        }
+    }
+    publisher.queue(review.candidate, stats, first_finding);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_artifact_measurement<F: FnMut(ScanBatch)>(
+    mut job: ArtifactMeasurement,
+    root: &Root,
+    kept: &[PathBuf],
+    cancel: &AtomicBool,
+    checkpoint: &impl Fn(),
+    stats: &mut ScanStats,
+    links: &mut Hardlinks,
+    activity: &mut Option<(Instant, Result<ActivitySnapshot>)>,
+    caches: &mut EvidenceCaches,
+    downloads: Option<&Path>,
+    recent_files: Option<&mut RecentFileHints>,
+    publisher: &mut Publisher<F>,
+    started: Instant,
+) -> Option<ArtifactMeasurement> {
+    let entry_path = &job.review.entry.path;
+    let candidate = &mut job.review.candidate;
+    let recent_leaf = &mut job.review.recent_leaf;
+    let can_learn = job.review.can_learn;
+    let cutoff = job.review.cutoff;
+    let measured = job.cursor.advance(
+        cancel,
+        MEASUREMENT_QUANTUM_ENTRIES,
+        Instant::now() + MEASUREMENT_QUANTUM,
+        |observed, partial| {
+            if observed.path != *entry_path {
+                tally(stats, links, &observed.meta, root.identity.device);
+                if can_learn
+                    && recent_leaf.is_none()
+                    && partial.errors == 0
+                    && partial.unsafe_reason.is_none()
+                    && is_recent_local_file(&observed.meta, root.identity.device, cutoff)
+                    && !kept.iter().any(|kept| observed.path.starts_with(kept))
+                {
+                    *recent_leaf = Some(observed.path.clone());
+                }
+            }
+            if publisher.last.elapsed() >= BATCH_INTERVAL {
+                stats.elapsed_ms = started.elapsed().as_millis() as u64;
+                apply_measurement(candidate, partial);
+                publisher.queue(candidate.clone(), stats, true);
+                // Publishing has returned and released engine/index locks.
+                checkpoint();
+            }
+            Ok(())
+        },
+    );
+    match measured {
+        Ok(safety::MeasurementProgress::Pending) => Some(job),
+        Ok(safety::MeasurementProgress::Complete(measured)) => {
+            stats.elapsed_ms = started.elapsed().as_millis() as u64;
+            finish_artifact_review(
+                job.review,
+                Ok(measured),
+                root,
+                cancel,
+                stats,
+                activity,
+                caches,
+                downloads,
+                recent_files,
+                publisher,
+            );
+            None
+        }
+        Err(reason) => {
+            stats.elapsed_ms = started.elapsed().as_millis() as u64;
+            finish_artifact_review(
+                job.review,
+                Err(reason),
+                root,
+                cancel,
+                stats,
+                activity,
+                caches,
+                downloads,
+                recent_files,
+                publisher,
+            );
+            None
+        }
     }
 }
 
@@ -1733,7 +2027,7 @@ pub(crate) fn scan_with_options(
     cancel: &AtomicBool,
     mut options: ScanOptions<'_>,
     checkpoint: impl Fn(),
-    mut publish: impl FnMut(ScanBatch),
+    publish: impl FnMut(ScanBatch),
 ) -> Result<ScanStats> {
     let mut session = ScanSession::new(options.mode);
     let selected = scope.unwrap_or(&root.path);
@@ -1742,8 +2036,6 @@ pub(crate) fn scan_with_options(
     {
         safety::check_scope_policy(root, selected)?;
         safety::validate_root(root)?;
-        let started = Instant::now();
-        let mut total = ScanStats::default();
         let mut lanes: Vec<PathBuf> = recommendations::HOME_LIBRARY_ROUTES
             .iter()
             .map(|route| root.path.join(route))
@@ -1755,61 +2047,19 @@ pub(crate) fn scan_with_options(
         if selected == root.path {
             lanes.push(root.path.clone());
         }
-        for lane in lanes {
-            checkpoint();
-            if safety::cancelled(cancel).is_err() {
-                total.cancelled = true;
-                break;
-            }
-            if kept.iter().any(|path| lane.starts_with(path)) {
-                total.skipped += 1;
-                continue;
-            }
-            let scanned = session.scan(
-                root,
-                ScanScope {
-                    path: Some(&lane),
-                    expected: None,
-                    recent_files: options.recent_files.as_deref_mut(),
-                },
-                kept,
-                cancel,
-                &checkpoint,
-                |mut batch| {
-                    batch.stats = crate::combine_stats(&total, &batch.stats);
-                    batch.stats.complete = false;
-                    batch.stats.elapsed_ms = started.elapsed().as_millis() as u64;
-                    publish(batch);
-                },
-            );
-            match scanned {
-                Ok(stats) => total = crate::combine_stats(&total, &stats),
-                Err(_) if safety::cancelled(cancel).is_err() => total.cancelled = true,
-                Err(_) => {
-                    // One inaccessible targeted route must not hide useful
-                    // findings in the rest of the authorized Home folder.
-                    total.errors += 1;
-                }
-            }
-            total.elapsed_ms = started.elapsed().as_millis() as u64;
-            if total.cancelled {
-                break;
-            }
-        }
-        total.complete = !total.cancelled && total.errors == 0;
-        total.message = if total.cancelled {
-            "Scan cancelled; completed findings remain available."
-        } else if total.errors > 0 {
-            "Scan finished with inaccessible locations; completed findings are ready to review."
-        } else {
-            "Scan complete. Targeted cleanup and personal-file findings are ready to review."
-        }
-        .into();
-        publish(ScanBatch {
-            candidates: Vec::new(),
-            stats: total.clone(),
-        });
-        return Ok(total);
+        return session.scan(
+            root,
+            ScanScope {
+                path: Some(selected),
+                expected: None,
+                recent_files: options.recent_files.as_deref_mut(),
+                starts: Some(&lanes),
+            },
+            kept,
+            cancel,
+            checkpoint,
+            publish,
+        );
     }
     session.scan(
         root,
@@ -1817,6 +2067,7 @@ pub(crate) fn scan_with_options(
             path: scope,
             expected: None,
             recent_files: options.recent_files,
+            starts: None,
         },
         kept,
         cancel,
@@ -1847,6 +2098,7 @@ pub(crate) fn scan_cargo_lock_with_checkpoint_mode(
             path: Some(origin),
             expected: None,
             recent_files: None,
+            starts: None,
         },
         kept,
         cancel,
@@ -1882,6 +2134,7 @@ pub(crate) fn scan_cargo_lock_with_checkpoint_mode(
                     path: Some(&target),
                     expected: Some(expected),
                     recent_files: None,
+                    starts: None,
                 },
                 kept,
                 cancel,
@@ -1956,6 +2209,8 @@ struct ScanScope<'a> {
     path: Option<&'a Path>,
     expected: Option<&'a EntryMeta>,
     recent_files: Option<&'a mut RecentFileHints>,
+    /// Fixed grant-anchored logical lanes advanced within one fair scheduler.
+    starts: Option<&'a [PathBuf]>,
 }
 
 impl ScanSession {
@@ -1985,39 +2240,71 @@ impl ScanSession {
         };
         let mut publisher = Publisher::new(publish);
         safety::cancelled(cancel)?;
-        let start = scoped_start(root, scope.path)?;
+        let selected = scoped_start(root, scope.path)?;
+        let logical_lanes = scope.starts.is_some();
+        let default_start = [selected.clone()];
+        let starts = scope.starts.unwrap_or(&default_start);
+        if starts.len() > MAX_SCAN_LANES {
+            return Err("The scan exceeds the bounded logical-lane limit".into());
+        }
+        if scope.expected.is_some() && starts.len() != 1 {
+            return Err("An exact refresh cannot span multiple logical lanes".into());
+        }
+        let mut next = VecDeque::new();
         // Use the same lookup for existence and initial metadata. A short-lived
         // incremental scope may disappear before discovery starts; only a verified
         // absent descendant is complete with no entries. The grant itself is strict.
-        let meta = if start == root.path {
-            safety::validate_root(root)?;
-            safety::metadata(&start)?
-        } else {
-            match safety::scope_metadata(root, &start, cancel)? {
-                Some(meta) => meta,
-                None => {
+        for (lane, requested) in starts.iter().enumerate() {
+            safety::cancelled(cancel)?;
+            if kept.iter().any(|path| requested.starts_with(path)) {
+                stats.skipped += 1;
+                continue;
+            }
+            let start = match scoped_start(root, Some(requested)) {
+                Ok(start) => start,
+                Err(_) if logical_lanes => {
+                    stats.errors += 1;
+                    continue;
+                }
+                Err(reason) => return Err(reason),
+            };
+            let observed = if start == root.path {
+                safety::validate_root(root).and_then(|()| safety::metadata(&start).map(Some))
+            } else {
+                safety::scope_metadata(root, &start, cancel)
+            };
+            let meta = match observed {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
                     if scope.expected.is_some() {
                         return Err(
                             "The selected refresh scope disappeared before traversal".into()
                         );
+                    }
+                    if logical_lanes {
+                        continue;
                     }
                     stats.complete = true;
                     stats.elapsed_ms = started.elapsed().as_millis() as u64;
                     stats.message = "Removed scope reconciled without scanning its parent.".into();
                     return Ok(stats);
                 }
+                Err(_) if logical_lanes && safety::cancelled(cancel).is_ok() => {
+                    stats.errors += 1;
+                    continue;
+                }
+                Err(reason) => return Err(reason),
+            };
+            if scope.expected.is_some_and(|expected| expected != &meta) {
+                return Err("The selected refresh scope changed before traversal".into());
             }
-        };
-        if scope.expected.is_some_and(|expected| expected != &meta) {
-            return Err("The selected refresh scope changed before traversal".into());
+            next.push_back((Entry { path: start, meta }, 0, true, lane));
         }
-        let first = Entry {
-            path: start.clone(),
-            meta,
-        };
-        let mut next = Some((first, 0, true));
         let mut frontier: VecDeque<ScanDirectory> = VecDeque::new();
         let mut deferred: VecDeque<DeferredArtifact> = VecDeque::new();
+        let mut measurements: VecDeque<ArtifactMeasurement> = VecDeque::new();
+        let mut measurement_turn = false;
+        let mut lane_turn = 0;
         let mut activity = None;
         let mut caches = EvidenceCaches::default();
         let downloads = downloads_boundary(root);
@@ -2031,126 +2318,179 @@ impl ScanSession {
                 stats.elapsed_ms = started.elapsed().as_millis() as u64;
                 publisher.flush(&stats);
             }
+            let discovery_done = next.is_empty() && frontier.is_empty() && deferred.is_empty();
+            if !measurements.is_empty()
+                && (measurement_turn
+                    || measurements.len() >= MAX_ACTIVE_MEASUREMENTS
+                    || discovery_done)
+            {
+                measurement_turn = false;
+                let job = measurements
+                    .pop_front()
+                    .expect("the measurement queue was checked above");
+                if let Some(job) = advance_artifact_measurement(
+                    job,
+                    root,
+                    kept,
+                    cancel,
+                    &checkpoint,
+                    &mut stats,
+                    links,
+                    &mut activity,
+                    &mut caches,
+                    downloads.as_deref(),
+                    scope.recent_files.as_deref_mut(),
+                    &mut publisher,
+                    started,
+                ) {
+                    measurements.push_back(job);
+                }
+                if stats.cancelled {
+                    break;
+                }
+                continue;
+            }
+            measurement_turn = true;
             // Explicit metadata coverage postpones known non-suggestions while
             // shallow discovery can still find useful work. Interactive discovery
             // never queues them. Drain the oldest item at capacity so this queue
             // never grows with the number of projects on disk.
             let deferred_job = if deferred.len() == MAX_DEFERRED_ARTIFACTS
-                || (next.is_none() && frontier.is_empty())
+                || (next.is_empty() && frontier.is_empty())
             {
                 deferred.pop_front()
             } else {
                 None
             };
-            let (entry, depth, classify, previous_checks, opened_directory) = if let Some(job) =
-                deferred_job
-            {
-                (
-                    job.entry,
-                    0,
-                    false,
-                    Some((job.evidence, job.early_quiet, job.blocked)),
-                    None,
-                )
-            } else if let Some((entry, depth, classify)) = next.take() {
-                (entry, depth, classify, None, None)
-            } else {
-                let Some(frame) = frontier.front_mut() else {
-                    break;
-                };
-                let library = recommendations::library_area(root, &frame.directory.path);
-                let next_entry = if library.is_some()
-                    || (mode == ScanMode::Suggestions
-                        && !downloads
-                            .as_ref()
-                            .is_some_and(|path| frame.directory.path.starts_with(path)))
-                {
-                    let home_children = root.kind == "home" && frame.directory.path == root.path;
-                    let step = if let Some((area, suffix)) = library {
-                        frame.directory.next_library_discovery(
-                            cancel,
-                            area == recommendations::LibraryArea::Caches
-                                && suffix.as_os_str().is_empty(),
-                        )
-                    } else if recommendations::personal_scope(root, &frame.directory.path) {
-                        frame
-                            .directory
-                            .next_personal_discovery(cancel, home_children)
-                    } else {
-                        frame.directory.next_discovery(cancel, home_children)
-                    };
-                    match step {
-                        Ok(step) => {
-                            stats.entries += step.files + step.skipped;
-                            stats.files += step.files;
-                            stats.skipped += step.skipped;
-                            stats.metadata_skipped += step.metadata_skipped;
-                            if step.entry.is_none() && !step.finished {
-                                continue;
+            let (entry, depth, classify, lane, previous_checks, opened_directory) =
+                if let Some(job) = deferred_job {
+                    (
+                        job.entry,
+                        0,
+                        false,
+                        0,
+                        Some((job.evidence, job.early_quiet, job.blocked)),
+                        None,
+                    )
+                } else if let Some((entry, depth, classify, lane)) = next.pop_front() {
+                    (entry, depth, classify, lane, None, None)
+                } else {
+                    if logical_lanes && !frontier.is_empty() {
+                        for offset in 0..starts.len() {
+                            let lane = (lane_turn + offset) % starts.len();
+                            if let Some(index) =
+                                frontier.iter().position(|frame| frame.lane == lane)
+                            {
+                                frontier.rotate_left(index);
+                                lane_turn = (lane + 1) % starts.len();
+                                break;
                             }
-                            match step.entry {
-                                Some(DiscoveryEntry::Directory(path)) => {
-                                    // Keep is a lexical boundary, so avoid opening
-                                    // or initializing a reader for any kept subtree.
-                                    if kept.iter().any(|kept| path.starts_with(kept)) {
-                                        stats.entries += 1;
-                                        stats.directories += 1;
-                                        stats.skipped += 1;
-                                        stats.metadata_skipped += 1;
-                                        continue;
-                                    }
-                                    match frame.directory.open_discovered(
-                                        path,
-                                        root.identity.device,
-                                        cancel,
-                                    ) {
-                                        Ok((entry, directory)) => Ok(Some((entry, directory))),
-                                        Err(reason) if safety::cancelled(cancel).is_err() => {
-                                            Err(reason)
-                                        }
-                                        Err(_) => {
+                        }
+                    }
+                    let Some(frame) = frontier.front_mut() else {
+                        break;
+                    };
+                    let library = recommendations::library_area(root, &frame.directory.path);
+                    let next_entry = if library.is_some()
+                        || (mode == ScanMode::Suggestions
+                            && !downloads
+                                .as_ref()
+                                .is_some_and(|path| frame.directory.path.starts_with(path)))
+                    {
+                        let home_children =
+                            root.kind == "home" && frame.directory.path == root.path;
+                        let step = if let Some((area, suffix)) = library {
+                            frame.directory.next_library_discovery(
+                                cancel,
+                                area == recommendations::LibraryArea::Caches
+                                    && suffix.as_os_str().is_empty(),
+                            )
+                        } else if recommendations::personal_scope(root, &frame.directory.path) {
+                            frame
+                                .directory
+                                .next_personal_discovery(cancel, home_children)
+                        } else {
+                            frame.directory.next_discovery(cancel, home_children)
+                        };
+                        match step {
+                            Ok(step) => {
+                                stats.entries += step.files + step.skipped;
+                                stats.files += step.files;
+                                stats.skipped += step.skipped;
+                                stats.metadata_skipped += step.metadata_skipped;
+                                if step.entry.is_none() && !step.finished {
+                                    continue;
+                                }
+                                match step.entry {
+                                    Some(DiscoveryEntry::Directory(path)) => {
+                                        // Keep is a lexical boundary, so avoid opening
+                                        // or initializing a reader for any kept subtree.
+                                        if kept.iter().any(|kept| path.starts_with(kept)) {
                                             stats.entries += 1;
                                             stats.directories += 1;
-                                            stats.errors += 1;
                                             stats.skipped += 1;
+                                            stats.metadata_skipped += 1;
                                             continue;
                                         }
+                                        match frame.directory.open_discovered(
+                                            path,
+                                            root.identity.device,
+                                            cancel,
+                                        ) {
+                                            Ok((entry, directory)) => Ok(Some((entry, directory))),
+                                            Err(reason) if safety::cancelled(cancel).is_err() => {
+                                                Err(reason)
+                                            }
+                                            Err(_) => {
+                                                stats.entries += 1;
+                                                stats.directories += 1;
+                                                stats.errors += 1;
+                                                stats.skipped += 1;
+                                                continue;
+                                            }
+                                        }
                                     }
+                                    Some(DiscoveryEntry::Metadata(entry)) => {
+                                        Ok(Some((entry, None)))
+                                    }
+                                    None => Ok(None),
                                 }
-                                Some(DiscoveryEntry::Metadata(entry)) => Ok(Some((entry, None))),
-                                None => Ok(None),
                             }
+                            Err(reason) => Err(reason),
                         }
-                        Err(reason) => Err(reason),
-                    }
-                } else {
-                    frame
-                        .directory
-                        .next(cancel)
-                        .map(|entry| entry.map(|entry| (entry, None)))
-                };
-                match next_entry {
-                    Ok(Some((entry, opened))) => {
-                        (entry, frame.depth + 1, frame.classify, None, opened)
-                    }
-                    Ok(None) => {
-                        if frame.directory.unchanged().is_err() {
+                    } else {
+                        frame
+                            .directory
+                            .next(cancel)
+                            .map(|entry| entry.map(|entry| (entry, None)))
+                    };
+                    match next_entry {
+                        Ok(Some((entry, opened))) => (
+                            entry,
+                            frame.depth + 1,
+                            frame.classify,
+                            frame.lane,
+                            None,
+                            opened,
+                        ),
+                        Ok(None) => {
+                            if frame.directory.unchanged().is_err() {
+                                stats.errors += 1;
+                            }
+                            frontier.pop_front();
+                            continue;
+                        }
+                        Err(_) if safety::cancelled(cancel).is_err() => {
+                            stats.cancelled = true;
+                            break;
+                        }
+                        Err(_) => {
                             stats.errors += 1;
+                            frontier.pop_front();
+                            continue;
                         }
-                        frontier.pop_front();
-                        continue;
                     }
-                    Err(_) if safety::cancelled(cancel).is_err() => {
-                        stats.cancelled = true;
-                        break;
-                    }
-                    Err(_) => {
-                        stats.errors += 1;
-                        frontier.pop_front();
-                        continue;
-                    }
-                }
-            };
+                };
             let was_deferred = previous_checks.is_some();
             if !was_deferred {
                 // A queued root was already counted when first discovered. Its
@@ -2250,7 +2590,7 @@ impl ScanSession {
                     // Diagnostics stay in the index, but only completed useful rows
                     // become public suggestions. Cheap evidence, age and activity
                     // checks can exclude the whole artifact before opening it.
-                    let (early_quiet, mut blocked) = if let Some(previous) = previous_checks {
+                    let (early_quiet, blocked) = if let Some(previous) = previous_checks {
                         previous
                     } else {
                         let quiet = quiet_for(
@@ -2383,174 +2723,84 @@ impl ScanSession {
                         && early_quiet
                         && blocked.is_none()
                         && scope.recent_files.is_some();
-                    let mut recent_leaf = None;
-                    let observe = |observed: &Entry, partial: &Measurement| {
-                        if observed.path != entry.path {
-                            tally(&mut stats, links, &observed.meta, root.identity.device);
-                            // Retain one path from observations already needed by
-                            // measurement. No locks, I/O, or per-entry allocation.
-                            if can_learn
-                                && recent_leaf.is_none()
-                                && partial.errors == 0
-                                && partial.unsafe_reason.is_none()
-                                && is_recent_local_file(
-                                    &observed.meta,
-                                    root.identity.device,
-                                    cutoff,
-                                )
-                                && !kept.iter().any(|kept| observed.path.starts_with(kept))
-                            {
-                                recent_leaf = Some(observed.path.clone());
-                            }
-                        }
-                        if publisher.last.elapsed() >= BATCH_INTERVAL {
-                            stats.elapsed_ms = started.elapsed().as_millis() as u64;
-                            apply_measurement(&mut candidate, partial);
-                            publisher.queue(candidate.clone(), &stats, true);
-                            // Publishing has returned and released engine/index locks.
-                            checkpoint();
-                        }
-                    };
                     let policy = if recommendations::developer_measurement(found.kind) {
                         MeasurementPolicy::Developer
                     } else {
                         MeasurementPolicy::Strict
                     };
-                    let measured = if mode == ScanMode::Suggestions
+                    let cursor = if mode == ScanMode::Suggestions
                         && !was_deferred
                         && early_quiet
                         && blocked.is_none()
                     {
-                        safety::measure_suggestion_observing_with_policy(
+                        safety::MeasurementCursor::suggestion(
                             &entry.path,
                             root.identity.device,
-                            cancel,
                             policy,
                             cutoff,
-                            observe,
+                            cancel,
                         )
                     } else if !was_deferred && early_quiet && blocked.is_none() {
-                        safety::measure_observing_with_policy(
+                        safety::MeasurementCursor::full(
                             &entry.path,
                             root.identity.device,
-                            cancel,
                             policy,
-                            observe,
+                            cancel,
                         )
                     } else {
-                        safety::measure_metadata_observing_with_policy(
+                        safety::MeasurementCursor::metadata(
                             &entry.path,
                             root.identity.device,
-                            cancel,
                             policy,
-                            observe,
+                            cancel,
                         )
                     };
-                    let mut quality_reason = Some("Measurement is incomplete".to_owned());
-                    match measured {
-                        Ok(measured) => {
-                            stats.skipped += measured.skipped;
-                            stats.errors += measured.errors;
-                            if measured.pruned {
-                                stats.excluded_artifacts += 1;
-                                if measured.errors == 0
-                                    && let Some(path) = recent_leaf
-                                    && let Some(hints) = scope.recent_files.as_deref_mut()
-                                {
-                                    hints.remember(root, &entry.path, &path);
-                                }
-                            }
-                            apply_measurement(&mut candidate, &measured);
-                            quality_reason = suggestion_reason(&found, &measured, clock_ns());
-                            blocked = blocked.or(measured.unsafe_reason);
-                            if measured.pruned {
-                                quality_reason = Some(
-                                "Measurement stopped when this artifact became ineligible; remaining contents were not traversed".into(),
-                            );
-                            }
-                        }
-                        Err(reason) => {
-                            blocked = Some(reason);
-                            if safety::cancelled(cancel).is_err() {
-                                stats.cancelled = true;
-                            } else {
-                                stats.errors += 1;
-                            }
-                        }
-                    }
-                    if recommendations::checks_git(found.kind)
-                        && blocked.is_none()
-                        && quality_reason.is_none()
-                    {
-                        let project = entry.path.parent().unwrap();
-                        if let Err(reason) = git_untracked(root, project, &entry.path, cancel) {
-                            blocked = Some(reason);
-                        }
-                    }
-                    if recommendations::checks_activity(found.kind)
-                        && blocked.is_none()
-                        && quality_reason.is_none()
-                    {
-                        blocked = activity_reason(
-                            &mut activity,
-                            found
-                                .activity_root
-                                .as_deref()
-                                .unwrap_or_else(|| entry.path.parent().unwrap()),
-                            found.kind,
-                            cancel,
-                            SCAN_ACTIVITY_MAX_AGE,
-                        );
-                    }
-                    // Manifest changes during a long measurement invalidate the
-                    // row. The identity-keyed cache serves unchanged files
-                    // without rereading; a changed identity is always reread.
-                    if blocked.is_none() && quality_reason.is_none() {
-                        match evidence_with_downloads_cached(
-                            root,
-                            &entry.path,
-                            &entry.meta,
-                            downloads.as_deref(),
-                            cancel,
-                            Some(&mut caches),
-                        ) {
-                            Ok(Some(current))
-                                if current.fingerprint == found.fingerprint
-                                    && current.blocked.is_none() => {}
-                            _ => {
-                                blocked = Some(
-                                    "Project evidence changed during the scan; refresh this review"
-                                        .into(),
-                                );
-                            }
-                        }
-                    }
-                    if quality_reason.is_none() && candidate.fingerprint.is_empty() {
-                        quality_reason = Some("This was a diagnostic-only measurement; refresh to review current eligibility".into());
-                    }
-                    candidate.blocked_reason = blocked;
-                    candidate.provisional = false;
-                    candidate.suggestion_eligible = candidate.blocked_reason.is_none()
-                        && quality_reason.is_none()
-                        && !stats.cancelled;
-                    candidate.eligible_permanent = recommendations::permanent_kind(found.kind)
-                        && candidate.suggestion_eligible;
                     stats.elapsed_ms = started.elapsed().as_millis() as u64;
-                    let first_finding =
-                        candidate.suggestion_eligible && stats.first_finding_ms.is_none();
-                    if candidate.suggestion_eligible {
-                        stats.candidates += 1;
-                        stats.first_finding_ms.get_or_insert(stats.elapsed_ms);
-                        candidate.explanation.push_str(&format!(" At least {} MB is allocated locally. The {} have been unmodified for at least {} days.", recommendations::minimum_bytes(found.kind) / 1_000_000, if is_dir { "contents and identification files" } else { "file contents" }, found.quiet_days));
+                    let review = ArtifactReview {
+                        entry,
+                        found,
+                        candidate,
+                        blocked,
+                        is_dir,
+                        cutoff,
+                        can_learn,
+                        recent_leaf: None,
+                    };
+                    if review.retained_bytes() > MAX_MEASUREMENT_JOB_BYTES {
+                        finish_artifact_review(
+                            review,
+                            Err(
+                                "Artifact scheduling metadata exceeds the bounded queue limit"
+                                    .into(),
+                            ),
+                            root,
+                            cancel,
+                            &mut stats,
+                            &mut activity,
+                            &mut caches,
+                            downloads.as_deref(),
+                            scope.recent_files.as_deref_mut(),
+                            &mut publisher,
+                        );
                     } else {
-                        stats.skipped += 1;
-                        if let Some(reason) = quality_reason {
-                            candidate
-                                .explanation
-                                .push_str(&format!(" Not suggested: {reason}."));
+                        match cursor {
+                            Ok(cursor) => {
+                                measurements.push_back(ArtifactMeasurement { review, cursor })
+                            }
+                            Err(reason) => finish_artifact_review(
+                                review,
+                                Err(reason),
+                                root,
+                                cancel,
+                                &mut stats,
+                                &mut activity,
+                                &mut caches,
+                                downloads.as_deref(),
+                                scope.recent_files.as_deref_mut(),
+                                &mut publisher,
+                            ),
                         }
                     }
-                    publisher.queue(candidate, &stats, first_finding);
                     if stats.cancelled {
                         break;
                     }
@@ -2593,6 +2843,7 @@ impl ScanSession {
                 }
                 let opened = match opened_directory {
                     Some(directory) => Ok(directory),
+                    None if depth == 0 => Directory::open(&entry.path),
                     None => match frontier.front() {
                         Some(parent) => parent.directory.open_child(&entry),
                         None => Directory::open(&entry.path),
@@ -2604,6 +2855,7 @@ impl ScanSession {
                             directory,
                             depth,
                             classify: classify_children,
+                            lane,
                         };
                         if frontier.len() < MAX_SHALLOW_FRONTIER {
                             frontier.push_back(frame);
@@ -2627,7 +2879,14 @@ impl ScanSession {
             stats.errors += 1;
         }
         stats.complete = !stats.cancelled && stats.errors == 0;
-        stats.message = if stats.cancelled {
+        stats.message = if logical_lanes && stats.cancelled {
+            "Scan cancelled; completed findings remain available.".into()
+        } else if logical_lanes && stats.errors > 0 {
+            "Scan finished with inaccessible locations; completed findings are ready to review."
+                .into()
+        } else if logical_lanes {
+            "Scan complete. Targeted cleanup and personal-file findings are ready to review.".into()
+        } else if stats.cancelled {
             "Scan cancelled; the displayed coverage is partial".into()
         } else if links.saturated() {
             "Partial accounting: the bounded hard-link identity limit was reached; additional shared files received zero size credit".into()
@@ -3638,6 +3897,7 @@ mod tests {
                     path: Some(&target),
                     expected: Some(&expected),
                     recent_files: None,
+                    starts: None,
                 },
                 &[],
                 &AtomicBool::new(false),
@@ -6156,6 +6416,63 @@ mod tests {
     }
 
     #[test]
+    fn logical_lanes_share_exact_hardlink_accounting_without_duplicate_bytes() {
+        let (_temp, root, first) = fixture();
+        let second = add_fresh_project(&root.path, 0);
+        let shared = first.join("node_modules/payload");
+        let alias = second.join("node_modules/payload");
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::hard_link(&shared, &alias).unwrap();
+        let first_stats = safety::traverse_metadata(&first, &AtomicBool::new(false)).unwrap();
+        let second_stats = safety::traverse_metadata(&second, &AtomicBool::new(false)).unwrap();
+        let shared_meta = safety::metadata(&shared).unwrap();
+        let starts = [first.clone(), second.clone()];
+        let mut rows = Vec::new();
+        let stats = ScanSession::new(ScanMode::MetadataCoverage)
+            .scan(
+                &root,
+                ScanScope {
+                    path: Some(&root.path),
+                    expected: None,
+                    recent_files: None,
+                    starts: Some(&starts),
+                },
+                &[],
+                &AtomicBool::new(false),
+                || {},
+                |batch| rows.extend(batch.candidates),
+            )
+            .unwrap();
+        assert!(stats.complete, "{stats:?}; rows={rows:?}");
+        assert_eq!(stats.entries, first_stats.entries + second_stats.entries);
+        assert_eq!(stats.files, first_stats.files + second_stats.files);
+        assert_eq!(
+            stats.directories,
+            first_stats.directories + second_stats.directories
+        );
+        assert_eq!(
+            stats.logical_bytes,
+            first_stats
+                .logical_bytes
+                .saturating_add(second_stats.logical_bytes)
+                .saturating_sub(shared_meta.identity.size)
+        );
+        assert_eq!(
+            stats.allocated_bytes,
+            first_stats
+                .allocated_bytes
+                .saturating_add(second_stats.allocated_bytes)
+                .saturating_sub(shared_meta.allocated)
+        );
+        assert_eq!(rows.iter().filter(|row| !row.provisional).count(), 2);
+        assert!(rows.iter().filter(|row| !row.provisional).all(|row| {
+            row.blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("hard-linked"))
+        }));
+    }
+
+    #[test]
     fn changed_deferred_evidence_is_diagnostic_and_coverage_stays_partial() {
         let (_temp, root, _) = fixture();
         for index in 0..MAX_BATCH {
@@ -6994,6 +7311,96 @@ mod tests {
                 b"personal data"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn home_lanes_publish_quick_project_before_huge_cache_finishes() {
+        let (_temp, mut root, project) = fixture();
+        root.kind = "home".into();
+        let mut capacity: libc::statfs = unsafe { std::mem::zeroed() };
+        let root_name = CString::new(root.path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::statfs(root_name.as_ptr(), &mut capacity) },
+            0
+        );
+        assert!(
+            capacity.f_bavail.saturating_mul(capacity.f_bsize as u64) >= 512 * 1024 * 1024,
+            "The disposable lane-fairness test requires a 512 MiB reserve"
+        );
+
+        let quick = root.path.join("Projects/quick");
+        std::fs::create_dir_all(quick.parent().unwrap()).unwrap();
+        std::fs::rename(&project, &quick).unwrap();
+        {
+            let mut payload = std::fs::File::create(quick.join("node_modules/payload")).unwrap();
+            let block = vec![0x31; 1024 * 1024];
+            for _ in 0..100 {
+                payload.write_all(&block).unwrap();
+            }
+            payload.sync_all().unwrap();
+        }
+
+        let cache = root.path.join("Library/Caches/SlowFixture");
+        std::fs::create_dir_all(&cache).unwrap();
+        const SLOW_FILES: u64 = 2_048;
+        let block = vec![0x52; 28 * 1024];
+        for index in 0..SLOW_FILES {
+            std::fs::write(cache.join(format!("payload-{index:04}")), &block).unwrap();
+        }
+        age_tree(&quick, 31);
+        age_tree(&cache, 31);
+
+        let cache_reads = Rc::new(std::cell::Cell::new(0u64));
+        let observed_reads = cache_reads.clone();
+        let cache_for_observer = cache.clone();
+        let terminal = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let published_terminal = terminal.clone();
+        let reads_at_quick = Rc::new(std::cell::Cell::new(None));
+        let published_reads_at_quick = reads_at_quick.clone();
+        let cache_for_publish = cache.clone();
+        let quick_artifact = quick.join("node_modules");
+        let quick_for_publish = quick_artifact.clone();
+        let stats = safety::tests::with_directory_read_observer(
+            move |path| {
+                if path == cache_for_observer {
+                    observed_reads.set(observed_reads.get() + 1);
+                }
+            },
+            || {
+                scan(&root, None, &AtomicBool::new(false), |batch| {
+                    for candidate in batch.candidates {
+                        if candidate.provisional {
+                            continue;
+                        }
+                        if candidate.path == quick_for_publish {
+                            published_reads_at_quick.set(Some(cache_reads.get()));
+                        }
+                        published_terminal.borrow_mut().push(candidate.path);
+                    }
+                })
+            },
+        )
+        .unwrap();
+        assert!(stats.complete, "{}", stats.message);
+        assert_eq!(stats.candidates, 2);
+        let terminal = terminal.borrow();
+        let quick_index = terminal
+            .iter()
+            .position(|path| path == &quick_artifact)
+            .expect("the quick project must reach terminal eligibility");
+        let cache_index = terminal
+            .iter()
+            .position(|path| path == &cache_for_publish)
+            .expect("the cache must reach terminal eligibility");
+        assert!(quick_index < cache_index, "terminal order was {terminal:?}");
+        let reads = reads_at_quick
+            .get()
+            .expect("the quick result must observe the in-progress cache cursor");
+        assert!(
+            reads > 0 && reads < SLOW_FILES,
+            "the quick result arrived after {reads} of {SLOW_FILES} cache reads"
+        );
     }
 
     #[cfg(target_os = "macos")]
