@@ -93,10 +93,12 @@ fn storage_domain(stat: &libc::statfs) -> Result<String> {
             unsafe { std::ffi::CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_string_lossy();
         let fs = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_string_lossy();
         if fs == "apfs" {
-            let output = std::process::Command::new("/usr/sbin/diskutil")
-                .args(["info", "-plist", &mount])
-                .output()
-                .map_err(err)?;
+            let mut command = std::process::Command::new("/usr/sbin/diskutil");
+            command.args(["info", "-plist", &mount]);
+            let output = crate::probe::run(command, Duration::from_secs(2), 256 * 1024, None)
+                .map_err(|reason| {
+                    format!("Storage container identity is unavailable; no credit. {reason}")
+                })?;
             if !output.status.success() {
                 return Err("Storage container identity is unavailable; no credit.".into());
             }
