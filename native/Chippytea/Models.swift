@@ -73,7 +73,7 @@ struct Candidate: Codable, Identifiable, Hashable {
     var recommended: Bool { suggestionEligible == true && canReviewCleanup }
     var isDeveloper: Bool {
         switch kind {
-        case "node", "cargo", "venv", "webcache", "xcode": return true
+        case "node", "cargo", "venv", "webcache", "xcode", "swiftpm", "dotnet", "gradle", "dart", "flutter", "zig": return true
         default: return false
         }
     }
@@ -114,6 +114,8 @@ struct Candidate: Codable, Identifiable, Hashable {
         case "log": return "doc.text"
         case "crashreport": return "exclamationmark.bubble"
         case "xcode": return "hammer"
+        case "swiftpm", "dotnet", "gradle", "flutter", "zig": return "hammer"
+        case "dart": return "wrench.and.screwdriver"
         case "installer": return "shippingbox"
         case "archive": return "doc.zipper"
         case "largefile": return "doc"
@@ -131,6 +133,12 @@ struct Candidate: Codable, Identifiable, Hashable {
         case "log": return "App log"
         case "crashreport": return "Crash report"
         case "xcode": return "Xcode build data"
+        case "swiftpm": return "SwiftPM build data"
+        case "dotnet": return ".NET build data"
+        case "gradle": return "Gradle build data"
+        case "dart": return "Dart tool data"
+        case "flutter": return "Flutter build data"
+        case "zig": return "Zig build cache"
         case "installer": return "Installer"
         case "archive": return "Archive"
         case "largefile": return "Large personal file"
@@ -145,7 +153,7 @@ struct Candidate: Codable, Identifiable, Hashable {
         let name = location.lastPathComponent
         guard !name.isEmpty else { return title }
         switch kind {
-        case "node", "cargo", "venv", "webcache":
+        case "node", "cargo", "venv", "webcache", "swiftpm", "dotnet", "gradle", "dart", "flutter", "zig":
             let parent = (location.deletingLastPathComponent as NSString).lastPathComponent
             return parent.isEmpty || parent == "/" ? name : "\(parent) / \(name)"
         default:
