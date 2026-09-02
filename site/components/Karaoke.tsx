@@ -4,8 +4,12 @@
 // play it; pressing it opens the karaoke: the lyric one line at a time with
 // every word filling gold as it is sung and a chip bouncing over the words,
 // fish and chips carrying on behind, a hand-lettered chip count for every word
-// you get through, and a chip thrown into the wrap wherever you tap. Closing
-// fades the whole thing out, song included; opening it again starts afresh.
+// you get through, and a chip thrown into the wrap wherever you tap. Every
+// section of the song announces itself: a stamp slams onto the page, the paper
+// changes colour, the dot grid moves, and the words dance differently (bouncing
+// on the beat in the choruses, trembling through the pre-chorus, swaying on the
+// bridge). Closing fades the whole thing out, song included; opening it again
+// starts afresh.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { tea, inkA, goldDeepA, handPathD, circleSamples, lineSamples, roundedRectSamples } from "@/lib/ink";
@@ -13,6 +17,7 @@ import { paintBalance } from "@/lib/draw";
 import { getAudioContext, playChime } from "@/lib/chime";
 import { lyricLines } from "@/lib/lyrics";
 import { KaraokeScene } from "@/lib/karaokeScene";
+import { runOfLine, sectionRuns, progressThrough } from "@/lib/sections";
 import { Tape } from "./art";
 import { InkBox } from "./InkBox";
 
@@ -21,15 +26,9 @@ const SCORE_W = 132;
 const SCORE_H = 40;
 const strokeProps = { fill: "none", strokeLinecap: "round", strokeLinejoin: "round" } as const;
 
-const SECTION_LABELS: Record<string, string> = {
-  intro: "intro",
-  chorus: "chorus, everybody!",
-  "verse 1": "verse 1",
-  "pre-chorus": "pre-chorus, ready?",
-  "verse 2": "verse 2",
-  bridge: "bridge, clap along",
-  "last chorus": "last chorus, louder!",
-};
+/** Seconds between beats when there is no analyser to hear them. */
+const FALLBACK_BEAT = 0.5;
+const WASHES = ["chorus", "last-chorus", "bridge", "verse", "pre-chorus"] as const;
 
 // MARK: - The lyric's clock
 
@@ -245,7 +244,8 @@ function KaraokeOverlay({
   const line = lyricLines[lineIdx];
   const prevLine = lyricLines[lineIdx - 1];
   const nextLine = lyricLines[lineIdx + 1];
-  const sectionLabel = SECTION_LABELS[line.section] ?? line.section;
+  const runIdx = runOfLine[lineIdx] ?? 0;
+  const run = sectionRuns[runIdx];
 
   // Drawn chrome for the controls.
   const closeArt = useMemo(
@@ -354,8 +354,9 @@ function KaraokeOverlay({
       sourceRef.current ??= ctx.createMediaElementSource(audio);
       const gain = ctx.createGain();
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 64;
-      analyser.smoothingTimeConstant = 0.7;
+      // Fine enough that the first few bins are the kick drum, not the vocal.
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.3;
       sourceRef.current.connect(gain);
       gain.connect(analyser);
       analyser.connect(ctx.destination);
@@ -433,11 +434,18 @@ function KaraokeOverlay({
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!scene || !ctx) return;
-    const bins = analyserRef.current ? new Uint8Array(analyserRef.current.frequencyBinCount) : null;
+    const bins = analyserRef.current ? new Float32Array(analyserRef.current.frequencyBinCount) : null;
     let raf = 0;
     let last = performance.now();
     let lastDraw = 0;
     let level = 0;
+    let previousBass = -100;
+    let typicalBass = -100;
+    let lastBeatAt = -1;
+    let lastBeatSlot = -1;
+    let kick = 0;
+    let sway = 1;
+    let lastRun = -1;
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
       const audio = audioRef.current;
@@ -449,17 +457,53 @@ function KaraokeOverlay({
       const time = audio.currentTime;
       const isPlaying = !audio.paused && !audio.ended;
 
+      // The beat: the bass, in decibels, jumping a few dB above its recent
+      // run. (Byte data clips at -30 dB, which this song sits above.) Without
+      // WebAudio, a steady stand-in.
       const analyser = analyserRef.current;
       let target = isPlaying ? 0.45 : 0;
+      let beat = false;
       if (analyser && bins && isPlaying) {
-        analyser.getByteFrequencyData(bins);
+        analyser.getFloatFrequencyData(bins);
         let sum = 0;
-        for (let i = 1; i <= 4; i++) sum += bins[i];
-        target = Math.min(1, (sum / 4 / 255) * 1.4);
+        for (let i = 1; i <= 3; i++) sum += Math.max(-100, bins[i]);
+        const bass = sum / 3;
+        target = clamp01((bass + 62) / 34);
+        if (bass > -60 && bass > typicalBass + 3 && bass - previousBass > 1 && now - lastBeatAt > 300) {
+          beat = true;
+          lastBeatAt = now;
+        }
+        typicalBass += (bass - typicalBass) * 0.06;
+        previousBass = bass;
+      } else if (isPlaying) {
+        const slot = Math.floor(time / FALLBACK_BEAT);
+        if (slot !== lastBeatSlot) {
+          lastBeatSlot = slot;
+          beat = true;
+        }
       }
       level += (target - level) * 0.35;
 
       const li = lineAt(time);
+      const runIndex = runOfLine[li] ?? 0;
+      const run = sectionRuns[runIndex];
+      if (runIndex !== lastRun) {
+        lastRun = runIndex;
+        sway = 1;
+      }
+      if (beat) {
+        kick = 1;
+        sway = -sway;
+      } else {
+        kick *= Math.exp(-dt * 8);
+      }
+      const root = rootRef.current;
+      if (root) {
+        root.style.setProperty("--kick", reduced ? "0" : kick.toFixed(3));
+        root.style.setProperty("--sway", reduced ? "0" : String(sway));
+        root.style.setProperty("--charge", run.key === "pre-chorus" ? progressThrough(run, time).toFixed(3) : "0");
+      }
+
       if (li !== renderedLine.current) {
         setLineIdx(li);
       } else {
@@ -486,6 +530,7 @@ function KaraokeOverlay({
         now,
         dt,
         level,
+        beat,
         playing: isPlaying,
         line: li,
         wrapChips: Math.floor(sung / 8) + landedRef.current,
@@ -638,8 +683,9 @@ function KaraokeOverlay({
       aria-modal="true"
       aria-label="Sing along with the chippytea song"
       tabIndex={-1}
-      className={`karaoke-root paper-dots fixed inset-0 z-50 select-none overflow-hidden text-ink outline-none ${leaving ? "leaving" : ""}`}
+      className={`karaoke-root fixed inset-0 z-50 select-none overflow-hidden bg-paper text-ink outline-none ${leaving ? "leaving" : ""}`}
       data-reduced={reduced ? "1" : undefined}
+      data-section={run.key}
       onAnimationEnd={(event) => {
         if (leaving && event.animationName === "karaoke-out") onClose();
       }}
@@ -657,7 +703,22 @@ function KaraokeOverlay({
         }}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
       />
+      {/* The paper: a dot grid that moves with the section, washed in its colour. */}
+      <div className="karaoke-dots" aria-hidden="true" />
+      {WASHES.map((wash) => (
+        <div key={wash} className={`karaoke-wash wash-${wash}`} aria-hidden="true" />
+      ))}
       <canvas ref={canvasRef} className="pointer-events-none absolute inset-0" aria-hidden="true" />
+
+      {/* The section, stamped onto the page as it arrives. */}
+      {!ended ? (
+        <div key={runIdx} className="section-stamp" aria-hidden="true">
+          <Tape uid={`stamp${runIdx}`} className="absolute -top-3 left-1/2 z-[2] -translate-x-1/2 -rotate-3" />
+          <InkBox as="div" variant="card" seed={171 + runIdx} radius={12} className="px-6 py-3 text-[clamp(22px,4.6vw,42px)] font-bold leading-tight drop-shadow-[0_3px_6px_rgba(51,48,43,0.16)]">
+            {run.label}
+          </InkBox>
+        </div>
+      ) : null}
 
       {/* Top: the chip count, the section, the way out. */}
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-3 px-4 pt-4 sm:px-6 sm:pt-5">
@@ -671,9 +732,9 @@ function KaraokeOverlay({
           />
           <span className="pl-1 text-[11px] text-ink-soft">one a word, one a throw</span>
         </div>
-        <div key={line.section} className="animate-panel-in hidden -rotate-1 sm:block">
-          <InkBox as="div" variant="card" seed={131} radius={8} className="px-3 py-1.5 text-[12.5px] font-medium">
-            {sectionLabel}
+        <div key={runIdx} className="section-tag absolute left-1/2 top-[58px] -translate-x-1/2 -rotate-1 sm:top-5">
+          <InkBox as="div" variant="card" seed={131} radius={8} className="whitespace-nowrap px-3 py-1.5 text-[12.5px] font-medium">
+            {run.label}
           </InkBox>
         </div>
         <button
@@ -701,10 +762,11 @@ function KaraokeOverlay({
         <p className="m-0 max-w-[26em] text-[clamp(14px,2.2vw,20px)] font-medium leading-snug text-ink/45" aria-hidden="true">
           {prevLine ? prevLine.words.map((word) => word.text).join(" ") : " "}
         </p>
+        <div className="kline-stage mt-2 sm:mt-3">
         <div
           key={lineIdx}
           ref={lineRef}
-          className="animate-panel-in relative mt-2 max-w-[18em] text-[clamp(27px,5.4vw,54px)] font-bold leading-[1.3] tracking-[-0.01em] sm:mt-3"
+          className="kline relative max-w-[18em] text-[clamp(27px,5.4vw,54px)] font-bold leading-[1.3] tracking-[-0.01em]"
           aria-label={line.words.map((word) => word.text).join(" ")}
         >
           {line.words.map((word, index) => (
@@ -738,6 +800,7 @@ function KaraokeOverlay({
             </g>
           </svg>
         </div>
+        </div>
         <p className="m-0 max-w-[26em] text-[clamp(15px,2.6vw,24px)] font-semibold leading-snug text-ink/55" aria-hidden="true">
           {nextLine ? nextLine.words.map((word) => word.text).join(" ") : " "}
         </p>
@@ -745,7 +808,7 @@ function KaraokeOverlay({
 
       {/* A hint, until the first chip goes flying. */}
       {thrown === 0 && !ended ? (
-        <div className="pointer-events-none absolute left-4 top-[92px] rotate-2 sm:top-auto sm:bottom-[88px]">
+        <div className="pointer-events-none absolute left-4 top-[104px] rotate-2 sm:top-auto sm:bottom-[88px]">
           <Tape uid="hint" className="absolute -top-2.5 left-5 z-[2] -rotate-3 scale-75" />
           <InkBox as="div" variant="card" seed={141} radius={8} className="px-3 py-2 text-[12px] text-ink-soft">
             tap anywhere to throw a chip

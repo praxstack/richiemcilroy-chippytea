@@ -153,11 +153,241 @@
 
 .karaoke-root {
   animation: karaoke-in 0.45s ease-out both;
+  --kick: 0;
+  --sway: 0;
+  --charge: 0;
 }
 
 .karaoke-root.leaving {
   animation: karaoke-out 0.5s ease-in both;
   pointer-events: none;
+}
+
+/* The paper under the karaoke: the dot grid, oversized so it can move a whole
+   period without showing an edge. It rises through the choruses, sways on the
+   bridge, creeps up through the pre-chorus, and holds still for the verses. */
+.karaoke-dots {
+  position: absolute;
+  inset: -36px;
+  pointer-events: none;
+  background-image: radial-gradient(circle, rgba(51, 48, 43, 0.05) 0.85px, transparent 0.95px);
+  background-size: 18px 18px;
+}
+
+@keyframes dots-rise {
+  from { transform: translateY(0); }
+  to { transform: translateY(-36px); }
+}
+
+@keyframes dots-sway {
+  from { transform: translateX(-14px); }
+  to { transform: translateX(14px); }
+}
+
+.karaoke-root[data-section="chorus"] .karaoke-dots { animation: dots-rise 0.8s linear infinite; }
+.karaoke-root[data-section="last-chorus"] .karaoke-dots { animation: dots-rise 0.42s linear infinite; }
+.karaoke-root[data-section="pre-chorus"] .karaoke-dots { animation: dots-rise 1.6s linear infinite; }
+.karaoke-root[data-section="bridge"] .karaoke-dots { animation: dots-sway 0.96s ease-in-out infinite alternate; }
+
+/* Each section washes the paper its own way. Five layers, one lit at a time,
+   so the change between them is a crossfade. */
+.karaoke-wash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.7s ease;
+}
+
+.wash-chorus {
+  background:
+    radial-gradient(ellipse 95% 60% at 50% 106%, rgba(242, 182, 60, 0.46), rgba(242, 182, 60, 0) 70%),
+    radial-gradient(ellipse 70% 45% at 50% -8%, rgba(242, 182, 60, 0.28), rgba(242, 182, 60, 0) 70%);
+}
+
+.wash-last-chorus {
+  background:
+    radial-gradient(ellipse 100% 65% at 50% 106%, rgba(242, 182, 60, 0.62), rgba(242, 182, 60, 0) 72%),
+    radial-gradient(ellipse 75% 50% at 50% -8%, rgba(242, 182, 60, 0.4), rgba(242, 182, 60, 0) 70%),
+    radial-gradient(ellipse 80% 80% at 50% 50%, rgba(180, 85, 61, 0) 55%, rgba(180, 85, 61, 0.16) 100%);
+}
+
+.wash-bridge {
+  background: radial-gradient(ellipse 75% 75% at 50% 50%, rgba(63, 95, 168, 0) 38%, rgba(63, 95, 168, 0.2) 100%);
+}
+
+.wash-verse {
+  background: radial-gradient(ellipse 70% 70% at 50% 48%, rgba(241, 234, 219, 0) 45%, rgba(241, 234, 219, 0.95) 100%);
+}
+
+/* The pre-chorus closes in: a gold ring tightening around the words as the
+   chorus nears, driven by --charge from the song's clock. */
+.wash-pre-chorus {
+  background: radial-gradient(
+    circle at 50% 46%,
+    rgba(242, 182, 60, 0) calc(62% - var(--charge) * 42%),
+    rgba(242, 182, 60, 0.48) 100%
+  );
+}
+
+.karaoke-root[data-section="chorus"] .wash-chorus,
+.karaoke-root[data-section="last-chorus"] .wash-last-chorus,
+.karaoke-root[data-section="bridge"] .wash-bridge,
+.karaoke-root[data-section="verse-1"] .wash-verse,
+.karaoke-root[data-section="verse-2"] .wash-verse,
+.karaoke-root[data-section="pre-chorus"] .wash-pre-chorus {
+  opacity: 1;
+}
+
+/* The section stamp: slams onto the page, holds, then flies up and away as
+   the little tag at the top takes over. */
+.section-stamp {
+  position: absolute;
+  left: 50%;
+  top: 25%;
+  z-index: 12;
+  pointer-events: none;
+  white-space: nowrap;
+  transform-origin: 50% 50%;
+  animation: stamp-in 2s ease-out both;
+}
+
+@keyframes stamp-in {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(2.8) rotate(-18deg);
+  }
+  8% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(0.92) rotate(4deg);
+  }
+  14% {
+    transform: translate(-50%, -50%) scale(1.08) rotate(-5deg);
+  }
+  20% {
+    transform: translate(-50%, -50%) scale(1) rotate(-3deg);
+  }
+  70% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1) rotate(-3deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% - 110px)) scale(0.55) rotate(5deg);
+  }
+}
+
+.section-tag {
+  pointer-events: none;
+  animation: tag-in 0.35s ease-out 1.5s both;
+}
+
+@keyframes tag-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -12px) scale(0.7) rotate(-1deg);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1) rotate(-1deg);
+  }
+}
+
+/* The stage the lyric stands on: it bounces on the beat through the choruses,
+   trembles harder and harder through the pre-chorus, and sways on the bridge. */
+.kline-stage {
+  transition: transform 0.09s linear;
+  will-change: transform;
+}
+
+.karaoke-root[data-section="chorus"] .kline-stage {
+  transform: scale(calc(1 + var(--kick) * 0.09)) rotate(calc(var(--sway) * var(--kick) * -1deg));
+}
+
+.karaoke-root[data-section="last-chorus"] .kline-stage {
+  transform: scale(calc(1.08 + var(--kick) * 0.13)) rotate(calc(var(--sway) * var(--kick) * -2deg));
+}
+
+.karaoke-root[data-section="bridge"] .kline-stage {
+  transition: transform 0.32s cubic-bezier(0.3, 1.4, 0.5, 1);
+  transform: rotate(calc(var(--sway) * 3deg)) translateX(calc(var(--sway) * 14px));
+}
+
+.karaoke-root[data-section="pre-chorus"] .kline-stage {
+  transition: none;
+  animation: kline-tremble 0.11s steps(2) infinite;
+}
+
+@keyframes kline-tremble {
+  0% { transform: scale(calc(1 + var(--charge) * 0.14)) translate(calc(var(--charge) * -6px), calc(var(--charge) * 3px)) rotate(calc(var(--charge) * -1.2deg)); }
+  25% { transform: scale(calc(1 + var(--charge) * 0.14)) translate(calc(var(--charge) * 5px), calc(var(--charge) * -4px)) rotate(calc(var(--charge) * 1deg)); }
+  50% { transform: scale(calc(1 + var(--charge) * 0.14)) translate(calc(var(--charge) * -4px), calc(var(--charge) * -3px)) rotate(calc(var(--charge) * 0.8deg)); }
+  75% { transform: scale(calc(1 + var(--charge) * 0.14)) translate(calc(var(--charge) * 6px), calc(var(--charge) * 4px)) rotate(calc(var(--charge) * -0.9deg)); }
+  100% { transform: scale(calc(1 + var(--charge) * 0.14)) translate(calc(var(--charge) * -6px), calc(var(--charge) * 3px)) rotate(calc(var(--charge) * -1.2deg)); }
+}
+
+/* Each new line arrives in the manner of its section: written in from the
+   left for a verse, slammed down for a chorus, swung in on the bridge, risen
+   from below through the pre-chorus. */
+.kline {
+  animation: kline-write 0.3s ease-out both;
+}
+
+.karaoke-root[data-section="chorus"] .kline,
+.karaoke-root[data-section="last-chorus"] .kline {
+  animation: kline-slam 0.42s cubic-bezier(0.2, 1.5, 0.4, 1) both;
+}
+
+.karaoke-root[data-section="bridge"] .kline {
+  animation: kline-swing 0.5s cubic-bezier(0.3, 1.5, 0.5, 1) both;
+}
+
+.karaoke-root[data-section="pre-chorus"] .kline {
+  animation: kline-rise 0.36s cubic-bezier(0.2, 1.3, 0.4, 1) both;
+}
+
+@keyframes kline-write {
+  from {
+    opacity: 0;
+    transform: translateX(-28px) rotate(-1.5deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes kline-slam {
+  from {
+    opacity: 0;
+    transform: scale(1.9) rotate(-5deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes kline-swing {
+  from {
+    opacity: 0;
+    transform: rotate(-9deg) translateX(-40px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes kline-rise {
+  from {
+    opacity: 0;
+    transform: translateY(40px) scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 /* A soft paper wash behind the words so the fish never swim over them. */
@@ -195,6 +425,62 @@
   transform: translateY(-0.08em) scale(1.07) rotate(-1.5deg);
 }
 
+/* How the sung word moves, by section: a big pop in the choruses, a bigger
+   one in the last, a shiver through the pre-chorus, a lean either way on the
+   bridge. Sung words stay a touch lifted through the choruses, so a line
+   finished reads as a wave. */
+.karaoke-root[data-section="chorus"] .kw,
+.karaoke-root[data-section="last-chorus"] .kw {
+  margin: 0 0.2em;
+}
+
+.karaoke-root[data-section="chorus"] .kw[data-state="active"],
+.karaoke-root[data-section="last-chorus"] .kw[data-state="active"] {
+  animation: kw-pop 0.32s cubic-bezier(0.2, 1.6, 0.4, 1) both;
+  transform: translateY(-0.14em) scale(1.18) rotate(-3deg);
+}
+
+.karaoke-root[data-section="last-chorus"] .kw[data-state="active"] {
+  animation-name: kw-pop-big;
+  transform: translateY(-0.18em) scale(1.26) rotate(-4deg);
+}
+
+.karaoke-root[data-section="chorus"] .kw[data-state="done"],
+.karaoke-root[data-section="last-chorus"] .kw[data-state="done"] {
+  transform: translateY(-0.05em) rotate(1deg);
+}
+
+.karaoke-root[data-section="bridge"] .kw[data-state="active"] {
+  transform: translateY(-0.1em) scale(1.16) rotate(5deg);
+}
+
+.karaoke-root[data-section="bridge"] .kw:nth-child(even)[data-state="active"] {
+  transform: translateY(-0.1em) scale(1.16) rotate(-5deg);
+}
+
+.karaoke-root[data-section="pre-chorus"] .kw[data-state="active"] {
+  animation: kw-shiver 0.1s steps(2) infinite;
+  transform: translateY(-0.08em) scale(1.12);
+}
+
+@keyframes kw-pop {
+  0% { transform: translateY(0) scale(1) rotate(0deg); }
+  45% { transform: translateY(-0.2em) scale(1.3) rotate(-5deg); }
+  100% { transform: translateY(-0.14em) scale(1.18) rotate(-3deg); }
+}
+
+@keyframes kw-pop-big {
+  0% { transform: translateY(0) scale(1) rotate(0deg); }
+  45% { transform: translateY(-0.26em) scale(1.42) rotate(-7deg); }
+  100% { transform: translateY(-0.18em) scale(1.26) rotate(-4deg); }
+}
+
+@keyframes kw-shiver {
+  0% { transform: translate(-0.03em, -0.08em) scale(1.12) rotate(-1.5deg); }
+  50% { transform: translate(0.03em, -0.1em) scale(1.12) rotate(1.5deg); }
+  100% { transform: translate(-0.03em, -0.08em) scale(1.12) rotate(-1.5deg); }
+}
+
 @keyframes kw-boil {
   0% { transform: translate(0, 0) rotate(0deg); }
   33% { transform: translate(0.01em, -0.012em) rotate(0.5deg); }
@@ -223,13 +509,26 @@
   .reveal,
   .eq-chip,
   .kw,
-  .kw-gold {
+  .kw-gold,
+  .kline,
+  .kline-stage,
+  .karaoke-dots,
+  .section-tag {
     animation: none !important;
     transition: none !important;
   }
 
-  .kw[data-state="active"] {
-    transform: none;
+  .kw[data-state="active"],
+  .kline-stage {
+    transform: none !important;
+  }
+
+  .section-stamp {
+    display: none;
+  }
+
+  .karaoke-wash {
+    transition: none;
   }
 
   .karaoke-root {

@@ -2,7 +2,12 @@
 // swimming past, chips raining down, fountaining out of the wrap on every
 // chorus and flying in wherever the page is tapped, plus a run of sight gags
 // cued by the words themselves ("seventeen copies of the same old brew" is
-// seventeen mugs). Everything is drawn with the app's ink primitives.
+// seventeen mugs). Every section of the song has its own act: the fish whoosh
+// in for the intro, a sunburst turns and sparks fly on the beat through the
+// choruses, everything gathers and shakes through the pre-chorus until the
+// drop, the fish circle the words while two pairs of hands clap on the bridge,
+// and the last chorus is all of it, louder, with loop-the-loops. Everything is
+// drawn with the app's ink primitives.
 
 import {
   Pt,
@@ -19,6 +24,7 @@ import {
 import { fishArt } from "./art";
 import { paintChip, paintWrap, drawAsterisk } from "./draw";
 import { lyricLines } from "./lyrics";
+import { runOfLine, sectionRuns, progressThrough } from "./sections";
 
 type Ctx = CanvasRenderingContext2D;
 
@@ -36,6 +42,8 @@ export interface SceneFrame {
   dt: number;
   /** Bass energy 0…1 from the analyser, or a steady stand-in. */
   level: number;
+  /** True on the frame a beat lands. */
+  beat: boolean;
   playing: boolean;
   /** Index into lyricLines of the line on screen. */
   line: number;
@@ -48,10 +56,27 @@ export interface SceneFrame {
 
 interface Fish {
   lane: number;
+  /** Where along the width it starts, as a fraction, once it has swum in. */
+  home: number;
   x: number;
   height: number;
   speed: number;
   phase: number;
+  /** Where the fish is actually drawn: eases toward wherever the section wants it. */
+  dx: number;
+  dy: number;
+  flip: boolean;
+  tilt: number;
+}
+
+interface Spark {
+  x: number;
+  y: number;
+  /** performance.now() it appears. */
+  at: number;
+  size: number;
+  seed: number;
+  gold: boolean;
 }
 
 interface Chip {
@@ -66,6 +91,8 @@ interface Chip {
   /** Canvas y below which the chip has landed and vanishes. */
   floor: number;
   thrown: boolean;
+  /** Pre-chorus chips float up instead of falling. */
+  drift?: boolean;
 }
 
 interface Gag {
@@ -358,6 +385,63 @@ function drawSalt(ctx: Ctx, x: number, y: number, spread: number, count: number,
   }
 }
 
+/// A cartoon mitt seen from the back, fingers up, with a jumper cuff. Flipped,
+/// it is the other hand of the pair.
+function doodleHand(ctx: Ctx, x: number, y: number, size: number, seed: number, flip: boolean) {
+  const outline: Pt[] = [
+    { x: 0.3, y: 1 }, { x: 0.24, y: 0.8 }, { x: 0.2, y: 0.6 },
+    { x: 0.06, y: 0.46 }, { x: 0.02, y: 0.37 }, { x: 0.1, y: 0.31 }, { x: 0.26, y: 0.42 },
+    { x: 0.27, y: 0.2 }, { x: 0.31, y: 0.06 }, { x: 0.38, y: 0.08 }, { x: 0.4, y: 0.24 },
+    { x: 0.43, y: 0.08 }, { x: 0.49, y: 0 }, { x: 0.55, y: 0.06 }, { x: 0.55, y: 0.24 },
+    { x: 0.58, y: 0.06 }, { x: 0.64, y: 0.02 }, { x: 0.7, y: 0.1 }, { x: 0.68, y: 0.28 },
+    { x: 0.72, y: 0.16 }, { x: 0.78, y: 0.14 }, { x: 0.82, y: 0.24 }, { x: 0.78, y: 0.46 },
+    { x: 0.8, y: 0.64 }, { x: 0.76, y: 0.84 }, { x: 0.7, y: 1 },
+  ].map((p) => ({ x: p.x * size, y: p.y * size }));
+  ctx.save();
+  ctx.translate(x, y);
+  if (flip) ctx.scale(-1, 1);
+  ctx.translate(-size * 0.5, -size * 0.5);
+  const hand = handPath2D(outline, true, size * 0.012, seed);
+  ctx.fillStyle = tea.card;
+  ctx.fill(hand);
+  stroke(ctx, hand, tea.ink, Math.max(1.4, size * 0.022));
+  // Finger creases and the palm line.
+  for (let i = 0; i < 3; i++) {
+    const fx = size * (0.4 + i * 0.145);
+    stroke(ctx, handPath2D([{ x: fx, y: size * 0.24 }, { x: fx + size * 0.01, y: size * 0.4 }], false, size * 0.006, seed + 3 + i), inkA(0.4), Math.max(1, size * 0.014));
+  }
+  stroke(ctx, handPath2D(arcSamples({ x: size * 0.5, y: size * 0.36 }, size * 0.26, Math.PI * 0.2, Math.PI * 0.8, 6), false, size * 0.006, seed + 8), inkA(0.3), Math.max(1, size * 0.014));
+  // The cuff.
+  const cuff = handPath2D(roundedRectSamples(size * 0.2, size * 0.86, size * 0.58, size * 0.22, size * 0.05, 6), true, size * 0.01, seed + 9);
+  ctx.fillStyle = tea.gold;
+  ctx.fill(cuff);
+  stroke(ctx, cuff, tea.ink, Math.max(1.2, size * 0.02));
+  ctx.restore();
+}
+
+/// A sunburst: wobbly gold wedges fanning out from a point, for the choruses.
+function drawRays(ctx: Ctx, cx: number, cy: number, radius: number, angle: number, count: number, alpha: number, boil: number) {
+  const step = (Math.PI * 2) / count;
+  ctx.save();
+  ctx.fillStyle = `rgba(242, 182, 60, ${alpha})`;
+  for (let i = 0; i < count; i++) {
+    const a0 = angle + i * step;
+    const a1 = a0 + step * 0.48;
+    const mid = (a0 + a1) / 2;
+    const wedge = handPath2D(
+      [
+        { x: cx, y: cy },
+        { x: cx + Math.cos(a0) * radius, y: cy + Math.sin(a0) * radius },
+        { x: cx + Math.cos(mid) * radius * 1.04, y: cy + Math.sin(mid) * radius * 1.04 },
+        { x: cx + Math.cos(a1) * radius, y: cy + Math.sin(a1) * radius },
+      ],
+      true, radius * 0.012, 930 + i * 3 + boil
+    );
+    ctx.fill(wedge);
+  }
+  ctx.restore();
+}
+
 // MARK: - The scene
 
 export class KaraokeScene {
@@ -372,17 +456,27 @@ export class KaraokeScene {
   private firedAt = new Map<string, number>();
   private leapAt = -10;
   private lastLine = -1;
+  /** The section run on screen, and performance.now() when it arrived. */
+  private run = -1;
+  private runSince = 0;
+  private firstDrawAt = 0;
+  private lastBeat = -10;
+  private beatCount = 0;
+  private sparks: Spark[] = [];
+  /** 0…1: how far the clapping hands have come in from the wings. */
+  private handsIn = 0;
+  private lastDrift = 0;
   /** Called with a canvas point when a thrown chip lands in the wrap. */
   onLand: ((x: number, y: number) => void) | null = null;
 
   constructor() {
     this.fish = [
-      { lane: 0.12, x: 0.2, height: 58, speed: 30, phase: 0.4 },
-      { lane: 0.25, x: 0.72, height: 38, speed: 44, phase: 2.1 },
-      { lane: 0.5, x: 0.05, height: 30, speed: 24, phase: 4.2 },
-      { lane: 0.7, x: 0.55, height: 50, speed: 36, phase: 1.3 },
-      { lane: 0.84, x: 0.9, height: 34, speed: 52, phase: 3.3 },
-    ];
+      { lane: 0.12, home: 0.2, height: 58, speed: 30, phase: 0.4 },
+      { lane: 0.25, home: 0.72, height: 38, speed: 44, phase: 2.1 },
+      { lane: 0.5, home: 0.05, height: 30, speed: 24, phase: 4.2 },
+      { lane: 0.7, home: 0.55, height: 50, speed: 36, phase: 1.3 },
+      { lane: 0.84, home: 0.9, height: 34, speed: 52, phase: 3.3 },
+    ].map((fish) => ({ ...fish, x: 0, dx: 0, dy: 0, flip: false, tilt: 0 }));
     this.fishPaths = [0, 1, 2].map((phase) => {
       const art = fishArt(401 + phase * 7);
       return {
@@ -401,14 +495,29 @@ export class KaraokeScene {
     const first = this.w === 0;
     this.w = w;
     this.h = h;
-    if (first) for (const fish of this.fish) fish.x *= w;
+    if (first) this.lineUp();
+  }
+
+  /// The fish take their marks off the right-hand edge, ready to whoosh in.
+  private lineUp() {
+    for (const [index, fish] of this.fish.entries()) {
+      fish.x = this.w * (1.08 + index * 0.16);
+      fish.dx = fish.x;
+      fish.dy = fish.lane * this.h;
+      fish.flip = false;
+      fish.tilt = 0;
+    }
   }
 
   /// Back to the top of the song: gags may fire again, the wrap starts empty.
   reset() {
     this.firedAt.clear();
     this.chips = [];
+    this.sparks = [];
     this.lastLine = -1;
+    this.run = -1;
+    this.firstDrawAt = 0;
+    this.lineUp();
   }
 
   /** Scale for the doodles: 1 on a laptop screen, smaller on a phone. */
@@ -493,6 +602,51 @@ export class KaraokeScene {
   private spawn(chip: Chip) {
     if (this.chips.length >= MAX_CHIPS) this.chips.shift();
     this.chips.push(chip);
+  }
+
+  /// Asterisks that flare up and fade: the beat, made visible.
+  private spark(x: number, y: number, at: number, size: number, gold = true) {
+    if (this.sparks.length > 40) this.sparks.shift();
+    this.sparks.push({ x, y, at, size, seed: Math.floor(Math.random() * 1000), gold });
+  }
+
+  private sparkle(count: number, at: number, size: number) {
+    const u = this.unit();
+    for (let i = 0; i < count; i++) {
+      // Anywhere but behind the words.
+      const side = Math.random() < 0.5;
+      const x = side ? this.w * (0.03 + Math.random() * 0.24) : this.w * (0.73 + Math.random() * 0.24);
+      const y = this.h * (0.08 + Math.random() * 0.62);
+      this.spark(x, y, at + Math.random() * 60, size * u * (0.7 + Math.random() * 0.8), Math.random() < 0.7);
+    }
+  }
+
+  /// The arrival of a section: chips up out of the wrap, the fish leap, sparks.
+  private sectionBurst(key: string, previousKey: string, now: number) {
+    const { w, h } = this;
+    const fromPre = previousKey === "pre-chorus";
+    switch (key) {
+      case "chorus":
+      case "last-chorus": {
+        const power = key === "last-chorus" ? 1.7 : 1.4;
+        this.fountain(fromPre ? 34 : 24, power);
+        this.burst(w / 2, h * 0.6, fromPre ? 26 : 14, power * 0.9);
+        this.sparkle(key === "last-chorus" ? 14 : 9, now, 12);
+        this.leapAt = now;
+        break;
+      }
+      case "bridge":
+        this.fountain(12, 1.1);
+        this.sparkle(8, now, 10);
+        break;
+      case "verse-1":
+      case "verse-2":
+        this.fountain(7, 0.9);
+        break;
+      case "pre-chorus":
+        this.sparkle(4, now, 8);
+        break;
+    }
   }
 
   private buildGags(): Gag[] {
@@ -677,24 +831,68 @@ export class KaraokeScene {
     const { w, h } = this;
     if (w === 0 || h === 0) return;
     ctx.clearRect(0, 0, w, h);
+    if (!this.firstDrawAt) this.firstDrawAt = frame.now;
     const u = this.unit();
     const dt = frame.reduced ? 0 : Math.min(0.05, frame.dt);
     const boil = frame.reduced ? 0 : Math.floor(frame.now / 167) % 3;
     const text = lineText(frame.line);
-    const section = lyricLines[frame.line]?.section ?? "";
-    const chorus = section.includes("chorus");
     const lineActive = frame.playing && frame.time >= lineStart(frame.line) && frame.time <= lineEnd(frame.line) + 0.3;
     const finale = text.includes("hooray") && frame.time >= lineStart(frame.line);
     const finaleT = finale ? frame.time - lineStart(frame.line) : -1;
+
+    // The section on screen, and the moment it changes.
+    const runIndex = runOfLine[frame.line] ?? 0;
+    const run = sectionRuns[runIndex];
+    const key = run.key;
+    const last = key === "last-chorus";
+    const chorus = key === "chorus" || last;
+    const bridge = key === "bridge";
+    const pre = key === "pre-chorus";
+    const verse2 = key === "verse-2";
+    const intro = key === "intro";
+    if (runIndex !== this.run) {
+      const previous = this.run >= 0 ? sectionRuns[this.run].key : "";
+      this.run = runIndex;
+      this.runSince = frame.now;
+      if (previous && frame.playing && !frame.reduced) this.sectionBurst(key, previous, frame.now);
+    }
+    const sinceSection = (frame.now - this.runSince) / 1000;
+    const settle = frame.reduced ? 1 : clamp01(springTo(sinceSection, 1.1, 0.7));
+    const charge = pre ? progressThrough(run, frame.time) : 0;
+    const arrived = frame.reduced ? 1 : clamp01(springTo((frame.now - this.firstDrawAt) / 1000 - 0.15, 1, 0.65));
 
     if (frame.line !== this.lastLine) {
       this.lastLine = frame.line;
       if (text.startsWith("whoa") || text.includes("hooray") || text.startsWith("oi")) this.leapAt = frame.now;
     }
+    if (frame.beat && frame.playing && !frame.reduced) {
+      this.lastBeat = frame.now;
+      this.beatCount += 1;
+      if (chorus) this.sparkle(last ? 7 : 4, frame.now, last ? 11 : 8);
+    }
+    const beatT = (frame.now - this.lastBeat) / 1000;
+    const kick = frame.reduced ? 0 : Math.exp(-beatT * 7);
 
-    // Chips: a gentle rain in the verses, a fountain on every chorus.
+    // The pre-chorus shakes the whole scene, harder as the drop nears.
+    ctx.save();
+    if (pre && !frame.reduced && frame.playing) {
+      const shake = charge * charge * 9 * u;
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    // The sunburst behind the words, turning through the choruses.
+    if (chorus) {
+      const cx = w / 2;
+      const cy = h * 0.46;
+      const radius = Math.hypot(w, h) * 0.6 * (1 + kick * 0.05);
+      const angle = frame.reduced ? 0 : sinceSection * (last ? 0.55 : 0.32) + kick * 0.04;
+      drawRays(ctx, cx, cy, radius, angle, last ? 18 : 14, (last ? 0.26 : 0.16) * settle, boil);
+    }
+
+    // Chips: a gentle rain in the verses, a fountain on every chorus, and
+    // through the pre-chorus they float up out of the wrap instead.
     if (frame.playing && !frame.reduced) {
-      if (!chorus && frame.now - this.lastRain > 900 / (0.6 + frame.level)) {
+      if (!chorus && !pre && frame.now - this.lastRain > (verse2 ? 600 : 900) / (0.6 + frame.level)) {
         this.lastRain = frame.now;
         this.spawn({
           x: Math.random() * w, y: -30,
@@ -704,9 +902,20 @@ export class KaraokeScene {
           floor: this.wrapBox().landY, thrown: false,
         });
       }
-      if (chorus && lineActive && frame.now - this.lastFountain > 260 - frame.level * 120) {
+      if (chorus && lineActive && frame.now - this.lastFountain > (last ? 170 : 240) - frame.level * 110) {
         this.lastFountain = frame.now;
-        this.fountain(2, 0.85 + frame.level * 0.5);
+        this.fountain(last ? 3 : 2, (last ? 1.05 : 0.9) + frame.level * 0.5);
+      }
+      if (pre && frame.now - this.lastDrift > 260 - charge * 200) {
+        this.lastDrift = frame.now;
+        const wrap = this.wrapBox();
+        this.spawn({
+          x: wrap.landX + (Math.random() - 0.5) * wrap.width * 0.9, y: wrap.landY - 10,
+          vx: (Math.random() - 0.5) * 30, vy: -(60 + charge * 160 + Math.random() * 60),
+          rot: Math.random() * Math.PI, spin: (Math.random() - 0.5) * 4,
+          len: (18 + Math.random() * 12) * u, seed: Math.floor(Math.random() * 1000),
+          floor: h + 100, thrown: false, drift: true,
+        });
       }
       if (finale && finaleT < 3.2) {
         if (frame.now - this.lastFountain > 70) {
@@ -716,24 +925,102 @@ export class KaraokeScene {
       }
     }
 
-    // Fish, swimming left (the drawing faces left), bobbing to the song.
+    // Fish. Each section wants them somewhere: swimming their lanes, whooshing
+    // in from the wings, huddled at the bottom for the build-up, circling the
+    // words on the bridge. They ease toward it, so the changes read as moves.
     const leap = frame.reduced ? 1 : clamp01((frame.now - this.leapAt) / 900);
+    const ease = frame.reduced ? 1 : 1 - Math.exp(-dt * 4.5);
     for (const [index, fish] of this.fish.entries()) {
-      const tempo = chorus ? 2.2 : 1;
-      if (frame.playing) fish.x -= fish.speed * tempo * dt;
-      if (fish.x < -fish.height * 2) fish.x = w + fish.height * 1.5;
-      const bob = frame.reduced ? 0 : Math.sin(frame.now / 640 + fish.phase) * (chorus ? 12 : 6);
-      const beat = frame.playing && !frame.reduced ? -frame.level * 10 : 0;
+      const dir = verse2 ? 1 : -1;
+      const tempo = intro ? 9 : last ? 3 : chorus ? 2.2 : bridge ? 0.3 : 1;
+      // Reduced motion never advances the clock, so the fish sit at home.
+      if (frame.reduced) fish.x = fish.home * w;
+      else if (frame.playing) fish.x += dir * fish.speed * tempo * dt;
+      if (dir < 0 && fish.x < -fish.height * 2) fish.x = w + fish.height * 1.5;
+      if (dir > 0 && fish.x > w + fish.height * 2) fish.x = -fish.height * 1.5;
+
+      const wave = Math.sin(frame.now / (chorus ? 320 : 640) + fish.phase + (chorus ? index * 0.9 : 0));
+      const bob = frame.reduced ? 0 : wave * (last ? 18 : chorus ? 13 : 6);
+      const beat = frame.playing && !frame.reduced ? -frame.level * 10 - kick * (chorus ? 16 : 6) : 0;
       const hop = leap < 1 ? -Math.sin(leap * Math.PI) * 70 * (0.6 + 0.4 * ((index * 7) % 3) / 2) : 0;
-      const y = fish.lane * h + bob + beat + hop;
+      let tx = fish.x;
+      let ty = fish.lane * h + bob + beat + hop;
+      let flip = dir > 0;
+      let tilt = frame.reduced ? 0 : wave * 0.06 + (leap < 1 ? -Math.sin(leap * Math.PI) * 0.3 : 0);
+      let snap = true;
+
+      if (bridge && !frame.reduced) {
+        // Round and round the words they go.
+        const a = -Math.PI / 2 + (index * Math.PI * 2) / this.fish.length + sinceSection * 0.85;
+        const rx = Math.min(w * 0.44, h * 0.62);
+        const ry = h * 0.36;
+        tx = w / 2 + Math.cos(a) * rx;
+        ty = h * 0.46 + Math.sin(a) * ry + bob * 0.5;
+        const vx = -Math.sin(a) * rx;
+        const vy = Math.cos(a) * ry;
+        flip = vx > 0;
+        tilt = -Math.atan2(vy, Math.abs(vx)) * 0.8;
+        snap = false;
+      } else if (pre && !frame.reduced) {
+        // Huddled along the bottom, shivering more as the chorus nears.
+        tx = w / 2 + (index - (this.fish.length - 1) / 2) * Math.min(w * 0.17, 150 * u);
+        ty = h * 0.8 + Math.sin(frame.now / 90 + index) * charge * 9 * u;
+        flip = index % 2 === 1;
+        tilt = Math.sin(frame.now / 70 + index * 2) * charge * 0.18;
+        snap = false;
+      } else if (last && !frame.reduced) {
+        // Loop-the-loops, one fish at a time.
+        const cycle = (sinceSection + index * 0.7) % 3.6;
+        if (cycle < 0.9) {
+          const p = cycle / 0.9;
+          tilt += (flip ? 1 : -1) * p * Math.PI * 2;
+          ty -= Math.sin(p * Math.PI) * 60 * u;
+        }
+      }
+
+      if (snap && Math.abs(tx - fish.dx) > w * 0.5) fish.dx = tx;
+      fish.dx += (tx - fish.dx) * ease;
+      fish.dy += (ty - fish.dy) * ease;
+      fish.tilt += (tilt - fish.tilt) * Math.min(1, ease * 1.6);
+      fish.flip = flip;
+      if (arrived < 1 && intro) fish.dx = fish.x;
+
       const scale = (fish.height * u) / 44;
       ctx.save();
-      ctx.translate(fish.x, y);
-      ctx.rotate(frame.reduced ? 0 : Math.sin(frame.now / 640 + fish.phase) * 0.06 + (leap < 1 ? -Math.sin(leap * Math.PI) * 0.3 : 0));
+      ctx.translate(fish.dx, fish.dy);
+      if (fish.flip) ctx.scale(-1, 1);
+      ctx.rotate(fish.tilt);
       ctx.scale(scale, scale);
       ctx.translate(-32, -22);
       drawFishPaths(ctx, this.fishPaths[(boil + index) % 3]);
       ctx.restore();
+    }
+
+    // Two pairs of hands, clapping along on the bridge.
+    const handsTarget = bridge && !frame.reduced ? 1 : 0;
+    this.handsIn += (handsTarget - this.handsIn) * (frame.reduced ? 1 : 1 - Math.exp(-dt * 5));
+    if (this.handsIn > 0.01) {
+      const size = Math.min(96 * u, w * 0.13);
+      const clap = beatT < 0.24 ? Math.sin((beatT / 0.24) * Math.PI) : 0;
+      const gap = size * 0.5 * (1 - clap * 0.92);
+      // Beside the words on a wide screen; below them on a phone.
+      const y = (w < 640 ? h * 0.68 : h * 0.52) + Math.sin(frame.now / 300) * 4 * u;
+      const slide = (1 - this.handsIn) * size * 2.6;
+      for (const side of [-1, 1]) {
+        const cx = side < 0 ? w * 0.11 - slide : w * 0.89 + slide;
+        ctx.save();
+        ctx.translate(cx, y);
+        ctx.rotate(side * (0.06 - clap * 0.1));
+        doodleHand(ctx, -gap, 0, size, 811, false);
+        doodleHand(ctx, gap, 0, size, 812, true);
+        ctx.restore();
+        if (clap > 0.9 && beatT > 0.1 && this.beatCount !== this.firedAt.get(`clap${side}`)) {
+          this.firedAt.set(`clap${side}`, this.beatCount);
+          for (let i = 0; i < 3; i++) {
+            this.spark(cx + (Math.random() - 0.5) * size * 0.8, y - size * 0.55 - Math.random() * size * 0.4, frame.now, (7 + Math.random() * 6) * u);
+          }
+        }
+      }
     }
 
     // Sight gags, cued by their lines, holding on a little after.
@@ -777,6 +1064,12 @@ export class KaraokeScene {
         if (chip.thrown) this.onLand?.(wrap.landX, wrap.landY);
         return false;
       }
+      if (chip.drift) {
+        chip.x += (chip.vx + Math.sin(frame.now / 200 + chip.seed) * 40) * dt;
+        chip.y += chip.vy * dt;
+        chip.rot += chip.spin * dt;
+        return chip.y > -60;
+      }
       chip.vy += g * dt;
       chip.x += chip.vx * dt;
       chip.y += chip.vy * dt;
@@ -796,11 +1089,23 @@ export class KaraokeScene {
       ctx.restore();
     }
 
-    // The wrap, full of what you've earned.
+    // The wrap, full of what you've earned. It slides up to open the show.
     ctx.save();
-    ctx.translate(wrap.x, wrap.y);
+    ctx.translate(wrap.x, wrap.y + (1 - arrived) * (wrap.height + 120));
     paintWrap(ctx, wrap.width, wrap.height, frame.wrapChips, boil);
     ctx.restore();
+
+    // Sparks: on the beat, on the claps, on every section's arrival.
+    this.sparks = this.sparks.filter((spark) => frame.now - spark.at < 520);
+    for (const spark of this.sparks) {
+      const age = (frame.now - spark.at) / 1000;
+      if (age < 0) continue;
+      const s = age < 0.12 ? age / 0.12 : 1 - (age - 0.12) / 0.4;
+      ctx.save();
+      ctx.globalAlpha = clamp01(s);
+      drawAsterisk(ctx, { x: spark.x, y: spark.y }, spark.size * (0.6 + s * 0.7), spark.gold ? tea.gold : inkA(0.55), spark.seed + boil);
+      ctx.restore();
+    }
 
     // The finale: asterisks and salt everywhere.
     if (finale && finaleT < 4 && !frame.reduced) {
@@ -811,9 +1116,9 @@ export class KaraokeScene {
         drawAsterisk(ctx, { x, y }, (7 + (i % 3) * 3) * u, i % 2 ? tea.gold : inkA(0.5), seed);
       }
       drawSalt(ctx, w / 2, h * 0.5, w * 0.8, 40, 900 + boil);
-    } else if (chorus && lineActive) {
-      drawAsterisk(ctx, { x: w * 0.12, y: h * 0.38 }, 7 * u, tea.gold, 820 + boil);
-      drawAsterisk(ctx, { x: w * 0.9, y: h * 0.62 }, 5 * u, inkA(0.45), 823 + boil);
+    } else if (last && lineActive && !frame.reduced) {
+      drawSalt(ctx, w / 2, h * 0.3, w * 0.9, 24, 910 + boil + Math.floor(sinceSection * 2));
     }
+    ctx.restore();
   }
 }
