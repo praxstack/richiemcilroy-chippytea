@@ -838,6 +838,42 @@ fn explicit_duplicate_check_verifies_contents_includes_kept_copies_and_expires_o
 }
 
 #[test]
+fn completed_xip_downloads_use_archive_threshold_and_remain_trash_only() {
+    let _engine_guard = support::engine_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let downloads = base.join("Downloads");
+    let archive = downloads.join("old-tools.XiP");
+    allocated_file(&archive, 51_000_000);
+    let unfinished = downloads.join("still-downloading.xip.part");
+    fs::write(&unfinished, b"unfinished download").unwrap();
+    age_fixture_tree(&downloads, 31);
+    let engine = Engine::open(&base.join("db"), None).unwrap();
+    engine
+        .request(json!({"action":"authorize", "path":downloads, "kind":"downloads"}))
+        .unwrap();
+    engine.request(json!({"action":"scan"})).unwrap();
+    let snapshot = wait(&engine);
+    assert!(snapshot.stats.complete, "{snapshot:?}");
+    assert_eq!(snapshot.candidates.len(), 1);
+    let candidate = &snapshot.candidates[0];
+    assert_eq!(candidate.path, archive);
+    assert_eq!(candidate.kind, "archive");
+    assert!(candidate.suggestion_eligible && !candidate.provisional);
+    assert!(!candidate.eligible_permanent);
+    assert!(candidate.allocated_bytes >= 51_000_000);
+    assert!(
+        engine
+            .request(json!({"action":"prepare", "operation":"permanent", "items":[candidate]}))
+            .is_err()
+    );
+    assert_eq!(snapshot.wallet.credited_bytes, 0);
+    assert!(snapshot.history.is_empty());
+    assert_eq!(fs::metadata(&archive).unwrap().len(), 51_000_000);
+    assert_eq!(fs::read(&unfinished).unwrap(), b"unfinished download");
+}
+
+#[test]
 fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
     let _engine_guard = support::engine_guard();
     let temp = tempfile::tempdir().unwrap();

@@ -251,7 +251,9 @@ pub(crate) fn downloads_boundary(root: &Root) -> Option<PathBuf> {
 }
 
 const INSTALLER_EXTENSIONS: &[&str] = &["dmg", "pkg"];
-const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "tar", "gz", "bz2", "xz", "7z", "rar", "iso"];
+const ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "zst", "7z", "rar", "iso", "xip",
+];
 
 fn extension_is(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
@@ -381,6 +383,11 @@ mod tests {
             "document.pDf",
             "archive.tAr.Gz",
             "Installer.DMG",
+            "package.XIP",
+            "package.TGZ",
+            "package.tbz2",
+            "package.TXZ",
+            "package.zst",
         ] {
             assert!(personal_file_name(OsStr::new(name)), "{name}");
         }
