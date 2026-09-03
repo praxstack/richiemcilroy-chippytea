@@ -239,14 +239,16 @@ impl ActivitySnapshot {
         });
         match identifiers {
             Err(reason) => Some(reason.clone()),
-            Ok(identifiers) => location
-                .file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| identifiers.contains(name))
+            Ok(identifiers) => {
+                let browser_owner = crate::recommendations::browser_cache_owner(location);
+                let final_name = location.file_name().and_then(OsStr::to_str);
+                (browser_owner.is_some_and(|owner| identifiers.contains(owner))
+                    || final_name.is_some_and(|name| identifiers.contains(name)))
                 .then(|| {
                     "The app that owns this cache is running; close it before reviewing cleanup"
                         .into()
-                }),
+                })
+            }
         }
     }
 }
@@ -802,6 +804,49 @@ mod tests {
                     &cancel,
                 )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn browser_cache_activity_uses_browser_bundle_owner_and_exact_paths() {
+        let cancel = AtomicBool::new(false);
+        for (path, owner, unrelated) in [
+            (
+                "/Users/fixture/Library/Caches/Google/Chrome/Default",
+                "com.google.Chrome",
+                "org.chromium.Chromium",
+            ),
+            (
+                "/Users/fixture/Library/Caches/Chromium/Profile 1",
+                "org.chromium.Chromium",
+                "com.google.Chrome",
+            ),
+        ] {
+            let active = snapshot(&[owner]);
+            assert!(
+                active
+                    .blocked_for("cache", Path::new(path), &cancel)
+                    .is_some(),
+                "{path} must be blocked while its browser is running"
+            );
+            let other = snapshot(&[unrelated]);
+            assert!(
+                other
+                    .blocked_for("cache", Path::new(path), &cancel)
+                    .is_none(),
+                "{path} must not be blocked by an unrelated browser"
+            );
+        }
+        let snapshot = snapshot(&["com.google.Chrome"]);
+        assert!(
+            snapshot
+                .blocked_for(
+                    "cache",
+                    Path::new("/Users/fixture/Library/Caches/Google/Chrome/Default/Cache"),
+                    &cancel,
+                )
+                .is_none(),
+            "Only the validated profile root is an owner-matching location"
         );
     }
 

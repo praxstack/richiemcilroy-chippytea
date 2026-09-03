@@ -1374,7 +1374,11 @@ fn everyday_evidence(path: &Path, meta: &EntryMeta, kind: &'static str) -> Optio
     };
     let name = path.file_name()?.to_string_lossy();
     let title = match kind {
-        "cache" => format!("{name} cache"),
+        "cache" => match recommendations::browser_cache_owner(path) {
+            Some("com.google.Chrome") => format!("Chrome {name} cache"),
+            Some("org.chromium.Chromium") => format!("Chromium {name} cache"),
+            _ => format!("{name} cache"),
+        },
         "xcode" => format!("{name} Xcode data"),
         _ => name.into_owned(),
     };

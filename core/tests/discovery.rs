@@ -874,6 +874,105 @@ fn completed_xip_downloads_use_archive_threshold_and_remain_trash_only() {
 }
 
 #[test]
+fn browser_cache_profiles_are_separate_reviews_and_refresh_independently() {
+    let _engine_guard = support::engine_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let home = base.join("Home");
+    let browser = home.join("Library/Caches/Google/Chrome");
+    let old_profile = browser.join("Default");
+    let active_profile = browser.join("Profile 1");
+    let payload = old_profile.join("Cache/payload");
+    allocated_file(&payload, 51_000_000);
+    fs::create_dir_all(&active_profile).unwrap();
+    fs::write(active_profile.join("active"), b"current cache").unwrap();
+    let preserved = home.join("Library/Application Support/Google/Chrome/Default/Bookmarks");
+    fs::create_dir_all(preserved.parent().unwrap()).unwrap();
+    fs::write(&preserved, b"preserve browser profile data").unwrap();
+    age_fixture_tree(&home, 31);
+    fs::write(active_profile.join("new-cache-entry"), b"recent cache").unwrap();
+    fs::write(browser.join("current-browser-state"), b"recent state").unwrap();
+
+    let db = base.join("db");
+    let engine = Engine::open(&db, None).unwrap();
+    let root: Root = serde_json::from_value(
+        engine
+            .request(json!({"action":"authorize", "path":home, "kind":"home"}))
+            .unwrap(),
+    )
+    .unwrap();
+    engine.request(json!({"action":"scan"})).unwrap();
+    let snapshot = wait(&engine);
+    assert!(snapshot.stats.complete, "{snapshot:?}");
+    let old = indexed_candidate(&db, &old_profile);
+    assert_eq!(old.kind, "cache");
+    assert!(!old.provisional && !old.eligible_permanent);
+    if old.suggestion_eligible {
+        assert!(old.allocated_bytes >= 51_000_000);
+        assert!(!old.fingerprint.is_empty());
+    } else {
+        // The live browser or an unavailable process table must still gate
+        // the precisely recognized profile, never fall back to a vendor-wide
+        // review or silently treat the browser as idle.
+        assert!(
+            matches!(
+                old.blocked_reason.as_deref(),
+                Some("The app that owns this cache is running; close it before reviewing cleanup")
+                    | Some("A running executable could not be identified; cleanup is withheld")
+                    | Some(
+                        "Reliable activity checks are supported only by the native macOS engine"
+                    )
+            ),
+            "{old:?}"
+        );
+    }
+    let current = indexed_candidate(&db, &active_profile);
+    assert!(!current.suggestion_eligible && !current.eligible_permanent);
+    assert!(
+        current
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("quiet days")
+    );
+    assert!(snapshot.candidates.iter().all(|row| {
+        row.path != browser && row.path != browser.parent().unwrap() && row.path != preserved
+    }));
+
+    fs::write(old_profile.join("Cache/changed"), b"new cache contents").unwrap();
+    fs::File::open(&old_profile)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+        .unwrap();
+    let event = engine
+        .request(json!({"action":"dirty", "root_id":root.id,
+            "path":old_profile.join("Cache/changed"), "kind":"file", "recursive":false}))
+        .unwrap();
+    assert!(
+        event.get("ignored").is_none_or(|value| value != true),
+        "{event}"
+    );
+    let refreshed = wait(&engine);
+    assert!(refreshed.stats.complete, "{refreshed:?}");
+    let updated = indexed_candidate(&db, &old_profile);
+    assert!(!updated.suggestion_eligible);
+    assert!(updated.identity.modified_ns > old.identity.modified_ns);
+    assert!(
+        updated
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("quiet days")
+    );
+    assert_eq!(indexed_candidate(&db, &active_profile), current);
+    assert_eq!(
+        fs::read(&preserved).unwrap(),
+        b"preserve browser profile data"
+    );
+    assert_eq!(fs::metadata(&payload).unwrap().len(), 51_000_000);
+}
+
+#[test]
 fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
     let _engine_guard = support::engine_guard();
     let temp = tempfile::tempdir().unwrap();

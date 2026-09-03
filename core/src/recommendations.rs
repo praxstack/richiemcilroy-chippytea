@@ -173,12 +173,68 @@ pub(crate) fn library_route_allowed(root: &Root, path: &Path) -> bool {
         return true;
     }
     library_area(root, path).is_some_and(|(area, suffix)| {
-        area != LibraryArea::Caches
-            || suffix
-                .components()
-                .next()
-                .is_none_or(|component| !managed_cache(component.as_os_str()))
+        if area != LibraryArea::Caches {
+            return true;
+        }
+        let mut components = suffix.components();
+        let Some(first) = components.next().map(|component| component.as_os_str()) else {
+            return true;
+        };
+        if managed_cache(first) {
+            return false;
+        }
+        if first.eq_ignore_ascii_case("Google") {
+            match components.next().map(|component| component.as_os_str()) {
+                // Google is a corridor; Chrome is a nested corridor. A visible
+                // profile is the smallest browser cleanup unit.
+                None => true,
+                Some(browser) if browser.eq_ignore_ascii_case("Chrome") => components
+                    .next()
+                    .is_none_or(|profile| browser_component_allowed(profile.as_os_str())),
+                Some(child) => browser_component_allowed(child),
+            }
+        } else if first.eq_ignore_ascii_case("Chromium") {
+            match components.next().map(|component| component.as_os_str()) {
+                None => true,
+                Some(profile) => browser_component_allowed(profile),
+            }
+        } else {
+            true
+        }
     })
+}
+
+fn browser_component_allowed(component: &OsStr) -> bool {
+    let bytes = component.as_encoded_bytes();
+    !bytes.is_empty() && bytes[0] != b'.' && bytes != b".."
+}
+
+fn path_ends_with_ascii_case(path: &Path, suffix: &[&str]) -> bool {
+    let mut components = path.components().rev();
+    suffix.iter().rev().all(|expected| {
+        components
+            .next()
+            .is_some_and(|component| component.as_os_str().eq_ignore_ascii_case(expected))
+    })
+}
+
+/// Return the bundle identifier for a recognized browser profile cache. The
+/// caller must have already validated this as a Home Library/Caches location;
+/// the suffix match here only prevents an unrelated cache from being treated
+/// as browser-owned activity.
+pub(crate) fn browser_cache_owner(location: &Path) -> Option<&'static str> {
+    let profile = location.file_name()?;
+    if !browser_component_allowed(profile) {
+        return None;
+    }
+    let browser = location.parent()?;
+    if path_ends_with_ascii_case(browser, &["Library", "Caches", "Google", "Chrome"]) {
+        Some("com.google.Chrome")
+    } else if path_ends_with_ascii_case(browser, &["Library", "Caches", "Chromium"]) {
+        Some("org.chromium.Chromium")
+    } else {
+        None
+    }
 }
 
 pub(crate) fn library_candidate(root: &Root, path: &Path, directory: bool) -> Option<&'static str> {
@@ -187,7 +243,43 @@ pub(crate) fn library_candidate(root: &Root, path: &Path, directory: bool) -> Op
         return None;
     }
     match area {
-        LibraryArea::Caches if suffix.components().count() == 1 => Some("cache"),
+        LibraryArea::Caches => {
+            let mut components = suffix.components();
+            let vendor = components.next().map(|component| component.as_os_str())?;
+            let second = components.next().map(|component| component.as_os_str());
+            match (vendor, second) {
+                // Keep vendor and browser directories as traversal corridors.
+                (vendor, None)
+                    if vendor.eq_ignore_ascii_case("Google")
+                        || vendor.eq_ignore_ascii_case("Chromium") =>
+                {
+                    None
+                }
+                (vendor, Some(browser))
+                    if vendor.eq_ignore_ascii_case("Google")
+                        && browser.eq_ignore_ascii_case("Chrome") =>
+                {
+                    let profile = components.next().map(|component| component.as_os_str());
+                    (directory
+                        && profile.is_some_and(browser_component_allowed)
+                        && components.next().is_none())
+                    .then_some("cache")
+                }
+                (vendor, Some(profile)) if vendor.eq_ignore_ascii_case("Chromium") => {
+                    (directory && browser_component_allowed(profile) && components.next().is_none())
+                        .then_some("cache")
+                }
+                (vendor, Some(child))
+                    if vendor.eq_ignore_ascii_case("Google")
+                        && !child.eq_ignore_ascii_case("Chrome") =>
+                {
+                    (directory && browser_component_allowed(child) && components.next().is_none())
+                        .then_some("cache")
+                }
+                (_, None) => Some("cache"),
+                _ => None,
+            }
+        }
         // Log directories are traversal scopes, not cleanup units. A newly
         // written current log must not hide an old rotated log beside it.
         LibraryArea::Logs if !directory => Some(if suffix.starts_with("DiagnosticReports") {
@@ -215,6 +307,31 @@ pub(crate) fn library_event_scope(root: &Root, path: &Path) -> Option<PathBuf> {
         LibraryArea::Xcode => HOME_LIBRARY_ROUTES[2],
         LibraryArea::Logs => unreachable!(),
     };
+    if area == LibraryArea::Caches {
+        let mut components = suffix.components();
+        let Some(first) = components.next().map(|component| component.as_os_str()) else {
+            return Some(path.to_path_buf());
+        };
+        if first.eq_ignore_ascii_case("Google") || first.eq_ignore_ascii_case("Chromium") {
+            let second = components.next().map(|component| component.as_os_str());
+            let third = if first.eq_ignore_ascii_case("Google")
+                && second.is_some_and(|name| name.eq_ignore_ascii_case("Chrome"))
+            {
+                components.next().map(|component| component.as_os_str())
+            } else {
+                None
+            };
+            let mut path = root.path.join(route);
+            path.push(first);
+            if let Some(second) = second {
+                path.push(second);
+            }
+            if let Some(third) = third {
+                path.push(third);
+            }
+            return Some(path);
+        }
+    }
     Some(root.path.join(route).join(suffix.components().next()?))
 }
 
@@ -365,6 +482,117 @@ mod tests {
             assert_eq!(
                 library_event_scope(&root, &root.path.join(relative)),
                 Some(root.path.join(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn browser_cache_profiles_are_units_and_vendor_paths_are_corridors() {
+        let root = home();
+        for (relative, directory, expected) in [
+            ("Library/Caches/Google", true, None),
+            ("Library/Caches/Google/Chrome", true, None),
+            ("Library/Caches/Google/Chrome/Default", true, Some("cache")),
+            (
+                "Library/Caches/Google/Chrome/Profile 1",
+                true,
+                Some("cache"),
+            ),
+            ("Library/Caches/Google/Drive", true, Some("cache")),
+            ("Library/Caches/Chromium", true, None),
+            ("Library/Caches/Chromium/Default", true, Some("cache")),
+            ("Library/Caches/Google/Chrome/Default", false, None),
+            ("Library/Caches/Google/Chrome/Default/data", true, None),
+            ("Library/Caches/Google/.hidden", true, None),
+            ("Library/Caches/Chromium/.hidden", true, None),
+            ("Library/Caches/GoogleChrome", true, Some("cache")),
+        ] {
+            assert_eq!(
+                library_candidate(&root, &root.path.join(relative), directory),
+                expected,
+                "{relative}"
+            );
+        }
+        assert_eq!(
+            browser_cache_owner(&root.path.join("Library/Caches/Google/Chrome/Default")),
+            Some("com.google.Chrome")
+        );
+        assert!(library_route_allowed(
+            &root,
+            &root
+                .path
+                .join("Library/Caches/Google/Chrome/Default/Cache/data")
+        ));
+        assert!(library_route_allowed(
+            &root,
+            &root.path.join("Library/Caches/Google/Drive/deep/item")
+        ));
+        assert!(!library_route_allowed(
+            &root,
+            &root.path.join("Library/Caches/Google/Chrome/.hidden/deep")
+        ));
+        assert!(!library_route_allowed(
+            &root,
+            &root.path.join("Library/Caches/Chromium/.hidden/deep")
+        ));
+        assert_eq!(
+            browser_cache_owner(&root.path.join("library/caches/google/chrome/Default")),
+            Some("com.google.Chrome")
+        );
+        assert_eq!(
+            browser_cache_owner(&root.path.join("Library/Caches/Chromium/Default")),
+            Some("org.chromium.Chromium")
+        );
+        assert_eq!(
+            browser_cache_owner(&root.path.join("Library/Caches/Google/Chrome/.hidden")),
+            None
+        );
+        assert_eq!(
+            browser_cache_owner(&root.path.join("Library/Caches/GoogleChrome/Default")),
+            None
+        );
+        let mut other = root.clone();
+        other.kind = "projects".into();
+        assert_eq!(
+            browser_cache_owner(&other.path.join("Library/Caches/Google/Chrome/Default")),
+            Some("com.google.Chrome"),
+            "owner matching is lexical; the caller's Home route validation supplies authorization"
+        );
+        assert!(
+            library_candidate(
+                &other,
+                &other.path.join("Library/Caches/Google/Chrome/Default"),
+                true
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn browser_cache_events_keep_profiles_and_unknown_google_products_separate() {
+        let root = home();
+        for (relative, expected) in [
+            (
+                "Library/Caches/Google/Chrome",
+                "Library/Caches/Google/Chrome",
+            ),
+            (
+                "Library/Caches/Google/Chrome/Default/Cache/data",
+                "Library/Caches/Google/Chrome/Default",
+            ),
+            (
+                "Library/Caches/Google/Drive/deep/item",
+                "Library/Caches/Google/Drive",
+            ),
+            (
+                "Library/Caches/Chromium/Profile 1/Cache/data",
+                "Library/Caches/Chromium/Profile 1",
+            ),
+        ] {
+            assert_eq!(
+                library_event_scope(&root, &root.path.join(relative)),
+                Some(root.path.join(expected)),
+                "{relative}"
             );
         }
     }
