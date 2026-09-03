@@ -292,22 +292,41 @@ fn workspace_pattern(pattern: &str, relative: &str) -> Result<bool> {
     if pattern.is_empty() || pattern.starts_with('/') || pattern.len() > 1024 {
         return Err("Workspace paths are not supported local relative patterns".into());
     }
-    let parts: Vec<_> = pattern.split('/').collect();
-    if parts.len() > 64
-        || parts.iter().any(|part| {
-            part.is_empty()
-                || *part == "."
-                || *part == ".."
-                || (part.contains("**") && *part != "**")
-                || part.contains(['?', '[', ']', '{', '}', '!', '\\', '(', ')', '|'])
-        })
-    {
-        return Err("Complex workspace patterns need manual inspection".into());
+    // Validate the entire pattern before a mismatch can return false. Invalid
+    // later components must still withhold ownership evidence.
+    let mut part_count = 0;
+    let mut recursive = false;
+    for part in pattern.split('/') {
+        part_count += 1;
+        if part_count > 64
+            || part.is_empty()
+            || part == "."
+            || part == ".."
+            || (part.contains("**") && part != "**")
+            || part.contains(['?', '[', ']', '{', '}', '!', '\\', '(', ')', '|'])
+        {
+            return Err("Complex workspace patterns need manual inspection".into());
+        }
+        recursive |= part == "**";
+    }
+    // Ordinary workspace patterns consume exactly one path component per
+    // pattern component. No dynamic-programming arrays or heap storage are
+    // needed for the common packages/* and literal-member cases.
+    if !recursive {
+        let mut patterns = pattern.split('/');
+        let mut components = relative.split('/');
+        loop {
+            match (patterns.next(), components.next()) {
+                (None, None) => return Ok(true),
+                (Some(part), Some(component)) if workspace_component(part, component) => {}
+                _ => return Ok(false),
+            }
+        }
     }
     let components: Vec<_> = relative.split('/').collect();
     let mut previous = vec![false; components.len() + 1];
     previous[0] = true;
-    for part in parts {
+    for part in pattern.split('/') {
         let mut current = vec![false; previous.len()];
         if part == "**" {
             current[0] = previous[0];
