@@ -17,6 +17,9 @@ use std::time::Instant;
 pub(crate) const MAX_DEPTH: usize = 128;
 const MAX_LINK_IDENTITIES: usize = 131_072;
 const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
+const SCOPE_OBSERVATION_ATTEMPTS: usize = 3;
+pub(crate) const SCOPE_CONTENTS_CHANGED: &str =
+    "Files changed during refresh; this scope will be checked again.";
 
 /// Only callers that have recognized an owned developer artifact may opt in to
 /// generated application bundles and non-followed symbolic-link leaves. Folder
@@ -500,6 +503,22 @@ fn confirm_scope_observation(
     cancel: &AtomicBool,
     checkpoint: &impl Fn(),
 ) -> Result<Option<EntryMeta>> {
+    confirm_scope_observation_attempt(
+        root, names, parents, expected, ancestor, cancel, checkpoint, 0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_scope_observation_attempt(
+    root: &Root,
+    names: &[&OsStr],
+    parents: &[ScopeParent],
+    expected: Option<&EntryMeta>,
+    ancestor: Option<(usize, &EntryMeta)>,
+    cancel: &AtomicBool,
+    checkpoint: &impl Fn(),
+    attempt: usize,
+) -> Result<Option<EntryMeta>> {
     debug_assert_eq!(names.len().max(1), parents.len());
     // A cleanup pause may invalidate any earlier observation. Pause before this
     // bounded proof, never after some of its final ancestry checks have passed.
@@ -545,9 +564,25 @@ fn confirm_scope_observation(
         // Before any traversal or publication, one disappearance can establish
         // a new observation. Re-capture after removal; the None proof cannot
         // enter this branch again or turn a substitution/error into absence.
-        return confirm_scope_observation(root, names, parents, None, ancestor, cancel, checkpoint);
+        return confirm_scope_observation_attempt(
+            root, names, parents, None, ancestor, cancel, checkpoint, attempt,
+        );
     }
-    if current.as_ref() != expected {
+    // Initial discovery can observe an actively written file or directory. Its
+    // contents changing is distinct from replacing the path or changing its
+    // protection. Bound witnesses to their original full metadata as before.
+    // A non-root leaf is not pinned: its parent's original timestamps must
+    // still match, so unlink/recreate cannot disguise inode reuse as a write.
+    // The root itself is pinned by parents[0].
+    let contents_changed = ancestor.is_none()
+        && (names.is_empty()
+            || observed.last().unwrap().identity == parents.last().unwrap().identity)
+        && matches!((expected, current.as_ref()), (Some(before), Some(after))
+            if before != after
+                && same_object(&before.identity, &after.identity)
+                && before.uid == after.uid
+                && before.flags == after.flags);
+    if current.as_ref() != expected && !contents_changed {
         return Err("The refresh scope moved or changed during metadata verification".into());
     }
     #[cfg(test)]
@@ -566,6 +601,24 @@ fn confirm_scope_observation(
         if &current != before {
             return Err("A refresh scope parent changed during metadata verification".into());
         }
+    }
+    if contents_changed {
+        // Finish the strict grant/ancestry proof before either retrying or
+        // reporting churn. Keep every parent pinned and require the leaf to
+        // remain the same object across attempts; never retry a substitution.
+        if attempt + 1 < SCOPE_OBSERVATION_ATTEMPTS {
+            return confirm_scope_observation_attempt(
+                root,
+                names,
+                parents,
+                current.as_ref(),
+                ancestor,
+                cancel,
+                checkpoint,
+                attempt + 1,
+            );
+        }
+        return Err(SCOPE_CONTENTS_CHANGED.into());
     }
     Ok(expected.cloned())
 }
@@ -3361,6 +3414,158 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(std::fs::read(&preserved).unwrap(), b"unchanged sibling");
+    }
+
+    #[test]
+    fn scope_metadata_retries_brief_contents_changes_without_enumeration() {
+        for directory in [false, true] {
+            let (_temp, base) = fixture();
+            let requested = base.join("active");
+            if directory {
+                std::fs::create_dir(&requested).unwrap();
+            } else {
+                std::fs::write(&requested, b"active file").unwrap();
+            }
+            let preserved = base.join("preserved");
+            std::fs::write(&preserved, b"unchanged sibling").unwrap();
+            let root = authorize(&base, "projects").unwrap();
+            let changed = requested.clone();
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = attempts.clone();
+            let result = with_directory_read_observer(
+                |_| panic!("Retrying scope metadata must not enumerate directories"),
+                || {
+                    with_scope_metadata_observer(
+                        move |phase| {
+                            if phase == ScopeMetadataPhase::PresentObserved {
+                                observed.set(observed.get() + 1);
+                                if observed.get() == 1 {
+                                    File::open(&changed)
+                                        .unwrap()
+                                        .set_times(std::fs::FileTimes::new().set_modified(
+                                            std::time::UNIX_EPOCH
+                                                + std::time::Duration::from_secs(1),
+                                        ))
+                                        .unwrap();
+                                }
+                            }
+                        },
+                        || scope_metadata(&root, &requested, &AtomicBool::new(false)),
+                    )
+                },
+            );
+            assert_eq!(attempts.get(), 2);
+            assert_eq!(result.unwrap(), Some(metadata(&requested).unwrap()));
+            assert_eq!(std::fs::read(preserved).unwrap(), b"unchanged sibling");
+        }
+    }
+
+    #[test]
+    fn scope_metadata_bounds_continuous_contents_changes() {
+        let (_temp, base) = fixture();
+        let requested = base.join("active");
+        std::fs::create_dir(&requested).unwrap();
+        let root = authorize(&base, "projects").unwrap();
+        let changed = requested.clone();
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = attempts.clone();
+        let result = with_scope_metadata_observer(
+            move |phase| {
+                if phase == ScopeMetadataPhase::PresentObserved {
+                    observed.set(observed.get() + 1);
+                    File::open(&changed)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(
+                            std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(observed.get() as u64),
+                        ))
+                        .unwrap();
+                }
+            },
+            || scope_metadata(&root, &requested, &AtomicBool::new(false)),
+        );
+        assert_eq!(result.unwrap_err(), SCOPE_CONTENTS_CHANGED);
+        assert_eq!(attempts.get(), SCOPE_OBSERVATION_ATTEMPTS);
+    }
+
+    #[test]
+    fn scope_metadata_does_not_retry_contents_changes_with_namespace_changes() {
+        let (_temp, base) = fixture();
+        let requested = base.join("requested");
+        std::fs::write(&requested, b"original contents").unwrap();
+        let root = authorize(&base, "projects").unwrap();
+        let changed = requested.clone();
+        let parent = base.clone();
+        let result = with_scope_metadata_observer(
+            move |phase| {
+                if phase == ScopeMetadataPhase::PresentObserved {
+                    std::fs::write(&changed, b"updated contents").unwrap();
+                    // Even unchanged dev/inode on the leaf is not sufficient
+                    // when its containing namespace changed after opening.
+                    std::fs::write(parent.join("new-sibling"), b"preserved sibling").unwrap();
+                    File::open(&parent)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                        ))
+                        .unwrap();
+                }
+            },
+            || scope_metadata(&root, &requested, &AtomicBool::new(false)),
+        );
+        assert_ne!(result.unwrap_err(), SCOPE_CONTENTS_CHANGED);
+        assert_eq!(std::fs::read(requested).unwrap(), b"updated contents");
+        assert_eq!(
+            std::fs::read(base.join("new-sibling")).unwrap(),
+            b"preserved sibling"
+        );
+    }
+
+    #[test]
+    fn scope_metadata_retry_keeps_replacement_and_cancellation_strict() {
+        for cancel_retry in [false, true] {
+            let (_temp, base) = fixture();
+            let requested = base.join("requested");
+            std::fs::write(&requested, b"original contents").unwrap();
+            let original = base.join("original");
+            let root = authorize(&base, "projects").unwrap();
+            let changed = requested.clone();
+            let destination = original.clone();
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let requested_cancel = cancel.clone();
+            let mut attempts = 0;
+            let result = with_scope_metadata_observer(
+                move |phase| {
+                    if phase == ScopeMetadataPhase::PresentObserved {
+                        attempts += 1;
+                        if attempts == 1 {
+                            std::fs::write(&changed, b"original contents, updated").unwrap();
+                        } else if cancel_retry {
+                            requested_cancel.store(true, Ordering::Release);
+                        } else {
+                            std::fs::rename(&changed, &destination).unwrap();
+                            std::fs::write(&changed, b"replacement contents").unwrap();
+                        }
+                    }
+                },
+                || scope_metadata(&root, &requested, &cancel),
+            );
+            let error = result.unwrap_err();
+            assert_ne!(error, SCOPE_CONTENTS_CHANGED);
+            if cancel_retry {
+                assert_eq!(error, "Cancelled");
+                assert_eq!(
+                    std::fs::read(requested).unwrap(),
+                    b"original contents, updated"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(original).unwrap(),
+                    b"original contents, updated"
+                );
+                assert_eq!(std::fs::read(requested).unwrap(), b"replacement contents");
+            }
+        }
     }
 
     #[test]
