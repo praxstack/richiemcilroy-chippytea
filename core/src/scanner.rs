@@ -2606,6 +2606,33 @@ impl ScanSession {
                     drop(opened_directory);
                     stats.elapsed_ms = started.elapsed().as_millis() as u64;
                     let mut candidate = make_candidate(root, &entry.path, &entry.meta, &found);
+                    // The no-follow discovery metadata is enough to reject a
+                    // regular file. Reopening a recent or sparsely allocated
+                    // download/log cannot make this observation actionable.
+                    // Keep a diagnostic without a measurement fingerprint;
+                    // eligible files and exhaustive inventory still take the
+                    // complete measurement and revalidation path below.
+                    if mode == ScanMode::Suggestions
+                        && !is_dir
+                        && let Some(reason) = suggestion_reason(
+                            &found,
+                            &Measurement {
+                                allocated_bytes: entry.meta.allocated,
+                                latest_modified_ns: entry.meta.identity.modified_ns,
+                                ..Measurement::default()
+                            },
+                            clock_ns(),
+                        )
+                    {
+                        stats.skipped += 1;
+                        candidate.provisional = false;
+                        candidate.explanation.push_str(&format!(
+                            " Not suggested: {reason}. Discovery metadata already excludes this file; it was not reopened or measured."
+                        ));
+                        candidate.blocked_reason = Some(reason);
+                        publisher.queue(candidate, &stats, false);
+                        continue;
+                    }
                     // Diagnostics stay in the index, but only completed useful rows
                     // become public suggestions. Cheap evidence, age and activity
                     // checks can exclude the whole artifact before opening it.
@@ -6737,6 +6764,79 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn ineligible_regular_files_stay_diagnostic_until_a_fresh_complete_measurement() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap().join("Home");
+        let logs = home.join("Library/Logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let recent = logs.join("recent.log");
+        let sparse = logs.join("sparse.log");
+        let block = [42; 64 * 1024];
+        let mut file = std::fs::File::create(&recent).unwrap();
+        for _ in 0..160 {
+            file.write_all(&block).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::File::create(&sparse)
+            .unwrap()
+            .set_len(11_000_000)
+            .unwrap();
+        age_tree(&sparse, 31);
+        let root = safety::authorize(&home, "home").unwrap();
+        let cancel = AtomicBool::new(false);
+        let (stats, rows) = candidates(&root);
+        assert!(stats.complete && stats.errors == 0);
+        assert_eq!((stats.candidates, rows.len()), (0, 2));
+        for row in &rows {
+            assert!(!row.provisional && !row.suggestion_eligible && !row.eligible_permanent);
+            assert!(row.fingerprint.is_empty());
+            assert!(row.explanation.contains("not reopened or measured"));
+            assert!(revalidate(&root, row, &cancel).is_err());
+        }
+        assert!(rows.iter().any(|row| {
+            row.path == recent
+                && row
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("quiet days")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.path == sparse
+                && row
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("allocated locally")
+        }));
+
+        let (coverage, measured) = candidates_in_mode(&root, ScanMode::MetadataCoverage);
+        assert!(coverage.complete && coverage.errors == 0);
+        for row in measured {
+            let metadata = safety::metadata(&row.path).unwrap();
+            assert_eq!(row.logical_bytes, metadata.identity.size);
+            assert_eq!(row.allocated_bytes, metadata.allocated);
+            assert_eq!(row.file_count, 1);
+            assert!(!row.suggestion_eligible);
+        }
+
+        // An earlier negative observation never prevents a later scan from
+        // producing a fully measured, revalidatable review once it qualifies.
+        age_tree(&recent, 31);
+        let (stats, rows) = candidates(&root);
+        assert!(stats.complete && stats.errors == 0);
+        assert_eq!(stats.candidates, 1);
+        let row = rows.iter().find(|row| row.path == recent).unwrap();
+        assert!(row.suggestion_eligible && !row.eligible_permanent);
+        assert_eq!(row.file_count, 1);
+        assert!(row.allocated_bytes >= recommendations::minimum_bytes("log"));
+        assert!(!row.fingerprint.is_empty());
+        revalidate(&root, row, &cancel).unwrap();
+        assert_eq!(std::fs::metadata(&sparse).unwrap().len(), 11_000_000);
     }
 
     #[test]
