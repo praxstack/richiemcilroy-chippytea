@@ -111,6 +111,11 @@ struct IsolatedScope {
     started: Instant,
 }
 
+enum ScopeAdmissionStop {
+    ContentsChanged,
+    Failed(String),
+}
+
 fn candidate_in_read_scope(root: &Root, resolved: &Path, cargo_lock: bool, path: &Path) -> bool {
     if path == root.path
         || !path.starts_with(&root.path)
@@ -2107,7 +2112,7 @@ impl Engine {
         // A helper failure is durable work, not a reason to immediately launch
         // the same failing helper again. Finish already-admitted siblings, then
         // leave the failed scope queued for an explicit Resume/retry.
-        let mut stop_admissions = None::<String>;
+        let mut stop_admissions = None::<ScopeAdmissionStop>;
         let mut active = Vec::<IsolatedScope>::with_capacity(scan_worker::ACTIVE_SCANS);
         loop {
             if self.cancel.load(Ordering::Acquire) {
@@ -2141,7 +2146,7 @@ impl Engine {
                     Ok(Some(scope)) => active.push(scope),
                     Ok(None) => break,
                     Err(error) => {
-                        stop_admissions = Some(error);
+                        stop_admissions = Some(ScopeAdmissionStop::Failed(error));
                         break;
                     }
                 }
@@ -2163,18 +2168,32 @@ impl Engine {
                         // any refresh marker in the same durable boundary.
                         store.recover_discovery()?;
                         drop(store);
-                        runtime.error = Some(reason.clone());
                         runtime.stats.complete = false;
-                        runtime.stats.errors = runtime.stats.errors.max(1);
-                        runtime.stats.message = format!(
-                            "Scan stopped after a read-only helper failure; pending scopes remain for Resume: {reason}"
-                        );
+                        let hard_failure = matches!(&reason, ScopeAdmissionStop::Failed(_));
+                        runtime.stats.message = match reason {
+                            ScopeAdmissionStop::ContentsChanged => {
+                                safety::SCOPE_CONTENTS_CHANGED.into()
+                            }
+                            ScopeAdmissionStop::Failed(reason) => {
+                                runtime.error = Some(reason.clone());
+                                runtime.stats.errors = runtime.stats.errors.max(1);
+                                format!(
+                                    "Scan stopped after a read-only helper failure; pending scopes remain for Resume: {reason}"
+                                )
+                            }
+                        };
                         let message = runtime.stats.message.clone();
-                        if let Some(scan) = &mut runtime.foreground {
+                        if let Some(scan) = runtime
+                            .foreground
+                            .as_mut()
+                            .filter(|scan| hard_failure || scan.snapshot.active)
+                        {
                             scan.stop(false, &message);
                             // All already-admitted siblings may have reached
                             // their terminal state before the failure barrier;
-                            // preserve the actionable Resume message anyway.
+                            // preserve a hard failure's actionable Resume
+                            // message, but not harmless background churn, in
+                            // that completed foreground result.
                             scan.snapshot.stats.message = message;
                         }
                         self.persist_foreground_summary(&mut runtime);
@@ -2312,10 +2331,27 @@ impl Engine {
                     if let Some(error) = error {
                         scope.handle.abort();
                         scope.stats.complete = false;
-                        scope.stats.errors = scope.stats.errors.saturating_add(1);
-                        scope.stats.message = format!("Could not complete this scope: {error}");
-                        runtime.error = Some(error.clone());
-                        stop_admissions.get_or_insert(error);
+                        let foreground = runtime.foreground.as_ref().is_some_and(|scan| {
+                            scope
+                                .ticket
+                                .as_ref()
+                                .is_some_and(|ticket| scan.accepts(ticket))
+                        });
+                        if error == safety::SCOPE_CONTENTS_CHANGED && !foreground {
+                            // A verified same-object change before traversal
+                            // needs another observation, not a warning banner.
+                            // Keep its durable scope and stop this worker so a
+                            // busy folder cannot cause an immediate retry loop.
+                            scope.stats.message = error;
+                            stop_admissions.get_or_insert(ScopeAdmissionStop::ContentsChanged);
+                        } else {
+                            scope.stats.errors = scope.stats.errors.saturating_add(1);
+                            scope.stats.message = format!("Could not complete this scope: {error}");
+                            runtime.error = Some(error.clone());
+                            if !matches!(stop_admissions, Some(ScopeAdmissionStop::Failed(_))) {
+                                stop_admissions = Some(ScopeAdmissionStop::Failed(error));
+                            }
+                        }
                     }
                     let mut store = self.store.lock().map_err(store::err)?;
                     // Failed helper/protocol output must remain replayable. A
@@ -3884,10 +3920,22 @@ mod controller_tests {
     static ISOLATED_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
     fn isolated_helper_fixture(directory: &Path, roots: &[Root], stalled: usize) -> PathBuf {
+        let scopes = roots
+            .iter()
+            .map(|root| (root, root.path.as_path()))
+            .collect::<Vec<_>>();
+        isolated_scoped_helper_fixture(directory, &scopes, stalled)
+    }
+
+    fn isolated_scoped_helper_fixture(
+        directory: &Path,
+        scopes: &[(&Root, &Path)],
+        stalled: usize,
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let helper = directory.join("disposable-scan-helper");
         let mut script = String::from("#!/bin/sh\ninput=$(/bin/cat)\ncase \"$input\" in\n");
-        for (index, root) in roots.iter().enumerate() {
+        for (index, (root, scope)) in scopes.iter().enumerate() {
             // Root IDs are generated identifiers, not user-supplied shell text.
             assert!(
                 root.id
@@ -3895,7 +3943,7 @@ mod controller_tests {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             );
             let mut frames = scan_worker::encode_json_frame(&scan_worker::ScanEvent::Resolved {
-                path: root.path.clone(),
+                path: scope.to_path_buf(),
                 cargo_lock: false,
             })
             .unwrap();
@@ -3929,11 +3977,13 @@ mod controller_tests {
 
     fn isolated_failure_helper_fixture(
         directory: &Path,
-        failed: &Root,
-        sibling: &Root,
+        failed: (&Root, &Path, &str),
+        sibling: (&Root, &Path, Option<&str>),
         malformed: bool,
     ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        let (failed, failed_path, failed_reason) = failed;
+        let (sibling, sibling_path, sibling_reason) = sibling;
         let helper = directory.join(if malformed {
             "disposable-malformed-scan-helper"
         } else {
@@ -3947,7 +3997,7 @@ mod controller_tests {
         );
         let mut outputs = Vec::new();
         let mut failed_output = scan_worker::encode_json_frame(&scan_worker::ScanEvent::Resolved {
-            path: failed.path.clone(),
+            path: failed_path.to_path_buf(),
             cargo_lock: false,
         })
         .unwrap();
@@ -3956,7 +4006,7 @@ mod controller_tests {
         } else {
             failed_output.extend(
                 scan_worker::encode_json_frame(&scan_worker::ScanEvent::Failed(
-                    "disposable helper failure".into(),
+                    failed_reason.into(),
                 ))
                 .unwrap(),
             );
@@ -3964,21 +4014,22 @@ mod controller_tests {
         outputs.push((failed, failed_output));
         let mut sibling_output =
             scan_worker::encode_json_frame(&scan_worker::ScanEvent::Resolved {
-                path: sibling.path.clone(),
+                path: sibling_path.to_path_buf(),
                 cargo_lock: false,
             })
             .unwrap();
-        sibling_output.extend(
-            scan_worker::encode_json_frame(&scan_worker::ScanEvent::Finished {
+        let sibling_result = match sibling_reason {
+            Some(reason) => scan_worker::ScanEvent::Failed(reason.into()),
+            None => scan_worker::ScanEvent::Finished {
                 stats: ScanStats {
                     entries: 7,
                     complete: true,
                     ..Default::default()
                 },
                 recent_files: None,
-            })
-            .unwrap(),
-        );
+            },
+        };
+        sibling_output.extend(scan_worker::encode_json_frame(&sibling_result).unwrap());
         outputs.push((sibling, sibling_output));
         let mut cases = String::new();
         for (root, output) in outputs {
@@ -3995,8 +4046,13 @@ mod controller_tests {
             } else {
                 String::new()
             };
+            let launches = directory
+                .join(format!("launches-{}", root.id))
+                .to_str()
+                .unwrap()
+                .replace('\'', "'\\''");
             cases.push_str(&format!(
-                "*'\"id\":\"{}\"'*)\n{wait}printf '{escaped}';;\n",
+                "*'\"id\":\"{}\"'*)\nprintf . >> '{launches}'\n{wait}printf '{escaped}';;\n",
                 root.id
             ));
         }
@@ -4012,10 +4068,18 @@ mod controller_tests {
         let _serial = ISOLATED_FIXTURE_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for malformed in [false, true] {
+        for (malformed, reason) in [
+            (false, "disposable helper failure"),
+            (true, "disposable helper failure"),
+            (false, safety::SCOPE_CONTENTS_CHANGED),
+        ] {
             let (temp, engine, roots) = foreground_fixture(3);
-            let helper =
-                isolated_failure_helper_fixture(temp.path(), &roots[0], &roots[1], malformed);
+            let helper = isolated_failure_helper_fixture(
+                temp.path(),
+                (&roots[0], &roots[0].path, reason),
+                (&roots[1], &roots[1].path, None),
+                malformed,
+            );
             *engine.scan_helper_fixture.lock().unwrap() = Some(helper);
             engine.request(json!({"action":"scan"})).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -4034,6 +4098,9 @@ mod controller_tests {
             fs::write(temp.path().join("release-sibling"), b"release").unwrap();
             wait_for_discovery_idle(&engine);
             let snapshot = engine.snapshot().unwrap();
+            if !malformed {
+                assert_eq!(snapshot.error.as_deref(), Some(reason));
+            }
             let foreground = snapshot.foreground_scan.unwrap();
             assert!(!foreground.active);
             assert!(!snapshot.stats.complete);
@@ -4114,6 +4181,230 @@ mod controller_tests {
                         |row| row.get(0)
                     )
                     .unwrap()
+            );
+        }
+    }
+
+    fn wait_for_scope_requeued_with_active_sibling(engine: &Engine, root: &Root, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let store = engine.store.lock().unwrap();
+            let ready: bool = store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_scopes WHERE root_id=?1 AND path=?2)
+                   AND NOT EXISTS(SELECT 1 FROM active_scopes WHERE root_id=?1)
+                   AND EXISTS(SELECT 1 FROM active_scopes WHERE root_id!=?1)",
+                    rusqlite::params![root.id, path.to_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(store);
+            if ready {
+                return;
+            }
+            assert!(Instant::now() < deadline, "Failed scope was not requeued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn isolated_background_contents_change_defers_without_warning_and_survives_restart() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (temp, engine, roots) = foreground_fixture(3);
+        *engine.scan_helper_fixture.lock().unwrap() =
+            Some(isolated_helper_fixture(temp.path(), &roots, usize::MAX));
+        engine.request(json!({"action":"scan"})).unwrap();
+        wait_for_discovery_idle(&engine);
+        let foreground = serde_json::to_value(engine.snapshot().unwrap().foreground_scan).unwrap();
+        let paths = roots
+            .iter()
+            .map(|root| root.path.join("child"))
+            .collect::<Vec<_>>();
+        let preserved = indexed_fixture_source(&roots[0], "preserved-during-refresh");
+        {
+            let mut store = engine.store.lock().unwrap();
+            store
+                .save_batch(&ScanBatch {
+                    candidates: vec![preserved.clone()],
+                    stats: ScanStats::default(),
+                })
+                .unwrap();
+            for (root, path) in roots.iter().zip(&paths) {
+                store.enqueue_scope(&root.id, path).unwrap();
+            }
+        }
+        *engine.scan_helper_fixture.lock().unwrap() = Some(isolated_failure_helper_fixture(
+            temp.path(),
+            (&roots[0], &paths[0], safety::SCOPE_CONTENTS_CHANGED),
+            (&roots[1], &paths[1], None),
+            false,
+        ));
+        engine.request(json!({"action":"resume"})).unwrap();
+        wait_for_scope_requeued_with_active_sibling(&engine, &roots[0], &paths[0]);
+        assert!(engine.snapshot().unwrap().error.is_none());
+        fs::write(temp.path().join("release-sibling"), b"release").unwrap();
+        wait_for_discovery_idle(&engine);
+        let deferred = engine.snapshot().unwrap();
+        assert!(!deferred.stats.complete);
+        assert_eq!(deferred.stats.errors, 0);
+        assert!(deferred.error.is_none());
+        assert_eq!(
+            serde_json::to_value(deferred.foreground_scan).unwrap(),
+            foreground
+        );
+        assert_eq!(
+            engine.runtime.lock().unwrap().stats.message,
+            safety::SCOPE_CONTENTS_CHANGED
+        );
+        assert_eq!(
+            fs::read(temp.path().join(format!("launches-{}", roots[0].id))).unwrap(),
+            b"."
+        );
+        assert!(
+            !temp
+                .path()
+                .join(format!("launches-{}", roots[2].id))
+                .exists()
+        );
+        {
+            let store = engine.store.lock().unwrap();
+            assert!(!store.has_active_scopes().unwrap());
+            let pending = store
+                .conn
+                .prepare("SELECT path FROM pending_scopes ORDER BY path")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                pending,
+                vec![paths[0].to_str().unwrap(), paths[2].to_str().unwrap()]
+            );
+            assert_eq!(
+                store.candidates_for_root(&roots[0].id).unwrap()[0].id,
+                preserved.id
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<u64, _, _>("SELECT count(*) FROM refreshes", [], |row| row.get(0))
+                    .unwrap(),
+                0
+            );
+        }
+
+        let reopened = reopen_foreground_fixture(&temp, engine);
+        let restored = reopened.snapshot().unwrap();
+        assert!(restored.error.is_none() && !restored.stats.complete);
+        assert_eq!(
+            serde_json::to_value(restored.foreground_scan).unwrap(),
+            foreground
+        );
+        assert!(
+            reopened
+                .store
+                .lock()
+                .unwrap()
+                .candidates_for_root(&roots[0].id)
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.id == preserved.id)
+        );
+        let scopes = roots
+            .iter()
+            .zip(&paths)
+            .map(|(root, path)| (root, path.as_path()))
+            .collect::<Vec<_>>();
+        *reopened.scan_helper_fixture.lock().unwrap() = Some(isolated_scoped_helper_fixture(
+            temp.path(),
+            &scopes,
+            usize::MAX,
+        ));
+        reopened.request(json!({"action":"resume"})).unwrap();
+        wait_for_discovery_idle(&reopened);
+        let resumed = reopened.snapshot().unwrap();
+        assert!(resumed.error.is_none());
+        assert_eq!(resumed.stats.errors, 0);
+        assert_eq!(
+            serde_json::to_value(resumed.foreground_scan).unwrap(),
+            foreground
+        );
+        {
+            let store = reopened.store.lock().unwrap();
+            assert!(!store.has_pending_scopes().unwrap() && !store.has_active_scopes().unwrap());
+            assert!(store.candidates_for_root(&roots[0].id).unwrap().is_empty());
+            // A successful scoped replay must not claim it repaired all of a
+            // root that was already incomplete when that replay began.
+            assert!(store.incomplete(&roots[0].id).unwrap());
+        }
+        assert!(!resumed.stats.complete);
+        *reopened.scan_helper_fixture.lock().unwrap() =
+            Some(isolated_helper_fixture(temp.path(), &roots, usize::MAX));
+        reopened.request(json!({"action":"scan"})).unwrap();
+        wait_for_discovery_idle(&reopened);
+        let completed = reopened.snapshot().unwrap();
+        assert!(completed.stats.complete && completed.error.is_none());
+        assert_eq!(completed.stats.errors, 0);
+        assert!(completed.history.is_empty() && completed.wallet.credited_bytes == 0);
+        for path in paths {
+            assert_eq!(
+                fs::read(path.join("preserve.txt")).unwrap(),
+                b"disposable source"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_background_contents_change_never_hides_a_hard_sibling_failure() {
+        let _serial = ISOLATED_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let hard = "The refresh scope moved or changed during metadata verification";
+        for transient_first in [true, false] {
+            let (temp, engine, roots) = foreground_fixture(2);
+            let paths = roots
+                .iter()
+                .map(|root| root.path.join("child"))
+                .collect::<Vec<_>>();
+            for (root, path) in roots.iter().zip(&paths) {
+                engine
+                    .store
+                    .lock()
+                    .unwrap()
+                    .enqueue_scope(&root.id, path)
+                    .unwrap();
+            }
+            let (first, second) = if transient_first {
+                (safety::SCOPE_CONTENTS_CHANGED, hard)
+            } else {
+                (hard, safety::SCOPE_CONTENTS_CHANGED)
+            };
+            *engine.scan_helper_fixture.lock().unwrap() = Some(isolated_failure_helper_fixture(
+                temp.path(),
+                (&roots[0], &paths[0], first),
+                (&roots[1], &paths[1], Some(second)),
+                false,
+            ));
+            engine.request(json!({"action":"resume"})).unwrap();
+            wait_for_scope_requeued_with_active_sibling(&engine, &roots[0], &paths[0]);
+            fs::write(temp.path().join("release-sibling"), b"release").unwrap();
+            wait_for_discovery_idle(&engine);
+            let snapshot = engine.snapshot().unwrap();
+            assert_eq!(snapshot.error.as_deref(), Some(hard));
+            assert!(!snapshot.stats.complete && snapshot.stats.errors > 0);
+            let store = engine.store.lock().unwrap();
+            assert!(!store.has_active_scopes().unwrap());
+            assert_eq!(
+                store
+                    .conn
+                    .query_row::<u64, _, _>("SELECT count(*) FROM pending_scopes", [], |row| row
+                        .get(0))
+                    .unwrap(),
+                2
             );
         }
     }
