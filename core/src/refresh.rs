@@ -223,8 +223,13 @@ pub(crate) fn event_scope_with_kind(
     if safety::excluded_home_media(root, path) {
         return Ok(None);
     }
+    if let Some(scope) = recommendations::home_cache_event_scope(root, path) {
+        return Ok((kind != EventKind::Directory || recursive)
+            .then_some(scope)
+            .filter(|scope| safety::check_scope_policy(root, scope).is_ok()));
+    }
     if recommendations::library_corridor(root, path) {
-        // Structural events for these corridors expand only into the three
+        // Structural events for these corridors expand only into the fixed
         // fixed cleanup routes, never an unrestricted Library walk.
         return Ok((kind != EventKind::Directory || recursive).then(|| path.to_path_buf()));
     }
@@ -396,6 +401,9 @@ pub(crate) fn resolve_scope(root: &Root, path: &Path, indexed: Option<PathBuf>) 
     if let Some(scope) = recommendations::library_event_scope(root, path) {
         return Ok(scope);
     }
+    if let Some(scope) = recommendations::home_cache_event_scope(root, path) {
+        return Ok(scope);
+    }
     normalize_scope(root, indexed.as_deref().unwrap_or(path))
 }
 
@@ -411,6 +419,9 @@ pub(crate) fn normalize_scope(root: &Root, path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
     if let Some(scope) = recommendations::library_event_scope(root, path) {
+        return Ok(scope);
+    }
+    if let Some(scope) = recommendations::home_cache_event_scope(root, path) {
         return Ok(scope);
     }
     let selected = path
@@ -776,6 +787,20 @@ mod tests {
             ),
             ("Library/Logs/app/old.log", "Library/Logs/app/old.log"),
             (
+                "Library/Application Support/Slack/Cache/nested/item",
+                "Library/Application Support/Slack/Cache",
+            ),
+            (
+                "Library/Application Support/Slack/Code Cache/.git/index",
+                "Library/Application Support/Slack/Code Cache",
+            ),
+            (".cache/zig/nested/item", ".cache/zig"),
+            (".npm/_logs/old.log", ".npm/_logs/old.log"),
+            (
+                "Documents/project/__pycache__/module.cpython-314.pyc",
+                "Documents/project/__pycache__",
+            ),
+            (
                 "Library/Logs/DiagnosticReports/report.ips",
                 "Library/Logs/DiagnosticReports/report.ips",
             ),
@@ -789,7 +814,8 @@ mod tests {
         }
         for relative in [
             "Library/Application Support/app/state",
-            "Library/Caches/uv/item",
+            "Library/Application Support/Slack/Local Storage/state",
+            "Library/Caches/pnpm/item",
             "Library/Caches/Homebrew/item",
             "Library/Caches/.git/index",
             "Library/Logs/Dropbox/report.log",
@@ -812,6 +838,42 @@ mod tests {
             event_scope_with_kind(&root, &library, EventKind::Directory, true).unwrap(),
             Some(library)
         );
+    }
+
+    #[test]
+    fn devcache_events_keep_exact_units_and_preserve_global_cargo_config_invalidation() {
+        let mut root = root();
+        root.kind = "home".into();
+        for route in recommendations::DEVELOPER_CACHE_ROUTES {
+            let unit = root.path.join(route.path);
+            for suffix in ["payload", "nested/item", ".git/config"] {
+                let path = unit.join(suffix);
+                assert_eq!(
+                    event_scope_with_kind(&root, &path, EventKind::File, false).unwrap(),
+                    Some(unit.clone())
+                );
+                if suffix != ".git/config" {
+                    assert_eq!(normalize_scope(&root, &path).unwrap(), unit);
+                }
+            }
+        }
+        for suffix in [".cargo/config", ".cargo/config.toml"] {
+            assert_eq!(
+                event_scope_with_kind(&root, &root.path.join(suffix), EventKind::File, false)
+                    .unwrap(),
+                Some(root.path.clone())
+            );
+        }
+        for suffix in [
+            "Library/Caches/Homebrew/locks/keep.lock",
+            "Library/org.swift.swiftpm/configuration/settings.json",
+        ] {
+            assert_eq!(
+                event_scope_with_kind(&root, &root.path.join(suffix), EventKind::File, false)
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

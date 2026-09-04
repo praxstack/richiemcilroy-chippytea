@@ -6,20 +6,345 @@ use std::ffi::OsStr;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-pub(crate) const HOME_LIBRARY_ROUTES: [&str; 3] = [
+pub(crate) const SWIFTPM_CACHE_ROUTE: &str = "Library/org.swift.swiftpm/cache";
+pub(crate) const HOME_LIBRARY_ROUTES: [&str; 5] = [
     "Library/Caches",
     "Library/Logs",
     "Library/Developer/Xcode/DerivedData",
+    "Library/Application Support",
+    SWIFTPM_CACHE_ROUTE,
 ];
 
+/// Only these generated leaves may be reviewed inside Application Support.
+/// In particular, browser profiles, offline storage, sessions, databases and
+/// all other siblings remain outside discovery and cleanup authorization.
+const SUPPORT_CACHE_APPS: &[(&str, &str)] = &[
+    ("Slack", "com.tinyspeck.slackmacgap"),
+    ("Claude", "com.anthropic.claudefordesktop"),
+    ("discord", "com.hnc.Discord"),
+    ("Code", "com.microsoft.VSCode"),
+    ("Cursor", "com.todesktop.230313mzl4w4u92"),
+];
+const SUPPORT_CACHE_LEAVES: &[&str] = &[
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+];
+
+/// Generated application caches retain their review-and-Trash policy.
+const HOME_CACHE_ROUTES: &[(&str, &str)] = &[
+    (".cache/opencode", "OpenCode"),
+    (".cache/ghostty", "Ghostty"),
+    (".oh-my-zsh/cache", "Oh My Zsh"),
+];
+const HOME_LOG_ROUTES: &[&str] = &[".npm/_logs", ".config/gcloud/logs", ".azure/logs"];
+
+pub(crate) struct DeveloperCacheRoute {
+    pub path: &'static str,
+    pub title: &'static str,
+    pub owner: &'static str,
+}
+
+/// Exact generated stores under an explicit Home grant. Configuration,
+/// persistent credentials, installed toolchains and runtime versions are excluded.
+/// A matching location still needs full identity, activity, Git, link and
+/// manifest validation before either cleanup operation can be offered.
+pub(crate) const DEVELOPER_CACHE_ROUTES: &[DeveloperCacheRoute] = &[
+    DeveloperCacheRoute {
+        path: ".npm/_cacache",
+        title: "npm package cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".npm/_npx",
+        title: "npx temporary packages",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/node/corepack",
+        title: "Corepack package cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/node/corepack",
+        title: "Corepack package cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".bun/install/cache",
+        title: "Bun package cache",
+        owner: "bun",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/pip",
+        title: "pip download cache",
+        owner: "pip",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/pip",
+        title: "pip download cache",
+        owner: "pip",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/uv",
+        title: "uv package cache",
+        owner: "uv",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/uv",
+        title: "uv package cache",
+        owner: "uv",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/mise",
+        title: "mise download cache",
+        owner: "mise",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/mise",
+        title: "mise download cache",
+        owner: "mise",
+    },
+    DeveloperCacheRoute {
+        path: ".cargo/registry/cache",
+        title: "Cargo crate downloads",
+        owner: "cargo",
+    },
+    DeveloperCacheRoute {
+        path: ".cargo/registry/src",
+        title: "Cargo unpacked crates",
+        owner: "cargo",
+    },
+    DeveloperCacheRoute {
+        path: ".cargo/git/db",
+        title: "Cargo Git downloads",
+        owner: "cargo",
+    },
+    DeveloperCacheRoute {
+        path: ".cargo/git/checkouts",
+        title: "Cargo Git checkouts",
+        owner: "cargo",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/org.swift.swiftpm",
+        title: "SwiftPM package cache",
+        owner: "swiftpm",
+    },
+    DeveloperCacheRoute {
+        path: SWIFTPM_CACHE_ROUTE,
+        title: "SwiftPM package cache",
+        owner: "swiftpm",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/Homebrew/downloads",
+        title: "Homebrew downloads",
+        owner: "homebrew",
+    },
+    DeveloperCacheRoute {
+        path: ".aws/cli/cache",
+        title: "AWS CLI session cache",
+        owner: "aws",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/zig",
+        title: "Zig build cache",
+        owner: "zig",
+    },
+    DeveloperCacheRoute {
+        path: "Library/Caches/zig",
+        title: "Zig build cache",
+        owner: "zig",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/ruff",
+        title: "Ruff cache",
+        owner: "ruff",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/mypy",
+        title: "MyPy cache",
+        owner: "mypy",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/typescript",
+        title: "TypeScript cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/eslint",
+        title: "ESLint cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".cache/prettier",
+        title: "Prettier cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".expo/native-modules-cache",
+        title: "Expo native modules cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".expo/versions-cache",
+        title: "Expo versions cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".expo/schema-cache",
+        title: "Expo schema cache",
+        owner: "node",
+    },
+    DeveloperCacheRoute {
+        path: ".expo/template-cache",
+        title: "Expo templates cache",
+        owner: "node",
+    },
+];
+
+pub(crate) fn developer_cache_route(
+    root: &Root,
+    path: &Path,
+) -> Option<&'static DeveloperCacheRoute> {
+    if root.kind != "home" {
+        return None;
+    }
+    let relative = path.strip_prefix(&root.path).ok()?;
+    DEVELOPER_CACHE_ROUTES
+        .iter()
+        .find(|route| relative == Path::new(route.path))
+}
+
+pub(crate) fn developer_cache_route_allowed(root: &Root, path: &Path) -> bool {
+    root.kind == "home"
+        && path.strip_prefix(&root.path).is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && DEVELOPER_CACHE_ROUTES.iter().any(|route| {
+                    relative.starts_with(route.path) || Path::new(route.path).starts_with(relative)
+                })
+        })
+}
+
+pub(crate) fn developer_cache_event_scope(root: &Root, path: &Path) -> Option<PathBuf> {
+    if root.kind != "home" {
+        return None;
+    }
+    let relative = path.strip_prefix(&root.path).ok()?;
+    DEVELOPER_CACHE_ROUTES.iter().find_map(|route| {
+        relative
+            .starts_with(route.path)
+            .then(|| root.path.join(route.path))
+    })
+}
+
+fn support_cache_unit(suffix: &Path) -> Option<(PathBuf, &'static str)> {
+    let mut components = suffix.components();
+    if let Some(app) = components.next().map(|part| part.as_os_str())
+        && let Some((_, owner)) = SUPPORT_CACHE_APPS
+            .iter()
+            .find(|(known, _)| app == OsStr::new(known))
+        && let Some(leaf) = components.next().map(|part| part.as_os_str())
+        && SUPPORT_CACHE_LEAVES
+            .iter()
+            .any(|known| leaf == OsStr::new(known))
+    {
+        return Some((Path::new(app).join(leaf), owner));
+    }
+    // The updater's download cache is separate from installed versions and
+    // registration state. No other Google application support is admitted.
+    let updater = Path::new("Google/GoogleUpdater/crx_cache");
+    suffix
+        .starts_with(updater)
+        .then(|| (updater.to_path_buf(), "com.google.GoogleUpdater"))
+}
+
+fn support_route_allowed(suffix: &Path) -> bool {
+    suffix.as_os_str().is_empty()
+        || SUPPORT_CACHE_APPS
+            .iter()
+            .any(|(app, _)| suffix == Path::new(app))
+        || matches!(suffix.to_str(), Some("Google" | "Google/GoogleUpdater"))
+        || support_cache_unit(suffix).is_some()
+}
+
+pub(crate) fn home_cache_candidate(
+    root: &Root,
+    path: &Path,
+    directory: bool,
+) -> Option<&'static str> {
+    if root.kind != "home" {
+        return None;
+    }
+    if directory && developer_cache_route(root, path).is_some() {
+        return Some("devcache");
+    }
+    let relative = path.strip_prefix(&root.path).ok()?;
+    if directory
+        && HOME_CACHE_ROUTES
+            .iter()
+            .any(|(route, _)| relative == Path::new(route))
+    {
+        Some("cache")
+    } else if !directory && home_log_scope(root, path) {
+        Some("log")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn home_log_scope(root: &Root, path: &Path) -> bool {
+    root.kind == "home"
+        && path.strip_prefix(&root.path).is_ok_and(|relative| {
+            HOME_LOG_ROUTES
+                .iter()
+                .any(|route| relative.starts_with(route))
+        })
+}
+
+pub(crate) fn home_cache_event_scope(root: &Root, path: &Path) -> Option<PathBuf> {
+    if root.kind != "home" {
+        return None;
+    }
+    let relative = path.strip_prefix(&root.path).ok()?;
+    if let Some(scope) = developer_cache_event_scope(root, path) {
+        return Some(scope);
+    }
+    HOME_CACHE_ROUTES
+        .iter()
+        .find_map(|(route, _)| relative.starts_with(route).then(|| root.path.join(route)))
+        .or_else(|| home_log_scope(root, path).then(|| path.to_path_buf()))
+}
+
+pub(crate) fn cache_title(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    if let Some((app, _)) = path.parent().and_then(Path::file_name).and_then(|name| {
+        SUPPORT_CACHE_APPS
+            .iter()
+            .find(|(app, _)| name == OsStr::new(app))
+    }) && SUPPORT_CACHE_LEAVES.contains(&name.as_ref())
+    {
+        return Some(format!("{app} {name}"));
+    }
+    HOME_CACHE_ROUTES
+        .iter()
+        .find_map(|(route, title)| path.ends_with(route).then(|| format!("{title} cache")))
+        .or_else(|| {
+            path.ends_with("Google/GoogleUpdater/crx_cache")
+                .then(|| "GoogleUpdater download cache".into())
+        })
+}
+
 pub(crate) fn permanent_kind(kind: &str) -> bool {
-    matches!(kind, "cargo" | "node" | "venv" | "webcache")
+    matches!(kind, "cargo" | "node" | "venv" | "webcache" | "devcache")
 }
 
 pub(crate) fn review_project_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "swiftpm" | "dotnet" | "gradle" | "dart" | "flutter" | "zig"
+        "swiftpm" | "dotnet" | "gradle" | "dart" | "flutter" | "zig" | "pythoncache"
     )
 }
 
@@ -37,11 +362,11 @@ pub(crate) fn checks_activity(kind: &str) -> bool {
 
 pub(crate) fn minimum_bytes(kind: &str) -> u64 {
     match kind {
-        "cache" | "archive" => 50_000_000,
-        "log" => 10_000_000,
-        "crashreport" => 1_000_000,
+        "cache" => 1_000_000,
+        "archive" => 50_000_000,
+        "log" | "crashreport" | "pythoncache" | "devcache" => 4_096,
         "installer" => 20_000_000,
-        "xcode" => 250_000_000,
+        "xcode" => 1_000_000,
         "largefile" => 500_000_000,
         "cargo" | "node" | "venv" | "webcache" | "download" => 100_000_000,
         kind if review_project_kind(kind) => 100_000_000,
@@ -49,17 +374,30 @@ pub(crate) fn minimum_bytes(kind: &str) -> u64 {
     }
 }
 
+pub(crate) fn minimum_size_label(kind: &str) -> String {
+    let bytes = minimum_bytes(kind);
+    if bytes >= 1_000_000 {
+        format!("{} MB", bytes / 1_000_000)
+    } else {
+        format!("{} KB", bytes / 1_024)
+    }
+}
+
 pub(crate) fn quiet_days(kind: &str) -> i64 {
     match kind {
+        "devcache" => 0,
         "cargo" | "node" | "venv" | "webcache" => 7,
+        "cache" => 1,
+        "log" | "crashreport" | "xcode" => 7,
         kind if review_project_kind(kind) => 7,
-        "installer" | "xcode" => 14,
+        "installer" => 14,
         "largefile" => 90,
         _ => 30,
     }
 }
 
-const KINDS: [&str; 18] = [
+const KINDS: [&str; 20] = [
+    "devcache",
     "cache",
     "log",
     "crashreport",
@@ -78,6 +416,7 @@ const KINDS: [&str; 18] = [
     "dart",
     "flutter",
     "zig",
+    "pythoncache",
 ];
 
 /// These SQL expressions are built once per query/index, from the same policy
@@ -100,7 +439,7 @@ pub(crate) fn priority_sql(column: &str) -> String {
     format!(
         "CASE json_extract({column},'$.kind') \
         WHEN 'log' THEN 0 WHEN 'crashreport' THEN 0 \
-        WHEN 'cache' THEN 1 WHEN 'webcache' THEN 1 WHEN 'dart' THEN 1 \
+        WHEN 'cache' THEN 1 WHEN 'devcache' THEN 1 WHEN 'webcache' THEN 1 WHEN 'dart' THEN 1 WHEN 'pythoncache' THEN 1 \
         WHEN 'cargo' THEN 2 WHEN 'xcode' THEN 2 WHEN 'zig' THEN 2 \
         WHEN 'dotnet' THEN 2 WHEN 'flutter' THEN 2 WHEN 'gradle' THEN 2 \
         WHEN 'swiftpm' THEN 3 WHEN 'node' THEN 3 WHEN 'venv' THEN 3 \
@@ -114,6 +453,7 @@ pub(crate) enum LibraryArea {
     Caches,
     Logs,
     Xcode,
+    ApplicationSupport,
 }
 
 /// Only an explicit Home grant opts into these routes. A project containing a
@@ -123,10 +463,12 @@ pub(crate) fn library_area<'a>(root: &Root, path: &'a Path) -> Option<(LibraryAr
         return None;
     }
     let relative = path.strip_prefix(&root.path).ok()?;
-    for (route, area) in HOME_LIBRARY_ROUTES.into_iter().zip([
+    // The fifth start is an exact candidate, not an open-ended Library area.
+    for (route, area) in HOME_LIBRARY_ROUTES.into_iter().take(4).zip([
         LibraryArea::Caches,
         LibraryArea::Logs,
         LibraryArea::Xcode,
+        LibraryArea::ApplicationSupport,
     ]) {
         if let Ok(suffix) = relative.strip_prefix(route) {
             return Some((area, suffix));
@@ -140,14 +482,25 @@ pub(crate) fn library_corridor(root: &Root, path: &Path) -> bool {
         && path.strip_prefix(&root.path).is_ok_and(|relative| {
             matches!(
                 relative.to_str(),
-                Some("Library" | "Library/Developer" | "Library/Developer/Xcode")
+                Some(
+                    "Library"
+                        | "Library/Developer"
+                        | "Library/Developer/Xcode"
+                        | "Library/org.swift.swiftpm"
+                )
             )
         })
 }
 
-/// Package caches need their manager's own preview/prune protocol. Do not
-/// reinterpret a familiar manager's opaque store as an ordinary app cache.
+/// Unrecognized manager stores never fall through to the app-cache adapter.
+/// Only the exact developer-cache table can admit a generated manager route.
 pub(crate) fn managed_cache(name: &OsStr) -> bool {
+    // The Library name filter has no Root, but it is used only after the
+    // caller enters an authorized Library/Caches lane. Admit table corridors;
+    // library_route_allowed still rejects every unsupported child below them.
+    if developer_library_cache_name(name) {
+        return false;
+    }
     let Some(name) = name.to_str() else {
         return true;
     };
@@ -168,18 +521,48 @@ pub(crate) fn managed_cache(name: &OsStr) -> bool {
     .any(|known| name.eq_ignore_ascii_case(known))
 }
 
+fn developer_library_cache_name(name: &OsStr) -> bool {
+    DEVELOPER_CACHE_ROUTES.iter().any(|route| {
+        Path::new(route.path)
+            .strip_prefix("Library/Caches")
+            .is_ok_and(|suffix| {
+                suffix
+                    .components()
+                    .next()
+                    .is_some_and(|part| part.as_os_str() == name)
+            })
+    })
+}
+
 pub(crate) fn library_route_allowed(root: &Root, path: &Path) -> bool {
     if library_corridor(root, path) {
         return true;
     }
+    if root.kind == "home"
+        && path
+            .strip_prefix(&root.path)
+            .is_ok_and(|relative| relative.starts_with("Library"))
+        && developer_cache_route_allowed(root, path)
+    {
+        return true;
+    }
     library_area(root, path).is_some_and(|(area, suffix)| {
+        if area == LibraryArea::ApplicationSupport {
+            return support_route_allowed(suffix);
+        }
         if area != LibraryArea::Caches {
+            return true;
+        }
+        if developer_cache_route_allowed(root, path) {
             return true;
         }
         let mut components = suffix.components();
         let Some(first) = components.next().map(|component| component.as_os_str()) else {
             return true;
         };
+        if developer_library_cache_name(first) {
+            return false;
+        }
         if managed_cache(first) {
             return false;
         }
@@ -218,11 +601,18 @@ fn path_ends_with_ascii_case(path: &Path, suffix: &[&str]) -> bool {
     })
 }
 
-/// Return the bundle identifier for a recognized browser profile cache. The
-/// caller must have already validated this as a Home Library/Caches location;
-/// the suffix match here only prevents an unrelated cache from being treated
-/// as browser-owned activity.
+/// Return the owner of an exact browser profile or known Application Support
+/// cache leaf. The caller must already have validated its Home cache location;
+/// lexical recognition never authorizes an arbitrary path or sibling data.
 pub(crate) fn browser_cache_owner(location: &Path) -> Option<&'static str> {
+    for ancestor in location.ancestors() {
+        if path_ends_with_ascii_case(ancestor, &["Library", "Application Support"]) {
+            let suffix = location.strip_prefix(ancestor).ok()?;
+            return support_cache_unit(suffix)
+                .filter(|(unit, _)| suffix == unit)
+                .map(|(_, owner)| owner);
+        }
+    }
     let profile = location.file_name()?;
     if !browser_component_allowed(profile) {
         return None;
@@ -238,6 +628,12 @@ pub(crate) fn browser_cache_owner(location: &Path) -> Option<&'static str> {
 }
 
 pub(crate) fn library_candidate(root: &Root, path: &Path, directory: bool) -> Option<&'static str> {
+    if developer_cache_route(root, path).is_some() {
+        return directory.then_some("devcache");
+    }
+    if developer_cache_route_allowed(root, path) {
+        return None;
+    }
     let (area, suffix) = library_area(root, path)?;
     if suffix.as_os_str().is_empty() || !library_route_allowed(root, path) {
         return None;
@@ -288,6 +684,9 @@ pub(crate) fn library_candidate(root: &Root, path: &Path, directory: bool) -> Op
             "log"
         }),
         LibraryArea::Xcode if directory && suffix.components().count() == 1 => Some("xcode"),
+        LibraryArea::ApplicationSupport if directory => support_cache_unit(suffix)
+            .filter(|(unit, _)| suffix == unit)
+            .map(|_| "cache"),
         _ => None,
     }
 }
@@ -295,6 +694,9 @@ pub(crate) fn library_candidate(root: &Root, path: &Path, directory: bool) -> Op
 /// Changes inside a cache/build unit invalidate that exact unit. Logs stay
 /// file-scoped, so a logging app cannot continually rescan all user logs.
 pub(crate) fn library_event_scope(root: &Root, path: &Path) -> Option<PathBuf> {
+    if let Some(scope) = developer_cache_event_scope(root, path) {
+        return Some(scope);
+    }
     let (area, suffix) = library_area(root, path)?;
     if !library_route_allowed(root, path) {
         return None;
@@ -302,10 +704,23 @@ pub(crate) fn library_event_scope(root: &Root, path: &Path) -> Option<PathBuf> {
     if area == LibraryArea::Logs || suffix.as_os_str().is_empty() {
         return Some(path.to_path_buf());
     }
+    if developer_cache_route_allowed(root, path) {
+        return Some(path.to_path_buf());
+    }
+    if area == LibraryArea::ApplicationSupport {
+        return Some(
+            root.path.join(HOME_LIBRARY_ROUTES[3]).join(
+                support_cache_unit(suffix)
+                    .map(|(unit, _)| unit)
+                    .unwrap_or_else(|| suffix.to_path_buf()),
+            ),
+        );
+    }
     let route = match area {
         LibraryArea::Caches => HOME_LIBRARY_ROUTES[0],
         LibraryArea::Xcode => HOME_LIBRARY_ROUTES[2],
         LibraryArea::Logs => unreachable!(),
+        LibraryArea::ApplicationSupport => unreachable!(),
     };
     if area == LibraryArea::Caches {
         let mut components = suffix.components();
@@ -450,7 +865,7 @@ mod tests {
             "Library/Developer/CoreSimulator",
             "Projects/Library/Caches/app",
             "Library/Caches-old/app",
-            "Library/Caches/uv/item",
+            "Library/Caches/pnpm/item",
             "Library/Caches/Homebrew/item",
         ] {
             assert!(
@@ -463,6 +878,186 @@ mod tests {
             &root,
             &root.path.join("Library/Caches/app")
         ));
+    }
+
+    #[test]
+    fn support_and_hidden_cache_routes_are_exact_generated_leaves() {
+        let mut root = home();
+        for relative in [
+            "Library/Application Support/Slack/Cache",
+            "Library/Application Support/Slack/Code Cache",
+            "Library/Application Support/Claude/GPUCache",
+            "Library/Application Support/Code/DawnGraphiteCache",
+            "Library/Application Support/Google/GoogleUpdater/crx_cache",
+        ] {
+            let path = root.path.join(relative);
+            assert!(library_route_allowed(&root, &path));
+            assert_eq!(library_candidate(&root, &path, true), Some("cache"));
+            assert_eq!(library_candidate(&root, &path, false), None);
+            assert_eq!(
+                library_event_scope(&root, &path.join("nested/payload")),
+                Some(path)
+            );
+        }
+        for relative in [
+            "Library/Application Support/Slack/Local Storage",
+            "Library/Application Support/Slack/Service Worker/CacheStorage",
+            "Library/Application Support/Slack/Cache-backup",
+            "Library/Application Support/Claude/claude-code",
+            "Library/Application Support/Google/Chrome/Default/Cache",
+            "Library/Application Support/Google/GoogleUpdater/Current",
+            "Library/Application Support/Unknown/Cache",
+        ] {
+            assert!(
+                !library_route_allowed(&root, &root.path.join(relative)),
+                "{relative}"
+            );
+        }
+        for (relative, kind) in [
+            (".cache/zig", "devcache"),
+            (".expo/versions-cache", "devcache"),
+            (".oh-my-zsh/cache", "cache"),
+        ] {
+            let path = root.path.join(relative);
+            assert_eq!(home_cache_candidate(&root, &path, true), Some(kind));
+            assert_eq!(
+                home_cache_candidate(&root, &path.join("nested"), true),
+                None
+            );
+            assert_eq!(
+                home_cache_event_scope(&root, &path.join("payload")),
+                Some(path)
+            );
+        }
+        assert_eq!(
+            home_cache_candidate(&root, &root.path.join(".npm/_logs/old.log"), false),
+            Some("log")
+        );
+        for relative in [
+            ".cache",
+            ".cache/unknown",
+            ".npm/_update-notifier-last-checked",
+            ".cargo/git",
+            ".aws/credentials",
+        ] {
+            assert_eq!(
+                home_cache_candidate(&root, &root.path.join(relative), true),
+                None
+            );
+        }
+        assert_eq!(
+            browser_cache_owner(&root.path.join("Library/Application Support/Slack/Cache")),
+            Some("com.tinyspeck.slackmacgap")
+        );
+        assert_eq!(
+            browser_cache_owner(
+                &root
+                    .path
+                    .join("Library/Application Support/Slack/Local Storage")
+            ),
+            None
+        );
+        root.kind = "folder".into();
+        assert!(!library_route_allowed(
+            &root,
+            &root.path.join("Library/Application Support/Slack/Cache")
+        ));
+        assert_eq!(
+            home_cache_candidate(&root, &root.path.join(".cache/zig"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn generated_data_has_useful_floors_without_changing_personal_or_permanent_policy() {
+        assert_eq!(
+            (minimum_bytes("devcache"), quiet_days("devcache")),
+            (4096, 0)
+        );
+        assert!(
+            permanent_kind("devcache") && checks_git("devcache") && checks_activity("devcache")
+        );
+        assert_eq!(
+            (minimum_bytes("cache"), quiet_days("cache")),
+            (1_000_000, 1)
+        );
+        assert_eq!((minimum_bytes("log"), quiet_days("log")), (4_096, 7));
+        assert_eq!(
+            (minimum_bytes("xcode"), quiet_days("xcode")),
+            (1_000_000, 7)
+        );
+        assert_eq!(minimum_size_label("log"), "4 KB");
+        assert_eq!(minimum_size_label("cache"), "1 MB");
+        assert_eq!(
+            (minimum_bytes("largefile"), quiet_days("largefile")),
+            (500_000_000, 90)
+        );
+        assert_eq!(
+            (minimum_bytes("cargo"), quiet_days("cargo")),
+            (100_000_000, 7)
+        );
+        assert!(!permanent_kind("pythoncache"));
+        assert!(checks_git("pythoncache") && checks_activity("pythoncache"));
+    }
+
+    #[test]
+    fn devcache_routes_require_exact_home_leaves_and_never_cover_adjacent_state() {
+        let root = home();
+        for route in DEVELOPER_CACHE_ROUTES {
+            let path = root.path.join(route.path);
+            assert_eq!(
+                developer_cache_route(&root, &path).unwrap().path,
+                route.path
+            );
+            assert_eq!(home_cache_candidate(&root, &path, true), Some("devcache"));
+            assert_eq!(home_cache_candidate(&root, &path, false), None);
+            assert!(developer_cache_route(&root, &path.join("child")).is_none());
+            assert_eq!(
+                developer_cache_event_scope(&root, &path.join("child/nested")),
+                Some(path.clone())
+            );
+            if route.path.starts_with("Library/") {
+                assert!(library_route_allowed(&root, &path));
+                assert_eq!(library_candidate(&root, &path, true), Some("devcache"));
+            }
+            for kind in ["projects", "folder", "downloads"] {
+                let mut other = root.clone();
+                other.kind = kind.into();
+                assert!(developer_cache_route(&other, &path).is_none());
+                assert!(home_cache_candidate(&other, &path, true).is_none());
+            }
+        }
+        for path in [
+            ".cargo",
+            ".cargo/bin",
+            ".cargo/registry",
+            ".npm",
+            ".bun/install",
+            ".rustup/toolchains",
+            ".local/share/mise/installs",
+            ".aws/credentials",
+            ".aws/config",
+            ".expo/state.json",
+            "Library/Caches/Homebrew",
+            "Library/Caches/Homebrew/locks",
+            "Library/Caches/node/other",
+            "Library/org.swift.swiftpm/configuration",
+        ] {
+            assert!(
+                developer_cache_route(&root, &root.path.join(path)).is_none(),
+                "{path}"
+            );
+            assert!(
+                home_cache_candidate(&root, &root.path.join(path), true).is_none(),
+                "{path}"
+            );
+            if path.starts_with("Library/") && !matches!(path, "Library/Caches/Homebrew") {
+                assert!(
+                    !library_route_allowed(&root, &root.path.join(path)),
+                    "{path}"
+                );
+            }
+        }
     }
 
     #[test]

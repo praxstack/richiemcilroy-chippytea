@@ -83,9 +83,10 @@ struct DiskAccessView: View {
             LookRoundSketch()
                 .frame(height: 150).frame(maxWidth: .infinity)
             title("Let chippytea have a look round.", seed: 703)
-            copy("To look through your home folder, macOS asks you to switch on Full Disk Access once. It’s quick: open Settings, drag chippytea in, switch it on.")
+            copy("Give chippytea access once to find cleanup opportunities across your Mac. Open Settings, drag chippytea in, then switch it on.")
             VStack(alignment: .leading, spacing: 6) {
-                dashed("Finds old caches, logs, build files, downloads and large personal files.", seed: 771)
+                dashed("Finds app and developer caches, logs, build files and downloads.", seed: 771)
+                dashed("Shows system and tool-managed storage to review, including locations that need an administrator.", seed: 772)
                 dashed("Leaves photo and music libraries alone.", seed: 773)
                 dashed("Removes nothing without your review.", seed: 775)
             }
@@ -192,7 +193,7 @@ struct DiskAccessView: View {
             Button(starting ? "Starting your scan…" : "It’s switched on — scan my Mac") { model.confirmDiskAccessAndScan() }
                 .buttonStyle(InkButtonStyle(kind: .primary, fullWidth: true, seed: 733))
                 .disabled(working || model.diskAccessPhase != .waiting)
-                .accessibilityHint("Confirms that you enabled Full Disk Access for this app in macOS and completed Quit & Reopen if asked, then starts your home-folder scan.")
+                .accessibilityHint("Confirms that you enabled Full Disk Access for this app in macOS and completed Quit & Reopen if asked, then scans your files and checks known system and developer storage locations.")
         }
     }
 

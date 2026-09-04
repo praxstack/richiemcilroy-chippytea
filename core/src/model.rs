@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 pub const COIN_BYTES: u64 = 100_000_000;
 // Rebuild derived findings for category-specific everyday Mac recommendations.
-pub const RULE_VERSION: u32 = 10;
+pub const RULE_VERSION: u32 = 12;
 pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +22,31 @@ pub struct Root {
     pub path: PathBuf,
     pub kind: String,
     pub identity: Identity,
+}
+
+/// Durable macOS identity used only to renew a grant after device numbering
+/// changes. Live traversal and cleanup still use the current device identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RootAnchor {
+    pub volume_uuid: [u8; 16],
+    pub birth_seconds: i64,
+    pub birth_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RootAccessStatus {
+    Available,
+    ReauthorizationRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RootAccess {
+    pub root_id: String,
+    pub path: PathBuf,
+    pub status: RootAccessStatus,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -50,6 +50,15 @@ struct ScanRoot: Codable, Identifiable, Equatable {
     var name: String { URL(fileURLWithPath: path).lastPathComponent }
 }
 
+struct RootAccessIssue: Decodable, Identifiable, Equatable {
+    let rootId: String
+    let path: String
+    let status: String
+    let message: String?
+    var id: String { rootId }
+    var needsAttention: Bool { status != "available" }
+}
+
 struct Candidate: Codable, Identifiable, Hashable {
     var id: String
     var rootId: String
@@ -73,13 +82,13 @@ struct Candidate: Codable, Identifiable, Hashable {
     var recommended: Bool { suggestionEligible == true && canReviewCleanup }
     var isDeveloper: Bool {
         switch kind {
-        case "node", "cargo", "venv", "webcache", "xcode", "swiftpm", "dotnet", "gradle", "dart", "flutter", "zig": return true
+        case "node", "cargo", "venv", "webcache", "devcache", "pythoncache", "xcode", "swiftpm", "dotnet", "gradle", "dart", "flutter", "zig": return true
         default: return false
         }
     }
     var isCacheOrLog: Bool {
         switch kind {
-        case "cache", "log", "crashreport": return true
+        case "devcache", "cache", "log", "crashreport": return true
         default: return false
         }
     }
@@ -94,13 +103,20 @@ struct Candidate: Codable, Identifiable, Hashable {
         return isDeveloper || isCacheOrLog || isPersonalFile
             ? nil : "This item type is not supported by this version of chippytea."
     }
+    /// Early activity exclusions deliberately skip cache traversal. An unknown
+    /// allocation must not be presented as an empty cache or recoverable space.
+    var measuredAllocatedBytes: UInt64? {
+        if kind == "devcache", blockedReason != nil, fingerprint.isEmpty,
+           fileCount == 0, allocatedBytes == 0 { return nil }
+        return allocatedBytes
+    }
     var canReviewCleanup: Bool { cleanupBlockedReason == nil }
     /// A category is not permission to delete: only the existing verified
     /// developer kinds can opt into permanent cleanup. New kinds fail closed.
     var canDeletePermanently: Bool {
         guard canReviewCleanup, eligiblePermanent else { return false }
         switch kind {
-        case "node", "cargo", "venv", "webcache": return true
+        case "node", "cargo", "venv", "webcache", "devcache": return true
         default: return false
         }
     }
@@ -110,6 +126,8 @@ struct Candidate: Codable, Identifiable, Hashable {
         case "cargo": return "hammer"
         case "venv": return "terminal"
         case "webcache": return "arrow.triangle.2.circlepath"
+        case "devcache": return "arrow.triangle.2.circlepath"
+        case "pythoncache": return "terminal"
         case "cache": return "externaldrive"
         case "log": return "doc.text"
         case "crashreport": return "exclamationmark.bubble"
@@ -129,6 +147,8 @@ struct Candidate: Codable, Identifiable, Hashable {
         case "cargo": return "Build artifacts"
         case "venv": return "Python environment"
         case "webcache": return "Build cache"
+        case "devcache": return "Developer cache"
+        case "pythoncache": return "Python bytecode cache"
         case "cache": return "App cache"
         case "log": return "App log"
         case "crashreport": return "Crash report"
@@ -153,7 +173,8 @@ struct Candidate: Codable, Identifiable, Hashable {
         let name = location.lastPathComponent
         guard !name.isEmpty else { return title }
         switch kind {
-        case "node", "cargo", "venv", "webcache", "swiftpm", "dotnet", "gradle", "dart", "flutter", "zig":
+        case "devcache": return title
+        case "node", "cargo", "venv", "webcache", "pythoncache", "swiftpm", "dotnet", "gradle", "dart", "flutter", "zig":
             let parent = (location.deletingLastPathComponent as NSString).lastPathComponent
             return parent.isEmpty || parent == "/" ? name : "\(parent) / \(name)"
         default:

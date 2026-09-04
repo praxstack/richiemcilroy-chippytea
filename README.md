@@ -10,8 +10,8 @@
 
 <p align="center">
   chippytea is an ultra-performant, native macOS app that clears space on your Mac.
-  Built with SwiftUI and Rust, it helps you find old build folders, project dependencies
-  and installers you may no longer need. Review their estimated sizes, see what removing
+  Built with SwiftUI and Rust, it helps you find app caches, developer tools, old build folders
+  and downloads you may no longer need. Review their estimated sizes, see what removing
   them means, and choose what to keep or remove.<br>
   SwiftUI + Rust · macOS 14+ · Free and open source
 </p>
@@ -35,13 +35,17 @@ chippytea runs locally from your menu bar. No account, no telemetry, no automati
 
 ## How it works
 
-1. **Find cleanup opportunities.** Scan folders you choose, or use the guided home-folder scan for old app caches, logs, Xcode data, build folders, downloads and large personal files.
+1. **Find cleanup opportunities.** Scan folders you choose, or use **Scan my Mac** for app and developer caches, logs, Xcode data, Python bytecode, build folders, downloads and large personal files. It also checks known system and tool-managed storage locations automatically.
 2. **Check before you clean.** Review the files, estimated size, and consequences. Git and activity checks vary by category; personal files and caches without an identified owning app still need your judgment.
-3. **Choose what to remove.** Move files to Trash, or permanently remove eligible build files and dependencies. Review the outcome and any credited space in the cleanup history.
+3. **Choose what to remove.** Move files to Trash, or permanently remove eligible developer caches, build files and dependencies. Review the outcome and any credited space in the cleanup history.
 
 **Check duplicate files** compares already-indexed old/large personal-file suggestions when you ask. It verifies contents, lets you choose one copy to keep and one to review, and rechecks both before moving the selected copy to Trash. This is a bounded check, not a whole-Mac duplicate search; ordinary scans never hash personal-file contents.
 
-Moving files to **Trash does not free storage**. App caches, logs, Xcode DerivedData, downloads and personal files are review/Trash-only; they never earn chips. Permanent cleanup is limited to verified, eligible developer build files and dependencies.
+Moving files to **Trash does not free storage**. App caches, logs, Python bytecode, Xcode DerivedData, downloads and personal files are review/Trash-only; they never earn chips. Verified developer caches, build files and dependencies can be deleted permanently after their ownership, activity and contents are rechecked.
+
+Known npm, npx, Corepack, Bun, pip, uv, mise, Cargo, SwiftPM, Zig, Expo, Homebrew download and AWS CLI caches appear in the same cleanup list, with the same checkboxes and review action. Only recognized cache directories are eligible; active tools, shared files and unrelated configuration stay protected. Blocked caches stay in the list with their reason and cleanup disabled. Installed toolchains, container data and system locations appear alongside cleanup findings with their relevant review steps. Their measured size does not establish how much is removable; some system locations need administrator access.
+
+Use **Settings → Scan locations & access** to add a folder or mounted drive, reconnect an unavailable location, or redo access setup. Saved volume identities handle macOS device-number changes without renewing a valid folder grant. Older grants that are already invalid need one explicit reconnection; Keep choices and cleanup history are preserved.
 
 This is early software that can permanently delete files. Start with a disposable test folder and keep backups. Full Disk Access is optional.
 

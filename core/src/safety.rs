@@ -3,7 +3,7 @@
 //! Paths are display names. Once a traversal starts, directory descriptors anchor
 //! its reads; `openat(O_NOFOLLOW)` and `fstatat(AT_SYMLINK_NOFOLLOW)` never follow a
 //! replaced link. This is a metadata fingerprint, deliberately not a content hash.
-use crate::model::{Identity, Result, Root};
+use crate::model::{Identity, Result, Root, RootAccess, RootAccessStatus, RootAnchor};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
@@ -20,6 +20,8 @@ const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
 const SCOPE_OBSERVATION_ATTEMPTS: usize = 3;
 pub(crate) const SCOPE_CONTENTS_CHANGED: &str =
     "Files changed during refresh; this scope will be checked again.";
+const ROOT_IDENTITY_CHANGED: &str =
+    "Folder access needs to be renewed. Choose this folder again in Settings.";
 
 /// Only callers that have recognized an owned developer artifact may opt in to
 /// generated application bundles and non-followed symbolic-link leaves. Folder
@@ -338,7 +340,7 @@ fn scope_metadata_impl(
     scope_checkpoint(cancel, checkpoint)?;
     let meta = scope_parent_metadata(fd.as_raw_fd(), root.identity.device, cancel)?;
     if !same_object(&root.identity, &meta.identity) {
-        return Err("The authorized folder has been replaced; choose it again".into());
+        return Err(ROOT_IDENTITY_CHANGED.into());
     }
     check_scope_ancestor(ancestor, 0, &meta)?;
     scope_checkpoint(cancel, checkpoint)?;
@@ -903,6 +905,10 @@ pub(crate) fn validate_ancestors(path: &Path) -> Result<()> {
 }
 
 pub fn authorize(path: &Path, kind: &str) -> Result<Root> {
+    authorize_with_anchor(path, kind).map(|(root, _)| root)
+}
+
+pub(crate) fn authorize_with_anchor(path: &Path, kind: &str) -> Result<(Root, Option<RootAnchor>)> {
     let _local_io = LocalOnlyIo::new()?;
     if !matches!(kind, "projects" | "downloads" | "folder" | "home") {
         return Err("Choose a projects, downloads, folder, or home location kind".into());
@@ -924,12 +930,96 @@ pub fn authorize(path: &Path, kind: &str) -> Result<Root> {
     hash.update(canonical.as_os_str().as_bytes());
     hash.update(&meta.identity.device.to_le_bytes());
     hash.update(&meta.identity.inode.to_le_bytes());
-    Ok(Root {
-        id: hash.finalize().to_hex()[..24].to_string(),
-        path: canonical,
-        kind: kind.into(),
-        identity: meta.identity,
-    })
+    // Capture before the last pathname identity check. The descriptor remains
+    // pinned, and no anchor may describe a different directory from the grant.
+    let anchor = root_anchor(fd.as_raw_fd())?;
+    if !same_object(&meta.identity, &identity(&canonical)?) {
+        return Err("The selected folder changed while confirming access".into());
+    }
+    Ok((
+        Root {
+            id: hash.finalize().to_hex()[..24].to_string(),
+            path: canonical,
+            kind: kind.into(),
+            identity: meta.identity,
+        },
+        anchor,
+    ))
+}
+
+fn root_anchor(fd: RawFd) -> Result<Option<RootAnchor>> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut attributes: libc::attrlist = unsafe { std::mem::zeroed() };
+        attributes.bitmapcount = 5;
+        // ATTR_VOL_INFO | ATTR_VOL_UUID, from sys/attr.h. The result is a
+        // packed u32 byte count followed by the volume's 16 UUID bytes.
+        attributes.volattr = 0x8004_0000;
+        let mut bytes = [0u8; 20];
+        let status = unsafe {
+            libc::fgetattrlist(
+                fd,
+                (&mut attributes as *mut libc::attrlist).cast(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        };
+        if status != 0 || u32::from_ne_bytes(bytes[..4].try_into().unwrap()) != 20 {
+            // Some local filesystems do not expose a persistent UUID. They
+            // retain strict session identities and can be renewed explicitly.
+            return Ok(None);
+        }
+        let volume_uuid: [u8; 16] = bytes[4..].try_into().unwrap();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(os_error("Cannot confirm the selected folder's identity"));
+        }
+        if volume_uuid == [0; 16] || stat.st_birthtime <= 0 {
+            return Ok(None);
+        }
+        Ok(Some(RootAnchor {
+            volume_uuid,
+            birth_seconds: stat.st_birthtime,
+            birth_nanoseconds: stat.st_birthtime_nsec,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        Ok(None)
+    }
+}
+
+/// Called only before engine workers/reviews exist. A volume-number change may
+/// renew discovery, never old findings: UUID, inode, birthtime and full mode all
+/// have to match, and the replacement grant is freshly authorized as usual.
+pub(crate) fn rebind_root(root: &Root, anchor: &RootAnchor) -> Result<Option<Root>> {
+    let (current, current_anchor) = authorize_with_anchor(&root.path, &root.kind)?;
+    if current.identity.device == root.identity.device
+        || current.identity.inode != root.identity.inode
+        || current.identity.mode != root.identity.mode
+        || current_anchor.as_ref() != Some(anchor)
+    {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
+pub(crate) fn root_access(root: &Root) -> RootAccess {
+    let (status, message) = match validate_root(root) {
+        Ok(()) => (RootAccessStatus::Available, None),
+        Err(message) if message == ROOT_IDENTITY_CHANGED => {
+            (RootAccessStatus::ReauthorizationRequired, Some(message))
+        }
+        Err(message) => (RootAccessStatus::Unavailable, Some(message)),
+    };
+    RootAccess {
+        root_id: root.id.clone(),
+        path: root.path.clone(),
+        status,
+        message,
+    }
 }
 
 pub fn validate_root(root: &Root) -> Result<()> {
@@ -937,7 +1027,7 @@ pub fn validate_root(root: &Root) -> Result<()> {
     let fd = open_directory(&root.path)?;
     check_local(fd.as_raw_fd())?;
     if !same_object(&root.identity, &stat_fd(fd.as_raw_fd())?.identity) {
-        return Err("The authorized folder has been replaced; choose it again".into());
+        return Err(ROOT_IDENTITY_CHANGED.into());
     }
     validate_ancestors(&root.path)
 }
@@ -4860,11 +4950,13 @@ pub(crate) mod tests {
     #[test]
     fn library_names_exclude_protected_and_managed_entries_before_metadata() {
         let (_temp, base) = fixture();
-        let excluded = [".git", "Library", "Dropbox", "Homebrew", "uv", "pip"];
+        let excluded = [".git", "Library", "Dropbox", "pnpm", "yarn", "cocoapods"];
         for name in excluded {
             std::fs::create_dir(base.join(name)).unwrap();
         }
-        std::fs::create_dir(base.join("com.example.browser")).unwrap();
+        for name in ["Homebrew", "uv", "pip", "com.example.browser"] {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
         std::fs::write(base.join("ordinary.log"), b"fixture").unwrap();
         symlink("ordinary.log", base.join("linked.log")).unwrap();
         for unknown_types in [false, true] {
@@ -4891,14 +4983,20 @@ pub(crate) mod tests {
             selected.sort();
             assert_eq!(
                 selected,
-                [base.join("com.example.browser"), base.join("ordinary.log")]
+                [
+                    base.join("Homebrew"),
+                    base.join("com.example.browser"),
+                    base.join("ordinary.log"),
+                    base.join("pip"),
+                    base.join("uv"),
+                ]
             );
             assert_eq!(skipped, excluded.len() as u64 + 1);
             // Unknown types need a no-follow stat for the ordinary directory
-            // and link too; protected names never need one in either mode.
+            // and admitted cache directories too; protected names never need one.
             assert_eq!(
                 CHILD_METADATA_CALLS.with(std::cell::Cell::get) - before,
-                if unknown_types { 3 } else { 1 }
+                if unknown_types { 6 } else { 1 }
             );
         }
     }
@@ -5193,6 +5291,58 @@ pub(crate) mod tests {
         std::fs::rename(&chosen, base.join("old")).unwrap();
         std::fs::create_dir(&chosen).unwrap();
         assert!(validate_root(&root).is_err());
+    }
+
+    #[test]
+    fn root_contents_churn_does_not_require_reauthorization() {
+        let (_temp, base) = fixture();
+        let root = authorize(&base, "projects").unwrap();
+        std::fs::write(base.join("new-work"), b"preserve").unwrap();
+        validate_root(&root).unwrap();
+        assert!(matches!(
+            root_access(&root).status,
+            RootAccessStatus::Available
+        ));
+        let mut stale = root.clone();
+        stale.identity.device = stale.identity.device.wrapping_add(1);
+        let access = root_access(&stale);
+        assert!(matches!(
+            access.status,
+            RootAccessStatus::ReauthorizationRequired
+        ));
+        assert_eq!(access.root_id, root.id);
+        assert_eq!(access.path, base);
+        assert!(access.message.unwrap().contains("Settings"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remounted_root_requires_uuid_birth_inode_and_mode() {
+        let (_temp, base) = fixture();
+        let (current, anchor) = authorize_with_anchor(&base, "projects").unwrap();
+        let anchor = anchor.expect("The local macOS test volume exposes a durable identity");
+        let mut remounted = current.clone();
+        remounted.identity.device = remounted.identity.device.wrapping_add(1);
+        assert!(validate_root(&remounted).is_err());
+        let renewed = rebind_root(&remounted, &anchor).unwrap().unwrap();
+        assert_eq!(renewed.id, current.id);
+        assert_eq!(renewed.identity.device, current.identity.device);
+        assert!(rebind_root(&current, &anchor).unwrap().is_none());
+        for changed in ["uuid", "birth", "inode", "mode"] {
+            let mut wrong_root = remounted.clone();
+            let mut wrong_anchor = anchor.clone();
+            match changed {
+                "uuid" => wrong_anchor.volume_uuid[0] ^= 1,
+                "birth" => wrong_anchor.birth_nanoseconds ^= 1,
+                "inode" => wrong_root.identity.inode ^= 1,
+                "mode" => wrong_root.identity.mode ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                rebind_root(&wrong_root, &wrong_anchor).unwrap().is_none(),
+                "{changed}"
+            );
+        }
     }
 
     #[test]

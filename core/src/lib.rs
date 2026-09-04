@@ -15,6 +15,7 @@ pub mod safety;
 #[doc(hidden)]
 pub mod scan_worker;
 pub mod scanner;
+mod storage_inventory;
 pub mod store;
 
 use model::*;
@@ -312,6 +313,7 @@ pub struct Engine {
     checking_duplicates: AtomicBool,
     duplicate_cancel: AtomicBool,
     managed_review: Mutex<ManagedReviewState>,
+    storage_inventory: Mutex<()>,
     sql_interrupt: rusqlite::InterruptHandle,
     busy: AtomicBool,
     scanning: AtomicBool,
@@ -357,6 +359,27 @@ impl Engine {
         }
         let mut store = Store::open(path)?;
         store.reconcile()?;
+        // Device numbers may change when macOS remounts an APFS volume. Only
+        // a previously captured durable identity can renew such a grant. This
+        // happens before any worker or review exists and atomically discards
+        // its old findings; missing/replaced/legacy-unverified roots stay closed.
+        for root in store.roots()? {
+            if let Some(anchor) = store.root_anchor(&root.id)? {
+                if let Ok(Some(current)) = safety::rebind_root(&root, &anchor) {
+                    // Renewal is opportunistic. A grant conflict or failed
+                    // transaction must leave the old grant available to the
+                    // Settings repair flow instead of preventing app startup.
+                    let _ = store.reauthorize_root(&current, &root.id, Some(&anchor));
+                }
+            } else if let Ok((current, Some(anchor))) =
+                safety::authorize_with_anchor(&root.path, &root.kind)
+                && safety::same_object(&root.identity, &current.identity)
+            {
+                // Upgrade a still-valid legacy grant without changing its
+                // authority or accepting an already-different device number.
+                store.save_root_anchor(&root.id, &anchor)?;
+            }
+        }
         // The library is exclusively owned and no reviews exist during open.
         // Keep migration work bounded; admission prevents further growth even
         // when a legacy index needs more than one idle maintenance slice.
@@ -385,6 +408,7 @@ impl Engine {
             checking_duplicates: AtomicBool::new(false),
             duplicate_cancel: AtomicBool::new(false),
             managed_review: Mutex::new(ManagedReviewState::default()),
+            storage_inventory: Mutex::new(()),
             sql_interrupt,
             busy: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
@@ -589,11 +613,52 @@ impl Engine {
                 Ok(json!({"ok":true}))
             }
             "prepare_duplicate" => self.prepare_duplicate(&request),
-            "authorize" => {
+            "storage_inventory" => {
+                let _inventory = self
+                    .storage_inventory
+                    .try_lock()
+                    .map_err(|_| "A storage overview is already running.")?;
+                let root = self
+                    .store
+                    .lock()
+                    .map_err(store::err)?
+                    .root(string(&request, "root_id")?)?;
+                if root.kind != "home" {
+                    return Err(
+                        "Set up Scan my Mac before checking system and developer storage.".into(),
+                    );
+                }
+                safety::validate_root(&root)?;
+                // A fixture Home can exercise the exact user routes without
+                // touching real system locations. Callers cannot supply a
+                // second arbitrary path or select their own system routes.
+                let include_system =
+                    std::env::var_os("HOME").is_some_and(|home| Path::new(&home) == root.path);
+                let report = storage_inventory::scan(&root, include_system);
+                safety::validate_root(&root)?;
+                if !self
+                    .store
+                    .lock()
+                    .map_err(store::err)?
+                    .root(&root.id)
+                    .is_ok_and(|current| same_root(&current, &root))
+                {
+                    return Err(
+                        "Scan access changed during the storage overview. Scan again.".into(),
+                    );
+                }
+                serde_json::to_value(report).map_err(store::err)
+            }
+            "root_access" => {
+                let roots = self.store.lock().map_err(store::err)?.roots()?;
+                serde_json::to_value(roots.iter().map(safety::root_access).collect::<Vec<_>>())
+                    .map_err(store::err)
+            }
+            "authorize" | "reauthorize" => {
                 if self.busy.load(Ordering::Acquire) {
                     return Err("Wait for the current operation before adding a folder.".into());
                 }
-                let root = safety::authorize(
+                let (root, anchor) = safety::authorize_with_anchor(
                     Path::new(string(&request, "path")?),
                     string(&request, "kind")?,
                 )?;
@@ -606,13 +671,20 @@ impl Engine {
                 if self.busy.load(Ordering::Acquire) {
                     return Err("Wait for the current operation before adding a folder.".into());
                 }
-                self.store
-                    .lock()
-                    .map_err(store::err)?
-                    .authorize_root(&root, replace_contained)?;
+                let mut reviews = self.reviews.lock().map_err(store::err)?;
+                let mut store = self.store.lock().map_err(store::err)?;
+                if request.get("action").and_then(Value::as_str) == Some("reauthorize") {
+                    store.reauthorize_root(&root, string(&request, "id")?, anchor.as_ref())?;
+                } else {
+                    store.authorize_root_with_anchor(&root, replace_contained, anchor.as_ref())?;
+                }
+                drop(store);
+                reviews.clear();
+                drop(reviews);
                 runtime.recent_files.clear();
                 runtime.foreground = None;
                 runtime.restored_foreground = None;
+                runtime.error = None;
                 self.invalidate_duplicates(None, None);
                 serde_json::to_value(root).map_err(store::err)
             }
@@ -625,10 +697,17 @@ impl Engine {
                 if self.busy.load(Ordering::Acquire) {
                     return Err("Cancel the current operation before removing a folder.".into());
                 }
-                if self.store.lock().map_err(store::err)?.remove_root(id)? {
+                let mut reviews = self.reviews.lock().map_err(store::err)?;
+                let removed = self.store.lock().map_err(store::err)?.remove_root(id)?;
+                if removed {
+                    reviews.clear();
+                }
+                drop(reviews);
+                if removed {
                     runtime.recent_files.clear();
                     runtime.foreground = None;
                     runtime.restored_foreground = None;
+                    runtime.error = None;
                     self.invalidate_duplicates(Some(id), None);
                 }
                 Ok(json!({"ok":true}))
@@ -1035,7 +1114,9 @@ impl Engine {
                         if self.mutation_cancel.load(Ordering::Acquire) {
                             break;
                         }
-                        if s.root(&root.id).is_err()
+                        if !s
+                            .root(&root.id)
+                            .is_ok_and(|current| same_root(&current, &root))
                             || s.kept()?.iter().any(|path| {
                                 candidate.path.starts_with(path)
                                     || Path::new(path).starts_with(&candidate.path)
@@ -5670,6 +5751,241 @@ mod controller_tests {
                 fs::rename(moved, &roots[0].path).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn storage_overview_requires_a_home_grant_and_never_creates_cleanup_state() {
+        let (temp, engine, roots) = foreground_fixture(1);
+        let folder = &roots[0];
+        assert!(
+            engine
+                .request(json!({"action":"storage_inventory","root_id":folder.id}))
+                .is_err()
+        );
+        assert!(
+            engine
+                .request(json!({"action":"storage_inventory","root_id":"missing"}))
+                .is_err()
+        );
+        let home = temp.path().canonicalize().unwrap().join("inventory-home");
+        let toolchain = home.join(".rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc");
+        fs::create_dir_all(toolchain.parent().unwrap()).unwrap();
+        fs::write(&toolchain, b"installed toolchain bytes").unwrap();
+        let cache_paths = [
+            ".npm/_cacache/preserved",
+            ".cargo/registry/cache/preserved",
+            "Library/Caches/Homebrew/downloads/preserved",
+            "Library/org.swift.swiftpm/cache/preserved",
+            "Library/Logs/com.example.app/preserved.log",
+        ];
+        for path in cache_paths {
+            let path = home.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"cached package bytes").unwrap();
+        }
+        let authorized: Root = serde_json::from_value(
+            engine
+                .request(json!({
+                    "action":"authorize", "path":home, "kind":"home"
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let report = engine
+            .request(json!({"action":"storage_inventory","root_id":authorized.id}))
+            .unwrap();
+        assert_eq!(report["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(report["rows"][0]["id"], "rust-toolchains");
+        assert_eq!(report["rows"][0]["cleanup_authority"], "ReviewOnly");
+        assert_eq!(report["examined_entries"], 4);
+        assert!(report["rows"].as_array().unwrap().iter().all(|row| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).starts_with(&home))
+        }));
+        assert!(engine.reviews.lock().unwrap().is_empty());
+        assert!(engine.store.lock().unwrap().history().unwrap().is_empty());
+        assert_eq!(
+            engine
+                .store
+                .lock()
+                .unwrap()
+                .wallet()
+                .unwrap()
+                .credited_bytes,
+            0
+        );
+        assert_eq!(fs::read(toolchain).unwrap(), b"installed toolchain bytes");
+        for path in cache_paths {
+            assert_eq!(fs::read(home.join(path)).unwrap(), b"cached package bytes");
+        }
+    }
+
+    #[test]
+    fn explicit_reauthorization_replaces_an_unavailable_grant_and_clears_reviews() {
+        let (temp, engine, roots) = foreground_fixture(1);
+        let previous = &roots[0];
+        let candidate = indexed_fixture_source(previous, "old");
+        let moved = temp.path().join("preserved-grant");
+        fs::rename(&previous.path, &moved).unwrap();
+        fs::create_dir(&previous.path).unwrap();
+        let access = engine.request(json!({"action":"root_access"})).unwrap();
+        assert_eq!(access[0]["status"], "reauthorization_required");
+        assert_eq!(access[0]["root_id"], previous.id);
+        engine.reviews.lock().unwrap().insert(
+            "old-review".into(),
+            Review {
+                operation: "trash".into(),
+                items: vec![(previous.clone(), candidate)],
+                created: now(),
+                cancel_generation: 0,
+                duplicate_keeper: None,
+                duplicate_created: None,
+            },
+        );
+        assert!(
+            engine
+                .request(
+                    json!({"action":"reauthorize","id":previous.id,"path":moved,"kind":"folder"})
+                )
+                .is_err()
+        );
+        assert_eq!(engine.reviews.lock().unwrap().len(), 1);
+        let renewed: Root = serde_json::from_value(
+            engine
+                .request(json!({
+                    "action":"reauthorize","id":previous.id,"path":previous.path,"kind":"folder"
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(renewed.id, previous.id);
+        assert!(engine.reviews.lock().unwrap().is_empty());
+        let access = engine.request(json!({"action":"root_access"})).unwrap();
+        assert_eq!(access[0]["status"], "available");
+        assert_eq!(
+            fs::read(moved.join("child/preserve.txt")).unwrap(),
+            b"disposable source"
+        );
+        assert_eq!(
+            engine.store.lock().unwrap().take_scope().unwrap(),
+            Some((renewed.id, renewed.path))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_rebinds_only_durably_anchored_device_changes() {
+        for scenario in ["valid", "wrong_anchor", "legacy", "transaction_failure"] {
+            let temp = tempfile::tempdir().unwrap();
+            let folder = temp.path().canonicalize().unwrap().join("chosen");
+            fs::create_dir_all(folder.join("child")).unwrap();
+            fs::write(folder.join("child/preserve.txt"), b"disposable source").unwrap();
+            let database = temp.path().join("db");
+            let (current, anchor) = safety::authorize_with_anchor(&folder, "folder").unwrap();
+            let mut anchor = anchor.unwrap();
+            if scenario == "wrong_anchor" {
+                anchor.volume_uuid[0] ^= 1;
+            }
+            let mut previous = current.clone();
+            previous.id = "before-remount".into();
+            previous.identity.device += 1;
+            {
+                let mut store = Store::open(&database).unwrap();
+                store
+                    .authorize_root_with_anchor(
+                        &previous,
+                        false,
+                        (scenario != "legacy").then_some(&anchor),
+                    )
+                    .unwrap();
+                store
+                    .keep(folder.join("preserved").to_str().unwrap(), true)
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE wallet SET collected=17,remainder=42,credited=1700000042",
+                        [],
+                    )
+                    .unwrap();
+                let candidate = indexed_fixture_source(&previous, "old");
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO candidates VALUES(?1,?2,?3,?4)",
+                        rusqlite::params![
+                            candidate.id,
+                            candidate.root_id,
+                            candidate.path.to_str(),
+                            serde_json::to_string(&candidate).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                if scenario == "transaction_failure" {
+                    store.conn.execute_batch("CREATE TRIGGER fail_rebind BEFORE INSERT ON root_anchors BEGIN SELECT RAISE(ABORT,'disposable anchor failure'); END;").unwrap();
+                }
+            }
+            let engine = Engine::open(&database, None).unwrap();
+            let mut store = engine.store.lock().unwrap();
+            assert_eq!(store.wallet().unwrap().collected_coins, 17);
+            assert_eq!(store.kept().unwrap().len(), 1);
+            if scenario == "valid" {
+                assert!(store.root(&previous.id).is_err());
+                assert_eq!(
+                    store.root(&current.id).unwrap().identity.device,
+                    current.identity.device
+                );
+                assert!(store.candidate("old").is_err());
+                assert_eq!(
+                    store.take_scope().unwrap(),
+                    Some((current.id, current.path))
+                );
+            } else {
+                assert_eq!(
+                    store.root(&previous.id).unwrap().identity.device,
+                    previous.identity.device
+                );
+                assert!(store.root(&current.id).is_err());
+                assert!(store.candidate("old").is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn a_review_cannot_outlive_a_same_id_grant_policy_change() {
+        let (_temp, engine, roots) = foreground_fixture(1);
+        let previous = &roots[0];
+        let mut renewed = previous.clone();
+        renewed.kind = "home".into();
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .reauthorize_root(&renewed, &previous.id, None)
+            .unwrap();
+        // Simulate a prepare request that captured the old grant before the
+        // change but reached review admission afterwards.
+        engine.reviews.lock().unwrap().insert(
+            "late-review".into(),
+            Review {
+                operation: "trash".into(),
+                items: vec![(previous.clone(), indexed_fixture_source(previous, "old"))],
+                created: now(),
+                cancel_generation: 0,
+                duplicate_keeper: None,
+                duplicate_created: None,
+            },
+        );
+        let error = engine
+            .request(json!({"action":"execute","token":"late-review","confirmed":true}))
+            .unwrap_err();
+        assert!(error.contains("Folder access"), "{error}");
+        assert!(engine.store.lock().unwrap().history().unwrap().is_empty());
+        assert_eq!(
+            fs::read(previous.path.join("child/preserve.txt")).unwrap(),
+            b"disposable source"
+        );
     }
 
     #[test]

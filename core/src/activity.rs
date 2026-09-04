@@ -22,15 +22,164 @@ const MAX_BUNDLE_IDENTIFIER_BYTES: usize = 1024;
 const BUNDLE_ACTIVITY_LIMIT: &str =
     "Running application ownership exceeded its bounded activity check; cleanup is withheld";
 
+#[derive(Clone)]
 pub(crate) struct ActivitySnapshot {
     pub(crate) working_directories: Vec<PathBuf>,
     pub(crate) executable_paths: Vec<PathBuf>,
     pub(crate) running_app_bundle_ids: OnceCell<Result<BTreeSet<String>>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ACTIVITY: std::cell::RefCell<Option<Result<ActivitySnapshot>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scoped, thread-local process snapshots keep destructive fixture checks
+/// independent of unrelated host applications. This hook is absent from every
+/// production and integration-test library build.
+#[cfg(test)]
+pub(crate) fn with_test_snapshot<T>(
+    snapshot: Result<ActivitySnapshot>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Result<ActivitySnapshot>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_ACTIVITY.with(|value| *value.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(TEST_ACTIVITY.with(|value| value.replace(Some(snapshot))));
+    run()
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot(
+    executables: &[&str],
+    working_directories: Vec<PathBuf>,
+) -> ActivitySnapshot {
+    ActivitySnapshot {
+        working_directories,
+        executable_paths: executables.iter().map(PathBuf::from).collect(),
+        running_app_bundle_ids: OnceCell::from(Ok(BTreeSet::new())),
+    }
+}
+
+fn python_interpreter(name: &str) -> bool {
+    if matches!(name, "python" | "Python") {
+        return true;
+    }
+    name.strip_prefix("python").is_some_and(|version| {
+        let version = version.strip_suffix('t').unwrap_or(version);
+        !version.is_empty()
+            && version.bytes().any(|byte| byte.is_ascii_digit())
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    })
+}
+
+/// Exact generated-cache routes have known writers even when their process
+/// cwd and installed executable live elsewhere. Do not inspect arguments or
+/// guess which global process currently references an individual cache.
+fn tool_cache_writer(location: &Path, executable: &str) -> bool {
+    if !matches!(
+        executable,
+        "zig" | "ruff" | "mypy" | "opencode" | "ghostty" | "zsh" | "node" | "bun"
+    ) && !python_interpreter(executable)
+    {
+        return false;
+    }
+    if location.ends_with(".cache/zig") {
+        return executable == "zig";
+    }
+    if location.ends_with(".cache/ruff") {
+        return executable == "ruff";
+    }
+    if location.ends_with(".cache/mypy") {
+        return executable == "mypy" || python_interpreter(executable);
+    }
+    if location.ends_with(".cache/opencode") {
+        return matches!(executable, "opencode" | "bun");
+    }
+    if location.ends_with(".cache/ghostty") {
+        return executable == "ghostty";
+    }
+    if location.ends_with(".oh-my-zsh/cache") {
+        return executable == "zsh";
+    }
+    [
+        ".cache/typescript",
+        ".cache/eslint",
+        ".cache/prettier",
+        ".expo/native-modules-cache",
+        ".expo/versions-cache",
+        ".expo/schema-cache",
+        ".expo/template-cache",
+    ]
+    .iter()
+    .any(|route| location.ends_with(route))
+        && matches!(executable, "node" | "bun")
+}
+
+fn developer_cache_writer(location: &Path, executable: &str) -> bool {
+    let Some(route) = crate::recommendations::DEVELOPER_CACHE_ROUTES
+        .iter()
+        .find(|route| location.ends_with(route.path))
+    else {
+        return false;
+    };
+    match route.owner {
+        "node" => matches!(
+            executable,
+            "node" | "nodejs" | "bun" | "npm" | "npx" | "corepack"
+        ),
+        "bun" => matches!(executable, "bun" | "bunx"),
+        "pip" | "uv" => {
+            python_interpreter(executable)
+                || matches!(executable, "pip" | "pip3" | "uv" | "uvx")
+                || executable.strip_prefix("pip").is_some_and(|version| {
+                    !version.is_empty()
+                        && version
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                })
+        }
+        "mise" => executable == "mise",
+        "cargo" => matches!(
+            executable,
+            "cargo" | "rustc" | "rustdoc" | "rust-analyzer" | "clippy-driver" | "git"
+        ),
+        "swiftpm" => matches!(
+            executable,
+            "swift"
+                | "swift-build"
+                | "swift-package"
+                | "swift-test"
+                | "swift-run"
+                | "swift-frontend"
+                | "xcodebuild"
+                | "Xcode"
+                | "XCBBuildService"
+                | "SWBBuildService"
+                | "git"
+        ),
+        "homebrew" => matches!(executable, "brew" | "ruby" | "curl" | "wget"),
+        "aws" => executable == "aws" || python_interpreter(executable),
+        "zig" => executable == "zig",
+        "ruff" => executable == "ruff" || python_interpreter(executable),
+        "mypy" => executable == "mypy" || python_interpreter(executable),
+        _ => true,
+    }
+}
+
 impl ActivitySnapshot {
     #[cfg(target_os = "macos")]
     pub(crate) fn capture(cancel: &AtomicBool) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(snapshot) = TEST_ACTIVITY.with(|value| value.borrow().clone()) {
+            safety::cancelled(cancel)?;
+            return snapshot;
+        }
         // Query only this account. Kernel/system services that cannot be inspected
         // are outside the per-user build activity signal, rather than silently
         // treated as known idle processes.
@@ -130,6 +279,11 @@ impl ActivitySnapshot {
 
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn capture(_cancel: &AtomicBool) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(snapshot) = TEST_ACTIVITY.with(|value| value.borrow().clone()) {
+            safety::cancelled(_cancel)?;
+            return snapshot;
+        }
         Err("Reliable activity checks are supported only by the native macOS engine".into())
     }
 
@@ -161,6 +315,19 @@ impl ActivitySnapshot {
         location: &Path,
         cancel: &AtomicBool,
     ) -> Option<String> {
+        if matches!(kind, "pythoncache" | "cache" | "devcache")
+            && self.executable_paths.iter().any(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| {
+                        (kind == "pythoncache" && python_interpreter(name))
+                            || (kind == "cache" && tool_cache_writer(location, name))
+                            || (kind == "devcache" && developer_cache_writer(location, name))
+                    })
+            })
+        {
+            return Some("A tool that writes this generated cache is running; close it before reviewing cleanup".into());
+        }
         // A global managed host can load project output named only in its
         // arguments or open handles while its cwd is elsewhere. We do not
         // inspect those private arguments or infer which project it uses.
@@ -868,6 +1035,138 @@ mod tests {
                 .blocked_for("cache", Path::new("/cache/terminal-sibling"), &cancel)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn python_and_exact_tool_cache_writers_block_cleanup_outside_their_cwd() {
+        let cancel = AtomicBool::new(false);
+        for executable in ["python", "Python", "python3", "python3.14", "python3.13t"] {
+            let mut active = snapshot(&[]);
+            active.executable_paths = vec![Path::new("/toolchain/bin").join(executable)];
+            assert!(
+                active
+                    .blocked_for(
+                        "pythoncache",
+                        Path::new("/projects/source/__pycache__"),
+                        &cancel
+                    )
+                    .is_some()
+            );
+        }
+        for (executable, cache) in [
+            ("zig", ".cache/zig"),
+            ("ruff", ".cache/ruff"),
+            ("python3.14", ".cache/mypy"),
+            ("opencode", ".cache/opencode"),
+            ("ghostty", ".cache/ghostty"),
+            ("zsh", ".oh-my-zsh/cache"),
+            ("node", ".expo/versions-cache"),
+            ("bun", ".cache/typescript"),
+        ] {
+            let mut active = snapshot(&[]);
+            active.executable_paths = vec![Path::new("/toolchain/bin").join(executable)];
+            assert!(
+                active
+                    .blocked_for("cache", &Path::new("/Users/fixture").join(cache), &cancel)
+                    .is_some(),
+                "{cache}"
+            );
+            assert!(
+                active
+                    .blocked_for(
+                        "cache",
+                        &Path::new("/Users/fixture").join(format!("{cache}-backup")),
+                        &cancel
+                    )
+                    .is_none(),
+                "{cache}"
+            );
+        }
+        assert!(!python_interpreter("python-project"));
+        assert!(!python_interpreter("python.."));
+        assert!(!python_interpreter("python3-malware"));
+        let mut active = snapshot(&[]);
+        active.executable_paths = vec![PathBuf::from("/toolchain/bin/zig")];
+        assert!(
+            active
+                .blocked_for(
+                    "pythoncache",
+                    Path::new("/projects/source/__pycache__"),
+                    &cancel
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn devcache_owner_processes_are_checked_outside_the_cache_and_near_misses_are_not_owners() {
+        let cancel = AtomicBool::new(false);
+        for (route, executable) in [
+            (".npm/_cacache", "node"),
+            (".npm/_npx", "npm"),
+            (".cache/node/corepack", "nodejs"),
+            (".bun/install/cache", "bun"),
+            ("Library/Caches/pip", "python3.14"),
+            (".cache/pip", "pip3.14"),
+            (".cache/uv", "uv"),
+            ("Library/Caches/uv", "python"),
+            (".cache/mise", "mise"),
+            (".cargo/registry/src", "cargo"),
+            (".cargo/git/db", "git"),
+            ("Library/org.swift.swiftpm/cache", "swift-package"),
+            ("Library/Caches/org.swift.swiftpm", "Xcode"),
+            ("Library/Caches/Homebrew/downloads", "ruby"),
+            (".aws/cli/cache", "aws"),
+            (".cache/zig", "zig"),
+            (".cache/ruff", "ruff"),
+            (".cache/mypy", "python3"),
+            (".expo/template-cache", "node"),
+            (".cache/typescript", "bun"),
+        ] {
+            let active = test_snapshot(&[&format!("/unrelated/tools/{executable}")], vec![]);
+            let cache = Path::new("/Users/fixture").join(route);
+            assert!(
+                active.blocked_for("devcache", &cache, &cancel).is_some(),
+                "{route}: {executable}"
+            );
+            let sibling = cache.with_file_name(format!(
+                "{}-backup",
+                cache.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                active.blocked_for("devcache", &sibling, &cancel).is_none(),
+                "{route}: unrelated sibling"
+            );
+        }
+        let cache = Path::new("/Users/fixture/.npm/_cacache");
+        let active = test_snapshot(&[], vec![cache.join("worker-directory")]);
+        assert!(active.blocked_for("devcache", cache, &cancel).is_some());
+    }
+
+    #[test]
+    fn support_cache_owner_is_limited_to_exact_generated_leaf() {
+        let active = snapshot(&["com.tinyspeck.slackmacgap"]);
+        let cancel = AtomicBool::new(false);
+        assert!(
+            active
+                .blocked_for(
+                    "cache",
+                    Path::new("/Users/fixture/Library/Application Support/Slack/Cache"),
+                    &cancel
+                )
+                .is_some()
+        );
+        for location in [
+            "/Users/fixture/Library/Application Support/Slack/Local Storage",
+            "/Users/fixture/Library/Application Support/Slack/Cache-backup",
+            "/Users/fixture/Library/Application Support/Claude/Cache",
+        ] {
+            assert!(
+                active
+                    .blocked_for("cache", Path::new(location), &cancel)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
