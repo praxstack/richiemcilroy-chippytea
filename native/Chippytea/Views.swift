@@ -169,8 +169,14 @@ private struct ErrorBanner: View {
         InkCard(padding: 9, seed: 141, fill: TeaTheme.card, stroke: TeaTheme.rust) {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "exclamationmark.circle").font(TeaFont.body).foregroundStyle(TeaTheme.rust)
-                Text(message).font(TeaFont.caption).foregroundStyle(TeaTheme.ink)
-                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(message).font(TeaFont.caption).foregroundStyle(TeaTheme.ink)
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    if !model.rootAccessIssues.isEmpty {
+                        Button("Fix scan access…") { model.openScanLocations() }
+                            .buttonStyle(InkButtonStyle(kind: .quiet, compact: true, seed: 143))
+                    }
+                }
                 Spacer(minLength: 4)
                 Button { model.errorMessage = nil } label: {
                     Image(systemName: "xmark").font(TeaFont.caption)
@@ -845,7 +851,7 @@ private struct ScanEverywhereCTA: View {
             Button("Scan my Mac") { model.scanMyMac() }
                 .buttonStyle(InkButtonStyle(kind: .primary, fullWidth: true, seed: seed))
                 .disabled(changing)
-                .accessibilityHint("Looks through your home folder for app caches, old logs, build files and large personal files to review. Nothing is selected or removed automatically.")
+                .accessibilityHint("Finds app caches, logs, build files and personal files to review, and checks known system and developer storage locations. Nothing is removed automatically.")
             Menu {
                 Button("Projects Folder…") { model.chooseFolder(kind: "projects") }
                 Button("Downloads Folder…") { model.chooseFolder(kind: "downloads") }
@@ -947,13 +953,12 @@ private struct DiscoveryPage: View {
         if filter == .all && search.isEmpty {
             return "Nothing meets the cleanup checks yet. Small, recently changed or unverified items are left alone."
         }
-        return "No supported candidates match this view. Excluded locations stay untouched."
+        return "No findings match this view. Excluded locations stay untouched."
     }
 
-    private var candidates: [Candidate] {
-        sort.ordered(model.displayedCandidates.filter { item in
-            filter.matches(item) && item.matchesSearch(search)
-        })
+    private var findings: [DiscoveryFinding] {
+        DiscoveryFinding.list(candidates: model.displayedCandidates, inventory: model.storageInventory,
+                              filter: filter, query: search, sort: sort)
     }
 
     private var selectedItems: [Candidate] { model.displayedCandidates.filter { model.selection.contains($0.id) } }
@@ -974,27 +979,34 @@ private struct DiscoveryPage: View {
     }
 
     var body: some View {
-        let visibleCandidates = candidates
+        let visibleFindings = findings
         VStack(spacing: 0) {
             header
             if model.snapshot.roots.isEmpty {
                 FolderEmptyState(model: model)
             } else {
                 ScanStatusLine(model: model).padding(.horizontal, TeaTheme.panelPadding).padding(.bottom, 7)
-                tools(candidateCount: visibleCandidates.count).padding(.horizontal, TeaTheme.panelPadding).padding(.bottom, 8)
+                tools(findingCount: visibleFindings.count).padding(.horizontal, TeaTheme.panelPadding).padding(.bottom, 8)
                 ZStack(alignment: .bottom) {
                     ScrollView {
                         LazyVStack(spacing: 8) {
-                            if visibleCandidates.isEmpty {
+                            if visibleFindings.isEmpty && !model.inventoryLoading {
                                 EmptyState(doodle: .magnifier,
                                            title: emptyTitle,
                                            detail: emptyDetail)
                                     .padding(.top, 14)
                             } else {
-                                ForEach(Array(visibleCandidates.enumerated()), id: \.element.id) { index, item in
-                                    CandidateRow(model: model, candidate: item, seed: 241 + index * 6)
+                                ForEach(Array(visibleFindings.enumerated()), id: \.element.id) { index, finding in
+                                    switch finding {
+                                    case .candidate(let item):
+                                        CandidateRow(model: model, candidate: item, seed: 241 + index * 6)
+                                    case .managed(let row):
+                                        StorageInventoryRowView(row: row, openProvider: model.openStorageProvider)
+                                    }
                                 }
                             }
+                            StorageInventoryStatus(report: model.storageInventory, isLoading: model.inventoryLoading,
+                                errorMessage: model.inventoryError, refresh: model.refreshStorageInventory)
                         }
                         .padding(.horizontal, TeaTheme.panelPadding)
                         .padding(.top, 2)
@@ -1024,6 +1036,9 @@ private struct DiscoveryPage: View {
                           || model.discoveryPresentation.isRequestPending)
                 .help("Refresh authorised folders").accessibilityLabel("Refresh authorised folders")
             Menu {
+                Button("Scan my Mac") { model.scanMyMac() }
+                Button("Scan locations & access…") { model.openScanLocations() }
+                Divider()
                 Button("Choose Projects Folder…") { model.chooseFolder(kind: "projects") }
                 Button("Choose Downloads Folder…") { model.chooseFolder(kind: "downloads") }
                 Button("Choose Another Folder…") { model.chooseFolder(kind: "folder") }
@@ -1039,7 +1054,7 @@ private struct DiscoveryPage: View {
         .padding(.top, 8).padding(.bottom, 8)
     }
 
-    private func tools(candidateCount: Int) -> some View {
+    private func tools(findingCount: Int) -> some View {
         VStack(spacing: 7) {
             HStack(spacing: 6) {
                 ForEach(Array(DiscoveryFilter.allCases.enumerated()), id: \.element) { index, item in
@@ -1059,9 +1074,9 @@ private struct DiscoveryPage: View {
                         .buttonStyle(.plain).foregroundStyle(TeaTheme.inkSoft)
                         .accessibilityLabel("Clear filter")
                 }
-                Text(candidateCount.formatted())
+                Text(findingCount.formatted())
                     .font(TeaFont.caption).monospacedDigit().foregroundStyle(TeaTheme.inkSoft)
-                    .help("\(candidateCount) findings in this view")
+                    .help("\(findingCount) findings in this view")
                 Menu {
                     Picker("Sort", selection: $sort) {
                         ForEach(DiscoverySort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
@@ -1104,8 +1119,8 @@ private struct DiscoveryPage: View {
             .disabled(!model.canEnqueueCleanup || !selectionIsCurrent)
             .accessibilityHint(deletesWithoutConfirmation
                 ? model.hasCleanupWork
-                    ? "Queues the selected developer artifacts for permanent deletion after the current cleanup. No further prompt, Trash or restore."
-                    : "Permanently deletes the selected developer artifacts without another prompt. No Trash or restore."
+                    ? "Queues the selected developer files and caches for permanent deletion after the current cleanup. No further prompt, Trash or restore."
+                    : "Permanently deletes the selected developer files and caches without another prompt. No Trash or restore."
                 : "Shows the exact selected items and consequences before cleanup.")
         }
         .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 10)
@@ -1226,7 +1241,7 @@ private struct CandidateRow: View {
                     .toggleStyle(InkCheckboxStyle(seed: seed &+ 3))
                     .padding(.top, 7)
                     .disabled(!selectionAllowed || atSelectionLimit)
-                    .help(atSelectionLimit ? "Select up to 100 items at a time." : "Select this item for cleanup")
+                    .help(candidate.cleanupBlockedReason ?? (atSelectionLimit ? "Select up to 100 items at a time." : "Select this item for cleanup"))
                     .accessibilityLabel("Select \(candidate.displayName). Path: \(candidate.path)")
                 ArtifactIcon(candidate: candidate, size: 32, seed: seed &+ 5)
                 VStack(alignment: .leading, spacing: 2) {
@@ -1237,8 +1252,12 @@ private struct CandidateRow: View {
                 }
                 Spacer(minLength: 4)
                 VStack(alignment: .trailing, spacing: 0) {
-                    Text(space(candidate.allocatedBytes)).font(TeaFont.bodyNumber).monospacedDigit()
-                    Text("estimated").font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
+                    if let bytes = candidate.measuredAllocatedBytes {
+                        Text(space(bytes)).font(TeaFont.bodyNumber).monospacedDigit()
+                        Text("estimated").font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
+                    } else {
+                        Text("Not measured").font(TeaFont.captionMedium).foregroundStyle(TeaTheme.inkSoft)
+                    }
                 }
                 .fixedSize()
             }
@@ -1441,7 +1460,7 @@ private struct ReviewTakeover: View {
                     Text(permanentEligible ? "Permanent cleanup" : "Move to Trash")
                         .font(TeaFont.bodySemibold)
                     Text(permanentEligible
-                         ? "Deletes these developer files without Trash or restore. Freed space and chips may be zero."
+                         ? "Deletes these developer files and caches without Trash or restore. Freed space and chips may be zero."
                          : "Recoverable from Activity until Trash is emptied. Moving files there does not free space or earn chips.")
                         .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft).fixedSize(horizontal: false, vertical: true)
                 }
@@ -1480,7 +1499,7 @@ private struct ReviewTakeover: View {
                     .accessibilityHint(model.hasCleanupWork
                         ? "Queues the reviewed items to move to Trash after the current cleanup. Earns no chips."
                         : "Moves the reviewed items to Trash. Earns no chips.")
-                Text("App caches, logs, Xcode build data and personal files go to Trash only. Permanent cleanup is limited to eligible developer artifacts.")
+                Text("App caches, logs, Xcode build data and personal files go to Trash only. Verified developer files and caches can be deleted permanently.")
                     .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1760,6 +1779,65 @@ private struct ReceiptRow: View, Equatable {
 
 // MARK: - Settings
 
+private struct ScanLocationsSection: View {
+    @ObservedObject var model: AppModel
+    private var changing: Bool { model.busy || model.hasCleanupWork || model.scanActivityForUI }
+
+    var body: some View {
+        SettingsSection(title: "Scan locations & access", seed: 377) {
+            Text("Scan your Mac’s app and developer caches, downloads and known system storage. Add other folders or mounted drives whenever you need them.")
+                .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Scan my Mac") { model.scanMyMac() }
+                .buttonStyle(InkButtonStyle(kind: .primary, fullWidth: true, compact: true, seed: 387))
+                .disabled(changing)
+            HStack(spacing: 8) {
+                Button("Redo access setup…") { model.beginDiskAccessSetup(restart: true) }
+                    .buttonStyle(InkButtonStyle(kind: .quiet, compact: true, seed: 389))
+                    .disabled(changing)
+                Spacer(minLength: 0)
+                Menu {
+                    Button("Projects Folder…") { model.chooseFolder(kind: "projects") }
+                    Button("Downloads Folder…") { model.chooseFolder(kind: "downloads") }
+                    Button("Folder or Drive…") { model.chooseFolder(kind: "folder") }
+                } label: { Text("Add folder…").font(TeaFont.captionMedium) }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .foregroundStyle(TeaTheme.biro).disabled(changing)
+            }
+            ForEach(model.snapshot.roots) { root in
+                let issue = model.rootAccessIssues.first { $0.rootId == root.id }
+                InkDivider(seed: 379)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: issue == nil ? "folder" : "folder.badge.questionmark")
+                            .font(TeaFont.body).foregroundStyle(issue == nil ? TeaTheme.ink : TeaTheme.rust)
+                        Text(root.kind == "home" ? "Your files" : root.name).font(TeaFont.bodyMedium)
+                        Spacer(minLength: 0)
+                        Button { model.forgetRoot(root) } label: { Image(systemName: "minus.circle").font(TeaFont.body) }
+                            .buttonStyle(.plain).foregroundStyle(TeaTheme.inkSoft)
+                            .accessibilityLabel("Stop scanning \(root.name)")
+                            .help("Remove this scan location; files, Keep choices and history stay saved")
+                            .disabled(changing)
+                    }
+                    Text(root.path).font(TeaFont.mono).foregroundStyle(TeaTheme.inkSoft)
+                        .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                    if let issue {
+                        Text(issue.message ?? "Folder access needs to be restored.")
+                            .font(TeaFont.caption).foregroundStyle(TeaTheme.rust)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Button(issue == nil ? "Choose this folder again…" : "Reconnect folder…") { model.reconnectRoot(root) }
+                        .buttonStyle(InkButtonStyle(kind: .quiet, compact: true, seed: 391))
+                        .disabled(changing)
+                }
+            }
+            Text("Full Disk Access lets macOS share protected files with chippytea. Some system storage still requires an administrator or its own app to manage it.")
+                .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 private struct SettingsPage: View {
     @ObservedObject var model: AppModel
     @ObservedObject var updates: UpdateController
@@ -1767,9 +1845,11 @@ private struct SettingsPage: View {
     private var changing: Bool { model.busy || model.snapshot.cleaning || model.scanActivityForUI }
 
     var body: some View {
+        ScrollViewReader { scroll in
         ScrollView {
             VStack(alignment: .leading, spacing: 11) {
                 ScreenTitle(text: "Settings", seed: 371)
+                ScanLocationsSection(model: model).id("scan-locations")
 
                 SettingsSection(title: "App updates", seed: 372) {
                     HStack(alignment: .firstTextBaseline) {
@@ -1819,64 +1899,16 @@ private struct SettingsPage: View {
                         .disabled(systemReduceMotion)
                     InkDivider(seed: 376)
                     settingToggle(title: "Confirm before deleting",
-                                  detail: "Ask once before permanently deleting developer files.",
+                                  detail: "Ask once before permanently deleting developer files and caches.",
                                   symbol: "trash", binding: $model.confirmBeforeDeleting)
                 }
 
                 SettingsSection(title: "Owner-managed storage", seed: 393) {
                     ManagedStorageView(model: model)
-                }
+                }.id("managed-storage")
 
                 SettingsSection(title: "chippytea’s own footprint", seed: 419) {
                     StorageFootprintView(model: model)
-                }
-
-                SettingsSection(title: "Folders you’ve invited in", seed: 377) {
-                    ForEach(model.snapshot.roots) { root in
-                        HStack(spacing: 10) {
-                            Image(systemName: "folder").font(TeaFont.body).frame(width: 18)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(root.name).font(TeaFont.bodyMedium).lineLimit(1)
-                                Text(root.path).font(TeaFont.mono).foregroundStyle(TeaTheme.inkSoft)
-                                    .lineLimit(1).truncationMode(.middle).help(root.path)
-                            }
-                            Spacer(minLength: 0)
-                            Button { model.forgetRoot(root) } label: { Image(systemName: "minus.circle").font(TeaFont.body) }
-                                .buttonStyle(.plain).foregroundStyle(TeaTheme.inkSoft)
-                                .accessibilityLabel("Stop scanning \(root.name)")
-                                .help("Remove folder authorisation; files stay where they are")
-                                .disabled(changing)
-                        }
-                    }
-                    if !model.snapshot.roots.isEmpty { InkDivider(seed: 379) }
-                    if !model.homeAuthorized {
-                        Button("Scan everywhere") { model.scanMyMac() }
-                            .buttonStyle(InkButtonStyle(kind: .primary, fullWidth: true, compact: true, seed: 387))
-                            .disabled(changing)
-                            .accessibilityHint("Authorises your home folder in one step. Nothing is removed without your review.")
-                    }
-                    HStack(spacing: 8) {
-                        Button("Full Disk Access…") { model.beginDiskAccessSetup() }
-                            .buttonStyle(.plain)
-                            .font(TeaFont.captionMedium).foregroundStyle(TeaTheme.biro)
-                            .accessibilityHint("Guides you through scan access in macOS settings.")
-                            .disabled(changing)
-                        Spacer(minLength: 4)
-                        Menu {
-                            Button("Projects Folder…") { model.chooseFolder(kind: "projects") }
-                            Button("Downloads Folder…") { model.chooseFolder(kind: "downloads") }
-                            Button("Another Folder…") { model.chooseFolder(kind: "folder") }
-                        } label: {
-                            Text("Add folder…").font(TeaFont.captionMedium)
-                        }
-                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                        .foregroundStyle(TeaTheme.biro)
-                        .disabled(changing)
-                        .accessibilityLabel("Add a folder")
-                    }
-                    Text("A guided setup for a more complete scan. Optional.")
-                        .font(TeaFont.caption).foregroundStyle(TeaTheme.inkSoft)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 SettingsSection(title: "Kept for a reason", seed: 381) {
@@ -1913,6 +1945,9 @@ private struct SettingsPage: View {
             .padding(.top, 8).padding(.bottom, 15)
         }
         .scrollIndicators(.hidden)
+        .onAppear { scroll.scrollTo(model.settingsSection, anchor: .top) }
+        .onChange(of: model.settingsSection) { _, section in scroll.scrollTo(section, anchor: .top) }
+        }
     }
 
     private func settingToggle(title: String, detail: String, symbol: String, binding: Binding<Bool>) -> some View {

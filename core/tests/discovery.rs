@@ -973,6 +973,125 @@ fn browser_cache_profiles_are_separate_reviews_and_refresh_independently() {
 }
 
 #[test]
+fn generated_app_and_tool_caches_are_discovered_without_entering_personal_state() {
+    let _engine_guard = support::engine_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let home = base.join("Home");
+    let units = [
+        ("Library/Application Support/Slack/Cache", "cache"),
+        ("Library/Application Support/Claude/Code Cache", "cache"),
+        (
+            "Library/Application Support/Google/GoogleUpdater/crx_cache",
+            "cache",
+        ),
+        (".cache/zig", "devcache"),
+        (".cache/opencode", "cache"),
+        (".expo/versions-cache", "devcache"),
+        (".npm/_cacache", "devcache"),
+        (".cache/uv", "devcache"),
+        ("Library/Caches/pip", "devcache"),
+        ("Library/org.swift.swiftpm/cache", "devcache"),
+        ("Library/Caches/Homebrew/downloads", "devcache"),
+        ("Library/Developer/Xcode/DerivedData/SmallProject", "xcode"),
+    ];
+    for (relative, _) in units {
+        allocated_file(&home.join(relative).join("payload"), 1_100_000);
+    }
+    let log = home.join(".npm/_logs/old.log");
+    allocated_file(&log, 8_192);
+    let protected = [
+        "Library/Application Support/Slack/Local Storage/state",
+        "Library/Application Support/Claude/claude-code/current",
+        "Library/Application Support/Google/Chrome/Default/Bookmarks",
+        "Library/Application Support/Unknown/Cache/payload",
+        ".npm/config/payload",
+        ".cargo/git/payload",
+        ".cache/unknown/payload",
+    ]
+    .map(|relative| home.join(relative));
+    for path in &protected {
+        allocated_file(path, 1_100_000);
+    }
+    age_fixture_tree(&home, 8);
+    // Two-day app caches must surface despite the former 30-day threshold.
+    for (relative, kind) in units {
+        if kind == "cache" {
+            age_fixture_tree(&home.join(relative), 2);
+        }
+    }
+    let db = base.join("db");
+    let engine = Engine::open(&db, None).unwrap();
+    let root: Root = serde_json::from_value(
+        engine
+            .request(json!({
+                "action":"authorize", "path":home, "kind":"home"
+            }))
+            .unwrap(),
+    )
+    .unwrap();
+    engine
+        .request(json!({"action":"scan", "metadata_coverage":true}))
+        .unwrap();
+    let initial = wait(&engine);
+    assert!(initial.stats.complete, "{initial:?}");
+    for (relative, kind) in units {
+        let candidate = indexed_candidate(&db, &home.join(relative));
+        assert_eq!(candidate.kind, kind, "{relative}");
+        assert!(
+            candidate.allocated_bytes >= 1_100_000 && !candidate.provisional,
+            "{candidate:?}"
+        );
+        assert_eq!(
+            candidate.eligible_permanent,
+            kind == "devcache" && candidate.suggestion_eligible
+        );
+        // Installed apps/build tools may be active on this host. Recognition,
+        // complete measurement and the narrow scope are independent of that.
+        if !candidate.suggestion_eligible {
+            assert!(candidate.blocked_reason.is_some(), "{candidate:?}");
+        }
+    }
+    let old_log = indexed_candidate(&db, &log);
+    assert_eq!(old_log.kind, "log");
+    assert!(old_log.suggestion_eligible && !old_log.eligible_permanent);
+    assert!(old_log.explanation.contains("4 KB"));
+    for path in &protected {
+        assert!(
+            initial
+                .candidates
+                .iter()
+                .all(|candidate| !path.starts_with(&candidate.path))
+        );
+        assert_eq!(fs::metadata(path).unwrap().len(), 1_100_000);
+    }
+
+    let cache = home.join(".expo/versions-cache");
+    let before = indexed_candidate(&db, &cache);
+    fs::write(cache.join("new"), b"recent generated data").unwrap();
+    engine
+        .request(json!({
+            "action":"dirty", "root_id":root.id,
+            "events":[{"path":cache.join("new"), "kind":"file", "recursive":false}]
+        }))
+        .unwrap();
+    let updated = wait(&engine);
+    assert!(updated.stats.complete);
+    let after = indexed_candidate(&db, &cache);
+    assert!(after.modified_ns > before.modified_ns);
+    assert_eq!(after.kind, "devcache");
+    assert_eq!(after.eligible_permanent, after.suggestion_eligible);
+    assert!(
+        !after.explanation.contains("quiet days"),
+        "Explicit cache cleanup has no age delay"
+    );
+    if !after.suggestion_eligible {
+        assert!(after.blocked_reason.is_some());
+    }
+    assert_eq!(indexed_candidate(&db, &log), old_log);
+}
+
+#[test]
 fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
     let _engine_guard = support::engine_guard();
     let temp = tempfile::tempdir().unwrap();
@@ -997,7 +1116,7 @@ fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
         "Library/Containers/fixture/Data/Library/Caches/preserve",
         "Library/Developer/Xcode/Archives/preserve",
         "Library/Developer/CoreSimulator/preserve",
-        "Library/Caches/uv/preserve",
+        "Library/Caches/pnpm/preserve",
         "Library/Caches/Homebrew/preserve",
     ]
     .map(|relative| home.join(relative));
@@ -1133,7 +1252,7 @@ fn home_everyday_recommendations_are_scoped_freshness_checked_and_trash_only() {
     let changed_cache = indexed_candidate(&db, &cache);
     assert!(changed_cache.modified_ns > cached_review.modified_ns);
     assert!(
-        changed_cache.explanation.contains("30 quiet days"),
+        changed_cache.explanation.contains("1 quiet days"),
         "Freshness must independently exclude the measured cache: {changed_cache:?}"
     );
     assert_eq!(fs::read(&active_payload).unwrap(), b"new work must remain");

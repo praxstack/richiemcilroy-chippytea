@@ -186,6 +186,11 @@ struct ManagedStorageView: View {
                 ManagedProviderResult(review: review)
             }
         }
+        .onAppear { selectedProvider = model.managedProvider }
+        .onChange(of: model.managedProvider) { _, provider in
+            guard loadingProvider == nil, cancellingProvider == nil else { return }
+            selectedProvider = provider
+        }
         .onChange(of: selectedProvider) { _, _ in
             guard loadingProvider == nil, cancellingProvider == nil else { return }
             review = nil

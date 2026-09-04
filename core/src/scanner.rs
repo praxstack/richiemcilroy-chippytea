@@ -28,7 +28,9 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BATCH: usize = 64;
 const MAX_SHALLOW_FRONTIER: usize = 32;
 const MAX_DEFERRED_ARTIFACTS: usize = 256;
-const MAX_SCAN_LANES: usize = 4;
+const MAX_SCAN_LANES: usize = 6;
+const SUPPORT_DISCOVERY_DESCRIPTORS: usize = 4;
+const SWIFTPM_DISCOVERY_DESCRIPTORS: usize = 1;
 const MAX_MEASUREMENT_JOB_BYTES: usize = 1024 * 1024;
 const MEASUREMENT_QUANTUM_ENTRIES: usize = 256;
 const MEASUREMENT_QUANTUM: Duration = Duration::from_millis(5);
@@ -37,8 +39,7 @@ const MEASUREMENT_QUANTUM: Duration = Duration::from_millis(5);
 // budget plus non-traversal headroom before admitting filesystem work; the
 // native host's descriptor limits are never changed by discovery.
 pub(crate) const MAX_SCHEDULED_DIRECTORY_FDS: usize = MAX_SHALLOW_FRONTIER + 6 * safety::MAX_DEPTH;
-const MAX_ACTIVE_MEASUREMENTS: usize =
-    (MAX_SCHEDULED_DIRECTORY_FDS - MAX_SHALLOW_FRONTIER) / safety::MAX_DEPTH - MAX_SCAN_LANES;
+const MAX_ACTIVE_MEASUREMENTS: usize = 2;
 const DAY_NS: i64 = 86_400_000_000_000;
 const DEVELOPER_QUIET_DAYS: i64 = 7;
 #[cfg(test)]
@@ -1319,8 +1320,8 @@ fn suggestion_reason(found: &Evidence, measured: &Measurement, now_ns: i64) -> O
     let minimum = recommendations::minimum_bytes(found.kind);
     if measured.allocated_bytes < minimum {
         return Some(format!(
-            "Less than {} MB is allocated locally; it does not meet this category's size threshold",
-            minimum / 1_000_000
+            "Less than {} is allocated locally; it does not meet this category's size threshold",
+            recommendations::minimum_size_label(found.kind)
         ));
     }
     let latest = measured.latest_modified_ns.max(found.latest_modified_ns);
@@ -1338,12 +1339,16 @@ fn everyday_evidence(path: &Path, meta: &EntryMeta, kind: &'static str) -> Optio
         return None;
     }
     let (explanation, consequence) = match kind {
+        "devcache" => (
+            "Generated developer cache data in an exact recognized location under your authorized Home folder. The complete contents and current tool activity are checked before cleanup; adjacent configuration, installed runtimes and toolchains are excluded.",
+            "Clearing this cache removes the reviewed files. The owning tool may need to download packages, rebuild cached data, or sign in again. Close its running tools first. Permanent cleanup cannot be undone; Move to Trash remains available.",
+        ),
         "cache" => (
-            "An old cache in your authorized user Library/Caches location. Apps may regenerate or download this data again; it is not personal application-support data.",
+            "Generated cache data in a recognized location under your authorized Home folder. Apps may regenerate or download this data again; personal application data and offline browser storage are excluded.",
             "Close the owning app before moving this cache to Trash. Ownership cannot always be identified; an app can keep writing to files in Trash, and changes there can prevent automatic restore. The app may need network access or start more slowly. Keep offline data you still need. Trash does not free space or earn chips.",
         ),
         "log" => (
-            "An old, sizeable log file in your authorized user Library/Logs location. Logs can help diagnose a problem; age does not establish that they are no longer needed.",
+            "An older log file in a recognized app or developer-tool log location under your authorized Home folder. Logs can help diagnose a problem; age does not establish that they are no longer needed.",
             "Review this log before moving it to Trash. Keep it if you are troubleshooting or need a diagnostic record. Trash does not free space or earn chips.",
         ),
         "crashreport" => (
@@ -1374,10 +1379,14 @@ fn everyday_evidence(path: &Path, meta: &EntryMeta, kind: &'static str) -> Optio
     };
     let name = path.file_name()?.to_string_lossy();
     let title = match kind {
+        "devcache" => recommendations::DEVELOPER_CACHE_ROUTES
+            .iter()
+            .find(|route| path.ends_with(route.path))
+            .map(|route| route.title.to_owned())?,
         "cache" => match recommendations::browser_cache_owner(path) {
             Some("com.google.Chrome") => format!("Chrome {name} cache"),
             Some("org.chromium.Chromium") => format!("Chromium {name} cache"),
-            _ => format!("{name} cache"),
+            _ => recommendations::cache_title(path).unwrap_or_else(|| format!("{name} cache")),
         },
         "xcode" => format!("{name} Xcode data"),
         _ => name.into_owned(),
@@ -1393,6 +1402,115 @@ fn everyday_evidence(path: &Path, meta: &EntryMeta, kind: &'static str) -> Optio
         quiet_days: recommendations::quiet_days(kind),
         activity_root: recommendations::checks_activity(kind).then(|| path.to_path_buf()),
     })
+}
+
+/// A `__pycache__` name alone is not enough: every entry must be a bounded,
+/// independently owned CPython bytecode file with a corresponding regular
+/// source file beside the cache. This never treats source-less bytecode,
+/// arbitrary files, nested directories or links as disposable output.
+fn python_cache_evidence(
+    root: &Root,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<Option<Evidence>> {
+    const MAX_FILES: usize = 256;
+    const MAX_FILE_BYTES: u64 = 1_048_576;
+    const MAX_TOTAL_BYTES: u64 = 8_388_608;
+    let parent = path
+        .parent()
+        .ok_or("Python cache has no source directory")?;
+    let before = safety::scope_metadata(root, path, cancel)?
+        .ok_or("Python cache disappeared before inspection")?;
+    let mut directory = Directory::open(path)?;
+    let mut captures = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut latest_modified_ns = before.identity.modified_ns;
+    while let Some(entry) = directory.next(cancel)? {
+        if captures.len() >= MAX_FILES || !safety::regular_evidence_metadata(&entry.meta) {
+            return Ok(None);
+        }
+        let Some(name) = entry.path.file_name().and_then(OsStr::to_str) else {
+            return Ok(None);
+        };
+        let Some((module, tag)) = name
+            .strip_suffix(".pyc")
+            .and_then(|name| name.rsplit_once(".cpython-"))
+        else {
+            return Ok(None);
+        };
+        let (version, optimization) = tag
+            .split_once(".opt-")
+            .map_or((tag, None), |(version, value)| (version, Some(value)));
+        if module.is_empty()
+            || module.starts_with('.')
+            || version.len() < 2
+            || version.len() > 4
+            || !version.bytes().all(|byte| byte.is_ascii_digit())
+            || !version.starts_with('3')
+            || optimization.is_some_and(|value| !matches!(value, "1" | "2"))
+        {
+            return Ok(None);
+        }
+        total_bytes = total_bytes.saturating_add(entry.meta.identity.size);
+        if entry.meta.identity.size > MAX_FILE_BYTES || total_bytes > MAX_TOTAL_BYTES {
+            return Ok(None);
+        }
+        let source_path = parent.join(format!("{module}.py"));
+        let Some(source) = safety::scope_metadata(root, &source_path, cancel)? else {
+            return Ok(None);
+        };
+        if !safety::regular_evidence_metadata(&source) {
+            return Ok(None);
+        }
+        let captured = safety::read_regular_bounded(&entry.path, cancel, MAX_FILE_BYTES)?;
+        if captured.identity != entry.meta.identity
+            || captured.bytes.len() < 16
+            || captured.bytes[2..4] != *b"\r\n"
+            || !(3400..=4000).contains(&u16::from_le_bytes(captured.bytes[..2].try_into().unwrap()))
+            || !matches!(
+                u32::from_le_bytes(captured.bytes[4..8].try_into().unwrap()),
+                0 | 1 | 3
+            )
+        {
+            return Ok(None);
+        }
+        latest_modified_ns = latest_modified_ns
+            .max(captured.identity.modified_ns)
+            .max(source.identity.modified_ns);
+        captures.push((
+            name.to_owned(),
+            captured.identity,
+            blake3::hash(&captured.bytes),
+            source.identity,
+        ));
+    }
+    directory.unchanged()?;
+    if captures.is_empty() || safety::scope_metadata(root, path, cancel)?.as_ref() != Some(&before)
+    {
+        return Ok(None);
+    }
+    captures.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hash = blake3::Hasher::new();
+    hash.update(format!("pythoncache-v{RULE_VERSION}").as_bytes());
+    for (name, bytecode, digest, source) in captures {
+        hash.update(name.as_bytes());
+        hash.update(&serde_json::to_vec(&(bytecode, source)).map_err(|error| error.to_string())?);
+        hash.update(digest.as_bytes());
+    }
+    Ok(Some(Evidence {
+        kind: "pythoncache",
+        title: format!(
+            "{} Python bytecode cache",
+            parent.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        explanation: "A Python bytecode cache containing only recognized CPython bytecode with corresponding local source files. Python can compile those files again when needed.",
+        consequence: "Close Python processes before moving this cache to Trash. The next import may take longer while Python recompiles it. Source files stay in place. Trash does not free space or earn chips.",
+        fingerprint: hash.finalize().to_hex().to_string(),
+        blocked: None,
+        latest_modified_ns,
+        quiet_days: recommendations::quiet_days("pythoncache"),
+        activity_root: Some(parent.to_path_buf()),
+    }))
 }
 
 fn evidence(
@@ -1428,6 +1546,9 @@ fn evidence_with_downloads_cached(
     cancel: &AtomicBool,
     caches: Option<&mut EvidenceCaches>,
 ) -> Result<Option<Evidence>> {
+    if let Some(kind) = recommendations::home_cache_candidate(root, path, meta.is_dir()) {
+        return Ok(everyday_evidence(path, meta, kind));
+    }
     if let Some(kind) = recommendations::library_candidate(root, path, meta.is_dir()) {
         return Ok(everyday_evidence(path, meta, kind));
     }
@@ -1443,7 +1564,7 @@ fn evidence_with_downloads_cached(
         match path.file_name().and_then(OsStr::to_str) {
             Some(
                 name @ ("node_modules" | "target" | ".venv" | "venv" | ".next" | ".nuxt" | ".turbo"
-                | ".parcel-cache"),
+                | ".parcel-cache" | "__pycache__"),
             ) => Some(name),
             Some(name) if crate::project_providers::recognizes_name(OsStr::new(name)) => Some(name),
             _ => return Ok(None),
@@ -1477,6 +1598,7 @@ fn evidence_with_downloads_cached(
                 })),
             },
             Some("target") => cargo_evidence(root, parent, path, cancel, caches),
+            Some("__pycache__") => python_cache_evidence(root, path, cancel),
             Some(".venv" | "venv") => venv_evidence(parent, path, cancel, caches),
             Some(".next" | ".nuxt" | ".turbo" | ".parcel-cache") => {
                 webcache_evidence(parent, path, cancel, caches)
@@ -1597,6 +1719,7 @@ pub(crate) fn artifact_component(name: &OsStr) -> bool {
                     | ".nuxt"
                     | ".turbo"
                     | ".parcel-cache"
+                    | "__pycache__"
             )
         )
 }
@@ -1613,7 +1736,7 @@ fn is_conditional_artifact_name(path: &Path) -> bool {
         .is_some_and(crate::project_providers::recognizes_name)
         || matches!(
             path.file_name().and_then(OsStr::to_str),
-            Some(".venv" | "venv" | ".next" | ".nuxt" | ".turbo" | ".parcel-cache")
+            Some(".venv" | "venv" | ".next" | ".nuxt" | ".turbo" | ".parcel-cache" | "__pycache__")
         )
 }
 
@@ -1868,9 +1991,15 @@ fn finish_artifact_review<F: FnMut(ScanBatch)>(
     if review.candidate.suggestion_eligible {
         stats.candidates += 1;
         stats.first_finding_ms.get_or_insert(stats.elapsed_ms);
-        review.candidate.explanation.push_str(&format!(
-            " At least {} MB is allocated locally. The {} have been unmodified for at least {} days.",
-            recommendations::minimum_bytes(review.found.kind) / 1_000_000,
+        if review.found.quiet_days == 0 {
+            review.candidate.explanation.push_str(&format!(
+                " At least {} is allocated locally. No known owning tool is active; this cache can be cleared after review without a waiting period.",
+                recommendations::minimum_size_label(review.found.kind),
+            ));
+        } else {
+            review.candidate.explanation.push_str(&format!(
+            " At least {} is allocated locally. The {} have been unmodified for at least {} days.",
+            recommendations::minimum_size_label(review.found.kind),
             if review.is_dir {
                 "contents and identification files"
             } else {
@@ -1878,6 +2007,7 @@ fn finish_artifact_review<F: FnMut(ScanBatch)>(
             },
             review.found.quiet_days
         ));
+        }
     } else {
         stats.skipped += 1;
         if let Some(reason) = quality_reason {
@@ -2065,7 +2195,7 @@ pub(crate) fn scan_with_options(
             .filter(|path| path.starts_with(selected))
             .collect();
         // Normal Home discovery still excludes Library before metadata. These
-        // three fixed, grant-anchored probes never enumerate other Library data.
+        // Fixed, grant-anchored probes admit only the recognized Library routes.
         // Reuse one session so hard-link accounting remains shared across lanes.
         if selected == root.path {
             lanes.push(root.path.clone());
@@ -2270,6 +2400,16 @@ impl ScanSession {
         if starts.len() > MAX_SCAN_LANES {
             return Err("The scan exceeds the bounded logical-lane limit".into());
         }
+        // The extra Home lanes have only fixed shallow corridors; cache leaves
+        // switch to the independent measurement stack. Reserve their five
+        // descriptors from the breadth frontier, retaining both measurement
+        // jobs so a large app cache cannot delay shallow project findings.
+        let shallow_frontier_limit = MAX_SHALLOW_FRONTIER
+            - if starts.len() == MAX_SCAN_LANES {
+                SUPPORT_DISCOVERY_DESCRIPTORS + SWIFTPM_DISCOVERY_DESCRIPTORS
+            } else {
+                0
+            };
         if scope.expected.is_some() && starts.len() != 1 {
             return Err("An exact refresh cannot span multiple logical lanes".into());
         }
@@ -2414,7 +2554,9 @@ impl ScanSession {
                         break;
                     };
                     let library = recommendations::library_area(root, &frame.directory.path);
+                    let home_logs = recommendations::home_log_scope(root, &frame.directory.path);
                     let next_entry = if library.is_some()
+                        || home_logs
                         || (mode == ScanMode::Suggestions
                             && !downloads
                                 .as_ref()
@@ -2422,7 +2564,9 @@ impl ScanSession {
                     {
                         let home_children =
                             root.kind == "home" && frame.directory.path == root.path;
-                        let step = if let Some((area, suffix)) = library {
+                        let step = if home_logs {
+                            frame.directory.next_library_discovery(cancel, false)
+                        } else if let Some((area, suffix)) = library {
                             frame.directory.next_library_discovery(
                                 cancel,
                                 area == recommendations::LibraryArea::Caches
@@ -2544,6 +2688,7 @@ impl ScanSession {
                 && is_dir
                 && entry.path != root.path
                 && is_artifact_name(&entry.path)
+                && recommendations::developer_cache_route(root, &entry.path).is_none()
                 && !is_conditional_artifact_name(&entry.path)
                 && !quiet_for(
                     entry.meta.identity.modified_ns,
@@ -2891,6 +3036,24 @@ impl ScanSession {
                     stats.errors += 1;
                     continue;
                 }
+                if depth >= SUPPORT_DISCOVERY_DESCRIPTORS
+                    && recommendations::library_area(root, &entry.path).is_some_and(|(area, _)| {
+                        area == recommendations::LibraryArea::ApplicationSupport
+                    })
+                {
+                    stats.skipped += 1;
+                    stats.errors += 1;
+                    continue;
+                }
+                if depth >= SWIFTPM_DISCOVERY_DESCRIPTORS
+                    && starts.get(lane).is_some_and(|path| {
+                        *path == root.path.join(recommendations::SWIFTPM_CACHE_ROUTE)
+                    })
+                {
+                    stats.skipped += 1;
+                    stats.errors += 1;
+                    continue;
+                }
                 let opened = match opened_directory {
                     Some(directory) => Ok(directory),
                     None if depth == 0 => Directory::open(&entry.path),
@@ -2907,7 +3070,7 @@ impl ScanSession {
                             classify: classify_children,
                             lane,
                         };
-                        if frontier.len() < MAX_SHALLOW_FRONTIER {
+                        if frontier.len() < shallow_frontier_limit {
                             frontier.push_back(frame);
                         } else {
                             frontier.push_front(frame);
@@ -6767,6 +6930,96 @@ mod tests {
                 suggestion_reason(&found, &measured, now).is_some(),
                 "{kind}"
             );
+        }
+    }
+
+    fn python_bytecode_fixture() -> (tempfile::TempDir, Root, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap().join("Home");
+        let project = home.join("Documents/python-project");
+        let cache = project.join("__pycache__");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(project.join("module.py"), b"value = 42\n").unwrap();
+        let mut bytecode = vec![0u8; 4_096];
+        bytecode[..4].copy_from_slice(&[0xf3, 0x0d, b'\r', b'\n']);
+        std::fs::write(cache.join("module.cpython-312.pyc"), bytecode).unwrap();
+        age_tree(&home, 8);
+        let root = safety::authorize(&home, "home").unwrap();
+        (temp, root, cache)
+    }
+
+    #[test]
+    fn python_bytecode_requires_matching_source_and_complete_verified_contents() {
+        let (_temp, root, cache) = python_bytecode_fixture();
+        let cancel = AtomicBool::new(false);
+        let original = python_cache_evidence(&root, &cache, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.kind, "pythoncache");
+        assert!(!recommendations::permanent_kind(original.kind));
+        let (_, rows) = candidates_in_mode(&root, ScanMode::MetadataCoverage);
+        let mut candidate = rows
+            .into_iter()
+            .find(|candidate| candidate.path == cache)
+            .unwrap();
+        assert_eq!(candidate.kind, "pythoncache");
+        assert!(candidate.allocated_bytes >= 4_096 && candidate.file_count == 1);
+        assert!(!candidate.eligible_permanent && !candidate.provisional);
+        // The permanent-operation kind gate applies even if a stored/client
+        // candidate claims eligibility. It executes before any activity check.
+        candidate.blocked_reason = None;
+        candidate.eligible_permanent = true;
+        assert!(
+            revalidate(&root, &candidate, &cancel)
+                .unwrap_err()
+                .contains("Trash-only")
+        );
+
+        std::fs::write(cache.parent().unwrap().join("module.py"), b"value = 43\n").unwrap();
+        let changed = python_cache_evidence(&root, &cache, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_ne!(changed.fingerprint, original.fingerprint);
+        assert!(changed.latest_modified_ns > original.latest_modified_ns);
+        assert_eq!(
+            python_cache_evidence(&root, &cache, &AtomicBool::new(true))
+                .err()
+                .unwrap(),
+            "Cancelled"
+        );
+    }
+
+    #[test]
+    fn python_bytecode_preserves_sources_mixed_content_and_redirected_entries() {
+        for variant in 0..7 {
+            let (_temp, root, cache) = python_bytecode_fixture();
+            let source = cache.parent().unwrap().join("module.py");
+            let bytecode = cache.join("module.cpython-312.pyc");
+            match variant {
+                0 => std::fs::write(cache.join("personal.txt"), b"preserve this file").unwrap(),
+                1 => std::fs::create_dir(cache.join("nested")).unwrap(),
+                2 => std::fs::remove_file(&source).unwrap(),
+                3 => std::fs::write(&bytecode, b"not bytecode").unwrap(),
+                4 => {
+                    let preserved = source.with_file_name("preserved.py");
+                    std::fs::rename(&source, &preserved).unwrap();
+                    std::os::unix::fs::symlink(&preserved, &source).unwrap();
+                }
+                5 => std::fs::hard_link(&bytecode, cache.parent().unwrap().join("shared.pyc"))
+                    .unwrap(),
+                6 => {
+                    let preserved = bytecode.with_file_name("preserved.pyc");
+                    std::fs::rename(&bytecode, &preserved).unwrap();
+                    std::os::unix::fs::symlink(&preserved, &bytecode).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = python_cache_evidence(&root, &cache, &AtomicBool::new(false));
+            assert!(
+                result.is_err() || result.unwrap().is_none(),
+                "variant {variant}"
+            );
+            assert!(cache.exists());
         }
     }
 

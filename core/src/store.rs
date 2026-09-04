@@ -101,6 +101,29 @@ static SUGGESTIONS_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+// Busy or protected developer caches remain visible with their exact reason.
+// They never enter the suggestion index and cannot authorize either operation.
+static BLOCKED_DEVELOPER_CACHES_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT c.json FROM candidates c
+    WHERE json_extract(c.json,'$.kind')='devcache'
+      AND json_extract(c.json,'$.suggestion_eligible')=0
+      AND json_extract(c.json,'$.eligible_permanent')=0
+      AND json_extract(c.json,'$.blocked_reason') IS NOT NULL
+      AND COALESCE(json_extract(c.json,'$.provisional'),0)=0
+      AND (json_extract(c.json,'$.allocated_bytes')>={}
+           OR (json_extract(c.json,'$.allocated_bytes')=0
+               AND json_extract(c.json,'$.file_count')=0
+               AND json_extract(c.json,'$.fingerprint')=''))
+      AND NOT EXISTS(SELECT 1 FROM kept k WHERE c.path=k.path
+          OR substr(c.path,1,length(k.path)+1)=k.path||'/'
+          OR substr(k.path,1,length(c.path)+1)=c.path||'/')
+    ORDER BY json_extract(c.json,'$.allocated_bytes') DESC, c.path
+    LIMIT 500",
+        crate::recommendations::minimum_size_sql("c.json"),
+    )
+});
+
 /// One page of the operations ledger, newest first. `?1` NULL starts at the
 /// newest receipt; a `next_before` cursor value continues strictly older ones.
 const HISTORY_PAGE_SQL: &str = "SELECT rowid, receipt_json FROM operations
@@ -117,6 +140,7 @@ impl Store {
         conn.execute_batch(&format!("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit={WAL_SIZE_HINT_BYTES};
             CREATE TABLE IF NOT EXISTS roots(id TEXT PRIMARY KEY, path TEXT UNIQUE NOT NULL, json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS root_anchors(root_id TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS candidates(id TEXT PRIMARY KEY, root_id TEXT NOT NULL, path TEXT UNIQUE NOT NULL, json TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS candidate_roots ON candidates(root_id);
             CREATE TABLE IF NOT EXISTS kept(path TEXT PRIMARY KEY);
@@ -135,13 +159,29 @@ impl Store {
             DROP INDEX IF EXISTS candidate_suggestions_v2;
             DROP INDEX IF EXISTS candidate_suggestions_v3;
             DROP INDEX IF EXISTS candidate_suggestions_v4;
-            CREATE INDEX IF NOT EXISTS candidate_suggestions_v5 ON candidates(
+            DROP INDEX IF EXISTS candidate_suggestions_v5;
+            CREATE INDEX IF NOT EXISTS candidate_suggestions_v6 ON candidates(
                 {},
                 json_extract(json,'$.allocated_bytes') DESC, path)
                 WHERE json_extract(json,'$.suggestion_eligible')=1
                   AND json_extract(json,'$.blocked_reason') IS NULL
                   AND json_extract(json,'$.allocated_bytes')>={};",
             crate::recommendations::priority_sql("json"),
+            crate::recommendations::minimum_size_sql("json")
+        ))
+        .map_err(err)?;
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS candidate_blocked_devcaches_v1 ON candidates(
+                json_extract(json,'$.allocated_bytes') DESC, path)
+                WHERE json_extract(json,'$.kind')='devcache'
+                  AND json_extract(json,'$.suggestion_eligible')=0
+                  AND json_extract(json,'$.eligible_permanent')=0
+                  AND json_extract(json,'$.blocked_reason') IS NOT NULL
+                  AND COALESCE(json_extract(json,'$.provisional'),0)=0
+                  AND (json_extract(json,'$.allocated_bytes')>={}
+                       OR (json_extract(json,'$.allocated_bytes')=0
+                           AND json_extract(json,'$.file_count')=0
+                           AND json_extract(json,'$.fingerprint')=''));",
             crate::recommendations::minimum_size_sql("json")
         ))
         .map_err(err)?;
@@ -479,6 +519,28 @@ impl Store {
         self.json_rows("SELECT json FROM roots ORDER BY path")
     }
 
+    pub(crate) fn root_anchor(&self, id: &str) -> Result<Option<RootAnchor>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json FROM root_anchors WHERE root_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        json.map(|json| serde_json::from_str(&json).map_err(err))
+            .transpose()
+    }
+
+    pub(crate) fn save_root_anchor(&self, id: &str, anchor: &RootAnchor) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO root_anchors(root_id,json) VALUES(?1,?2) ON CONFLICT(root_id) DO UPDATE SET json=excluded.json",
+            params![id, serde_json::to_string(anchor).map_err(err)?],
+        ).map_err(err)?;
+        Ok(())
+    }
+
     /// Reconcile an event-history loss boundary atomically. The caller must
     /// have created `event_cursor` during engine initialization. Every root is
     /// re-enqueued before the cursor is advanced, so a failed queue write
@@ -610,9 +672,49 @@ impl Store {
     /// An explicit broader authorization replaces its contained scan roots atomically.
     /// History, kept paths and the reward ledger retain their original identities.
     pub fn authorize_root(&mut self, root: &Root, replace_contained: bool) -> Result<Vec<String>> {
+        self.authorize_root_with_anchor(root, replace_contained, None)
+    }
+
+    pub(crate) fn authorize_root_with_anchor(
+        &mut self,
+        root: &Root,
+        replace_contained: bool,
+        anchor: Option<&RootAnchor>,
+    ) -> Result<Vec<String>> {
+        self.authorize_root_impl(root, replace_contained, None, anchor)
+    }
+
+    /// The caller has freshly authorized this exact path. Replacement is
+    /// atomic even when the physical directory (and therefore grant ID) changed.
+    pub(crate) fn reauthorize_root(
+        &mut self,
+        root: &Root,
+        expected_id: &str,
+        anchor: Option<&RootAnchor>,
+    ) -> Result<Vec<String>> {
+        let previous = self.root(expected_id)?;
+        if previous.path != root.path {
+            return Err(
+                "Choose the same folder to renew its access, or add a new location.".into(),
+            );
+        }
+        self.authorize_root_impl(root, false, Some(expected_id), anchor)
+    }
+
+    fn authorize_root_impl(
+        &mut self,
+        root: &Root,
+        replace_contained: bool,
+        replace_exact: Option<&str>,
+        anchor: Option<&RootAnchor>,
+    ) -> Result<Vec<String>> {
         let mut contained = Vec::new();
         let mut narrowing_home = false;
         for existing in self.roots()? {
+            if replace_exact == Some(existing.id.as_str()) && existing.path == root.path {
+                contained.push(existing.id);
+                continue;
+            }
             // Reconfirming a legacy Home grant narrows its media policy. Replace
             // only the same physical grant, in the existing atomic transaction;
             // old candidate rows must not remain actionable during the refresh.
@@ -668,12 +770,19 @@ impl Store {
             ],
         )
         .map_err(err)?;
+        if let Some(anchor) = anchor {
+            tx.execute(
+                "INSERT INTO root_anchors(root_id,json) VALUES(?1,?2)",
+                params![root.id, serde_json::to_string(anchor).map_err(err)?],
+            )
+            .map_err(err)?;
+        }
         tx.execute(
             "INSERT OR IGNORE INTO incomplete_roots VALUES(?1)",
             [&root.id],
         )
         .map_err(err)?;
-        if narrowing_home {
+        if narrowing_home || replace_exact.is_some() {
             // The replacement scan belongs to the same commit as invalidation.
             // A restart between authorization and the native resume must not
             // leave the narrowed grant empty with no durable work to finish.
@@ -1400,7 +1509,15 @@ impl Store {
         if let Some(cached) = self.visible_candidates.borrow().as_ref() {
             return Ok(cached.clone());
         }
-        let candidates = self.json_rows::<Candidate>(&SUGGESTIONS_SQL)?;
+        let mut candidates = self.json_rows::<Candidate>(&SUGGESTIONS_SQL)?;
+        if candidates.len() < 500 {
+            let remaining = 500 - candidates.len();
+            candidates.extend(
+                self.json_rows::<Candidate>(&BLOCKED_DEVELOPER_CACHES_SQL)?
+                    .into_iter()
+                    .take(remaining),
+            );
+        }
         *self.visible_candidates.borrow_mut() = Some(candidates.clone());
         Ok(candidates)
     }
@@ -3675,6 +3792,113 @@ mod tests {
     }
 
     #[test]
+    fn real_unmeasured_busy_cache_stays_visible_and_never_prepares_cleanup() {
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&["/tools/node"], vec![])),
+            || {
+                let temp = tempfile::tempdir().unwrap();
+                let home = temp.path().canonicalize().unwrap().join("Home");
+                let cache = home.join(".npm/_cacache");
+                std::fs::create_dir_all(&cache).unwrap();
+                std::fs::write(cache.join("package"), [0x31; 8_192]).unwrap();
+                let root = crate::safety::authorize(&home, "home").unwrap();
+                let mut store = Store::open(&temp.path().join("state/library.sqlite")).unwrap();
+                store.add_root(&root).unwrap();
+                crate::scanner::scan(&root, None, &AtomicBool::new(false), |batch| {
+                    store.save_batch(&batch).unwrap();
+                })
+                .unwrap();
+                let rows = store.candidates().unwrap();
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row.path, cache);
+                assert!(row.blocked_reason.as_ref().unwrap().contains("running"));
+                assert!(!row.provisional && !row.suggestion_eligible && !row.eligible_permanent);
+                assert_eq!((row.allocated_bytes, row.file_count), (0, 0));
+                assert!(row.fingerprint.is_empty());
+                assert!(crate::scanner::revalidate(&root, row, &AtomicBool::new(false)).is_err());
+                assert_eq!(std::fs::read(cache.join("package")).unwrap(), [0x31; 8_192]);
+                assert!(store.history().unwrap().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn blocked_developer_caches_stay_visible_without_cleanup_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        let ready = item("ready", "/root/.npm/_cacache", "devcache", 8_192, true);
+        let mut busy = item("busy", "/root/.cache/uv", "devcache", 16_384, false);
+        busy.blocked_reason = Some("uv is running; close it and scan again".into());
+        busy.eligible_permanent = false;
+        let mut protected = busy.clone();
+        protected.id = "protected".into();
+        protected.path = "/root/.cargo/git/checkouts".into();
+        protected.blocked_reason = Some("Contains protected Git metadata".into());
+        let mut provisional = busy.clone();
+        provisional.id = "provisional".into();
+        provisional.path = "/root/.cache/pip".into();
+        provisional.provisional = true;
+        let mut other_kind = busy.clone();
+        other_kind.id = "other-kind".into();
+        other_kind.path = "/root/project/target".into();
+        other_kind.kind = "cargo".into();
+        let mut tiny = busy.clone();
+        tiny.id = "tiny".into();
+        tiny.path = "/root/.cache/ruff".into();
+        tiny.allocated_bytes = 1;
+        save(
+            &mut store,
+            vec![
+                ready.clone(),
+                busy.clone(),
+                protected.clone(),
+                provisional,
+                other_kind,
+                tiny,
+            ],
+        );
+        let visible = store.candidates().unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ready", "busy", "protected"]
+        );
+        assert!(visible[0].suggestion_eligible && visible[0].eligible_permanent);
+        assert!(visible[1..].iter().all(|row| !row.suggestion_eligible
+            && !row.eligible_permanent
+            && row.blocked_reason.is_some()));
+        store.keep("/root/.cache", true).unwrap();
+        assert_eq!(
+            store
+                .candidates()
+                .unwrap()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ready", "protected"]
+        );
+        assert!(store.wallet().unwrap().credited_bytes == 0 && store.history().unwrap().is_empty());
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                *BLOCKED_DEVELOPER_CACHES_SQL
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            plan.join(" ").contains("candidate_blocked_devcaches_v1"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
     fn ranking_only_returns_verified_meaningful_suggestions_and_respects_keep() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("db")).unwrap();
@@ -3768,8 +3992,8 @@ mod tests {
                 .map(|row| row.kind.as_str())
                 .collect::<Vec<_>>(),
             [
-                "log",
                 "crashreport",
+                "log",
                 "cache",
                 "xcode",
                 "installer",
@@ -3778,11 +4002,12 @@ mod tests {
                 "largefile"
             ]
         );
-        // The 1 MB report and 10 MB log survive the query's size filter, while
+        // Small reports and logs survive their category-specific size filter,
+        // ordered by path when their size and priority match, while
         // a 500 MB personal file cannot displace first-group cleanup artifacts.
         assert_eq!(
             store.candidate("crashreport").unwrap().allocated_bytes,
-            1_000_000
+            crate::recommendations::minimum_bytes("crashreport")
         );
     }
 
@@ -4227,7 +4452,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(details.contains("candidate_suggestions_v5"), "{details}");
+        assert!(details.contains("candidate_suggestions_v6"), "{details}");
         assert!(!details.contains("USE TEMP B-TREE"), "{details}");
     }
     #[test]
@@ -4351,6 +4576,84 @@ mod tests {
         assert_eq!(
             restarted.take_scope().unwrap(),
             Some(("root".into(), "/root".into()))
+        );
+    }
+
+    #[test]
+    fn exact_reauthorization_is_atomic_and_preserves_durable_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("db")).unwrap();
+        discovery_root(&mut store);
+        let old = store.root("root").unwrap();
+        let candidate = item("old", "/root/target", "cargo", 100_000_000, true);
+        save(&mut store, vec![candidate.clone()]);
+        store.keep("/root/preserve", true).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE wallet SET collected=17,remainder=42,credited=1700000042",
+                [],
+            )
+            .unwrap();
+        let anchor = RootAnchor {
+            volume_uuid: [7; 16],
+            birth_seconds: 123,
+            birth_nanoseconds: 456,
+        };
+        store.save_root_anchor(&old.id, &anchor).unwrap();
+        let mut renewed = old.clone();
+        renewed.id = "renewed".into();
+        renewed.identity.device += 1;
+        let context = store.foreground_context().unwrap();
+        let summary = terminal_summary(10);
+        store.save_foreground_summary(context, &summary).unwrap();
+
+        let mut wrong_path = renewed.clone();
+        wrong_path.path = "/different".into();
+        assert!(
+            store
+                .reauthorize_root(&wrong_path, "root", Some(&anchor))
+                .is_err()
+        );
+        assert!(
+            store
+                .reauthorize_root(&renewed, "unknown", Some(&anchor))
+                .is_err()
+        );
+        store.conn.execute_batch("CREATE TEMP TRIGGER fail_reauthorize BEFORE INSERT ON root_anchors BEGIN SELECT RAISE(ABORT,'disposable anchor failure'); END;").unwrap();
+        assert!(
+            store
+                .reauthorize_root(&renewed, "root", Some(&anchor))
+                .is_err()
+        );
+        assert!(store.root("root").is_ok());
+        assert!(store.root("renewed").is_err());
+        assert_eq!(store.candidate("old").unwrap(), candidate);
+        assert_eq!(store.root_anchor("root").unwrap(), Some(anchor.clone()));
+        assert_eq!(store.foreground_context().unwrap(), context);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_reauthorize")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reauthorize_root(&renewed, "root", Some(&anchor))
+                .unwrap(),
+            ["root"]
+        );
+        assert!(store.root("root").is_err());
+        assert_eq!(store.root("renewed").unwrap().identity, renewed.identity);
+        assert!(store.candidates().unwrap().is_empty());
+        assert_eq!(store.root_anchor("root").unwrap(), None);
+        assert_eq!(store.root_anchor("renewed").unwrap(), Some(anchor));
+        assert_eq!(store.kept().unwrap(), ["/root/preserve"]);
+        assert_eq!(store.wallet().unwrap().collected_coins, 17);
+        assert_eq!(store.wallet().unwrap().fractional_bytes, 42);
+        assert!(store.load_foreground_summary().unwrap().is_none());
+        assert_eq!(
+            store.take_scope().unwrap(),
+            Some(("renewed".into(), "/root".into()))
         );
     }
 

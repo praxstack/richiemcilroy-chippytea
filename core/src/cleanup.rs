@@ -1277,6 +1277,453 @@ mod tests {
         sync::Arc,
     };
 
+    fn devcache_candidates(root: &Root) -> Vec<Candidate> {
+        let mut rows = HashMap::new();
+        scanner::scan(root, None, &AtomicBool::new(false), |batch| {
+            for candidate in batch.candidates {
+                if !candidate.provisional {
+                    rows.insert(candidate.path.clone(), candidate);
+                }
+            }
+        })
+        .unwrap();
+        rows.into_values()
+            .filter(|row| row.kind == "devcache")
+            .collect()
+    }
+
+    fn devcache_fixture(
+        routes: &[&str],
+    ) -> (tempfile::TempDir, Store, Root, Vec<Candidate>, Vec<PathBuf>) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let home = base.join("Home");
+        for route in routes {
+            let directory = home.join(route);
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut file = File::create(directory.join("payload")).unwrap();
+            file.write_all(&[0x59; 8192]).unwrap();
+            file.sync_all().unwrap();
+        }
+        let preserved: Vec<_> = [
+            ".npmrc",
+            ".cargo/config.toml",
+            ".cargo/bin/tool",
+            ".rustup/toolchains/current/bin/rustc",
+            ".local/share/mise/installs/python/current",
+            ".aws/credentials",
+            ".aws/config",
+            ".expo/state.json",
+            ".bun/bin/bun",
+            "Documents/project/source.rs",
+            "Library/Caches/Homebrew/locks/keep.lock",
+            "Library/org.swift.swiftpm/configuration/settings.json",
+        ]
+        .iter()
+        .map(|path| home.join(path))
+        .collect();
+        for path in &preserved {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"preserve adjacent user data").unwrap();
+        }
+        let root = safety::authorize(&home, "home").unwrap();
+        let rows = devcache_candidates(&root);
+        assert_eq!(rows.len(), routes.len(), "{rows:?}");
+        for row in &rows {
+            assert!(row.suggestion_eligible && row.eligible_permanent, "{row:?}");
+            assert!(row.allocated_bytes >= 4096 && row.file_count == 1);
+            assert!(!row.fingerprint.is_empty());
+        }
+        let store = Store::open(&base.join("ledger.sqlite")).unwrap();
+        (temp, store, root, rows, preserved)
+    }
+
+    #[test]
+    fn devcache_permanent_cleanup_removes_multiple_recent_caches_and_preserves_adjacent_data() {
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&[], vec![])),
+            || {
+                let (_temp, mut store, root, rows, preserved) = devcache_fixture(&[
+                    ".npm/_cacache",
+                    "Library/Caches/pip",
+                    ".cache/uv",
+                    ".cargo/registry/cache",
+                    ".aws/cli/cache",
+                    "Library/org.swift.swiftpm/cache",
+                    "Library/Caches/Homebrew/downloads",
+                ]);
+                let mut credited = 0;
+                for row in &rows {
+                    scanner::revalidate(&root, row, &AtomicBool::new(false)).unwrap();
+                    let receipt = execute(
+                        &mut store,
+                        &root,
+                        row,
+                        "permanent",
+                        None,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    assert_eq!(receipt.outcome, "removed", "{}", receipt.detail);
+                    assert!(!row.path.exists());
+                    assert_eq!(receipt.reported_bytes, row.allocated_bytes);
+                    assert!(
+                        receipt.credited_bytes
+                            <= receipt.observed_bytes.min(receipt.reported_bytes),
+                        "Filesystem deletion must not manufacture APFS space credit"
+                    );
+                    credited += receipt.credited_bytes;
+                    assert!(
+                        execute(
+                            &mut store,
+                            &root,
+                            row,
+                            "permanent",
+                            None,
+                            &AtomicBool::new(false)
+                        )
+                        .is_err(),
+                        "An old candidate cannot be replayed after removal"
+                    );
+                }
+                assert_eq!(store.wallet().unwrap().credited_bytes, credited);
+                for path in preserved {
+                    assert_eq!(std::fs::read(path).unwrap(), b"preserve adjacent user data");
+                }
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn devcache_trash_preserves_restorable_contents_without_credit() {
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&[], vec![])),
+            || {
+                let (temp, mut store, root, rows, _) = devcache_fixture(&[".cache/uv"]);
+                let destination = temp.path().canonicalize().unwrap().join("fixture-trash");
+                let _trash = install_fake_trash(destination.clone());
+                let receipt = execute(
+                    &mut store,
+                    &root,
+                    &rows[0],
+                    "trash",
+                    Some(fake_trash),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(receipt.outcome, "trashed", "{}", receipt.detail);
+                assert_eq!(fake_trash_calls(), 1);
+                assert!(!rows[0].path.exists());
+                assert_eq!(
+                    std::fs::read(destination.join("payload")).unwrap(),
+                    [0x59; 8192]
+                );
+                assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+                assert!(receipt.can_restore);
+            },
+        );
+    }
+
+    #[test]
+    fn devcache_active_writers_block_discovery_and_previously_reviewed_cleanup() {
+        for (route, executable) in [
+            (".npm/_cacache", "/tools/node"),
+            (".cache/uv", "/tools/python3.14"),
+            (".cargo/registry/cache", "/tools/cargo"),
+            ("Library/Caches/Homebrew/downloads", "/tools/curl"),
+            (".aws/cli/cache", "/tools/aws"),
+        ] {
+            crate::activity::with_test_snapshot(
+                Ok(crate::activity::test_snapshot(&[], vec![])),
+                || {
+                    let (_temp, mut store, root, rows, _) = devcache_fixture(&[route]);
+                    crate::activity::with_test_snapshot(
+                        Ok(crate::activity::test_snapshot(&[executable], vec![])),
+                        || {
+                            let active = devcache_candidates(&root);
+                            assert_eq!(active.len(), 1);
+                            assert!(
+                                !active[0].suggestion_eligible && !active[0].eligible_permanent
+                            );
+                            assert!(
+                                active[0]
+                                    .blocked_reason
+                                    .as_deref()
+                                    .unwrap()
+                                    .contains("running")
+                            );
+                            let receipt = execute(
+                                &mut store,
+                                &root,
+                                &rows[0],
+                                "permanent",
+                                None,
+                                &AtomicBool::new(false),
+                            )
+                            .unwrap();
+                            assert_eq!(receipt.outcome, "skipped", "{}", receipt.detail);
+                            assert_eq!(
+                                std::fs::read(rows[0].path.join("payload")).unwrap(),
+                                [0x59; 8192]
+                            );
+                            assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+                        },
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn devcache_revalidation_refuses_replacement_new_files_wrong_kind_and_non_home_grants() {
+        for mutation in [
+            "replacement",
+            "new-file",
+            "wrong-kind",
+            "wrong-grant",
+            "external-hardlink",
+        ] {
+            crate::activity::with_test_snapshot(
+                Ok(crate::activity::test_snapshot(&[], vec![])),
+                || {
+                    let (temp, mut store, root, mut rows, _) = devcache_fixture(&[".npm/_cacache"]);
+                    let row = &mut rows[0];
+                    let saved = temp.path().canonicalize().unwrap().join("saved-original");
+                    let mut grant = root.clone();
+                    match mutation {
+                        "replacement" => {
+                            std::fs::rename(&row.path, &saved).unwrap();
+                            std::fs::create_dir(&row.path).unwrap();
+                            std::fs::write(row.path.join("payload"), b"new replacement contents")
+                                .unwrap();
+                        }
+                        "new-file" => std::fs::write(
+                            row.path.join("new-source.txt"),
+                            b"preserve new contents",
+                        )
+                        .unwrap(),
+                        "wrong-kind" => row.kind = "cargo".into(),
+                        "wrong-grant" => grant.kind = "projects".into(),
+                        "external-hardlink" => {
+                            std::fs::hard_link(row.path.join("payload"), &saved).unwrap()
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        scanner::revalidate(&grant, row, &AtomicBool::new(false)).is_err(),
+                        "{mutation}"
+                    );
+                    let result = execute(
+                        &mut store,
+                        &grant,
+                        row,
+                        "permanent",
+                        None,
+                        &AtomicBool::new(false),
+                    );
+                    assert!(
+                        match &result {
+                            Err(_) => true,
+                            Ok(receipt) => receipt.outcome == "skipped",
+                        },
+                        "{mutation}: {result:?}"
+                    );
+                    assert!(row.path.join("payload").exists(), "{mutation}");
+                    assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+                    if mutation == "replacement" {
+                        assert_eq!(std::fs::read(saved.join("payload")).unwrap(), [0x59; 8192]);
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn devcache_shared_links_git_and_symlink_boundaries_never_become_cleanup() {
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&[], vec![])),
+            || {
+                let (_temp, _store, root, rows, _) =
+                    devcache_fixture(&[".npm/_cacache", ".cache/uv"]);
+                std::fs::hard_link(rows[0].path.join("payload"), rows[1].path.join("shared"))
+                    .unwrap();
+                let shared = devcache_candidates(&root);
+                assert_eq!(shared.len(), 2);
+                assert!(
+                    shared
+                        .iter()
+                        .all(|row| !row.suggestion_eligible && !row.eligible_permanent)
+                );
+                for row in shared {
+                    assert!(row.path.join("payload").exists());
+                }
+            },
+        );
+        for boundary in ["git", "symlink-root", "protected-git-child"] {
+            crate::activity::with_test_snapshot(
+                Ok(crate::activity::test_snapshot(&[], vec![])),
+                || {
+                    let (temp, _store, root, rows, _) = devcache_fixture(&[".npm/_cacache"]);
+                    if boundary == "git" {
+                        for arguments in [vec!["init", "-q"], vec!["add", ".npm/_cacache/payload"]]
+                        {
+                            assert!(
+                                std::process::Command::new("/usr/bin/git")
+                                    .env_clear()
+                                    .env("PATH", "/usr/bin:/bin")
+                                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                                    .args(arguments)
+                                    .current_dir(&root.path)
+                                    .status()
+                                    .unwrap()
+                                    .success()
+                            );
+                        }
+                    } else if boundary == "protected-git-child" {
+                        std::fs::create_dir(rows[0].path.join(".git")).unwrap();
+                        std::fs::write(
+                            rows[0].path.join(".git/config"),
+                            b"preserve repository metadata",
+                        )
+                        .unwrap();
+                    } else {
+                        let saved = temp.path().canonicalize().unwrap().join("saved-cache");
+                        std::fs::rename(&rows[0].path, &saved).unwrap();
+                        std::os::unix::fs::symlink(saved, &rows[0].path).unwrap();
+                    }
+                    let found = devcache_candidates(&root);
+                    assert!(
+                        found
+                            .iter()
+                            .all(|row| !row.suggestion_eligible && !row.eligible_permanent),
+                        "{boundary}: {found:?}"
+                    );
+                    assert_eq!(
+                        std::fs::read(rows[0].path.join("payload")).unwrap(),
+                        [0x59; 8192]
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn devcache_npx_bin_links_and_uv_internal_archives_are_deleted_without_following_links() {
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&[], vec![])),
+            || {
+                let (_temp, mut store, root, _rows, preserved) =
+                    devcache_fixture(&[".npm/_npx", ".cache/uv"]);
+                let npx = root.path.join(".npm/_npx");
+                let uv = root.path.join(".cache/uv");
+                let package = npx.join("install-hash/node_modules/fixture-cli");
+                std::fs::create_dir_all(&package).unwrap();
+                std::fs::write(
+                    package.join("package.json"),
+                    br#"{"name":"fixture-cli","bin":{"fixture":"cli.js"}}"#,
+                )
+                .unwrap();
+                std::fs::write(
+                    package.join("cli.js"),
+                    b"#!/usr/bin/env node\nconsole.log('fixture');\n",
+                )
+                .unwrap();
+                let bin = package.parent().unwrap().join(".bin");
+                std::fs::create_dir(&bin).unwrap();
+                std::os::unix::fs::symlink("../fixture-cli/cli.js", bin.join("fixture")).unwrap();
+                // The outside link target is preserved. Developer policy captures
+                // the link identity and unlinks only that leaf; it never opens it.
+                std::os::unix::fs::symlink(&preserved[0], package.join("external-reference"))
+                    .unwrap();
+                let archive = uv.join("archive-v0/fixture-hash/package");
+                let wheel = uv.join("wheels-v5/default/fixture-package");
+                std::fs::create_dir_all(&archive).unwrap();
+                std::fs::create_dir_all(&wheel).unwrap();
+                std::fs::rename(uv.join("payload"), archive.join("module.py")).unwrap();
+                std::fs::hard_link(archive.join("module.py"), archive.join("module-copy.py"))
+                    .unwrap();
+                std::os::unix::fs::symlink(
+                    "../../../archive-v0/fixture-hash",
+                    wheel.join("1.0-py3-none-any"),
+                )
+                .unwrap();
+                let rows = devcache_candidates(&root);
+                assert_eq!(rows.len(), 2);
+                for row in rows {
+                    assert!(row.suggestion_eligible && row.eligible_permanent, "{row:?}");
+                    let receipt = execute(
+                        &mut store,
+                        &root,
+                        &row,
+                        "permanent",
+                        None,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    assert_eq!(receipt.outcome, "removed", "{}", receipt.detail);
+                    assert!(!row.path.exists());
+                }
+                for path in preserved {
+                    assert_eq!(std::fs::read(path).unwrap(), b"preserve adjacent user data");
+                }
+            },
+        );
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&[], vec![])),
+            || {
+                let (_temp, _store, root, rows, _) = devcache_fixture(&[".cache/uv"]);
+                let installed = root
+                    .path
+                    .join("Documents/project/.venv/lib/fixture/module.py");
+                std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+                std::fs::hard_link(rows[0].path.join("payload"), &installed).unwrap();
+                let rows = devcache_candidates(&root);
+                assert_eq!(rows.len(), 1);
+                assert!(!rows[0].suggestion_eligible && !rows[0].eligible_permanent);
+                assert_eq!(std::fs::read(installed).unwrap(), [0x59; 8192]);
+            },
+        );
+    }
+
+    #[test]
+    fn devcache_unknown_process_activity_never_authorizes_a_previous_review() {
+        crate::activity::with_test_snapshot(
+            Ok(crate::activity::test_snapshot(&[], vec![])),
+            || {
+                let (_temp, mut store, root, rows, _) = devcache_fixture(&[".npm/_cacache"]);
+                crate::activity::with_test_snapshot(
+                    Err("Unidentified process fixture".into()),
+                    || {
+                        let current = devcache_candidates(&root);
+                        assert_eq!(current.len(), 1);
+                        assert!(!current[0].suggestion_eligible && !current[0].eligible_permanent);
+                        assert_eq!(
+                            current[0].blocked_reason.as_deref(),
+                            Some("Unidentified process fixture")
+                        );
+                        let receipt = execute(
+                            &mut store,
+                            &root,
+                            &rows[0],
+                            "permanent",
+                            None,
+                            &AtomicBool::new(false),
+                        )
+                        .unwrap();
+                        assert_eq!(receipt.outcome, "skipped");
+                        assert_eq!(
+                            std::fs::read(rows[0].path.join("payload")).unwrap(),
+                            [0x59; 8192]
+                        );
+                        assert_eq!(store.wallet().unwrap().credited_bytes, 0);
+                    },
+                );
+            },
+        );
+    }
+
     struct RestoreFixture {
         store: Store,
         candidate: Candidate,

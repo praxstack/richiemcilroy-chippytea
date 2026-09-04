@@ -2,10 +2,28 @@ import Foundation
 import Combine
 import CoreServices
 import SQLite3
+import SwiftUI
 
 enum NativeSelfTest {
     @MainActor static func runAccessFlow() async {
         do {
+            if CommandLine.arguments.contains("--access-preview") {
+                try await accessPreview()
+                return
+            }
+            if CommandLine.arguments.contains("--developer-cache-regression") {
+                try await developerCachePresentation()
+                try storageInventoryDecoding()
+                print("PASS native developer caches: unified findings, sorting, filters, mixed selection and permanent review")
+                exit(0)
+            }
+            if CommandLine.arguments.contains("--access-recovery-regression") {
+                try storageInventoryDecoding()
+                try await folderAccessRecovery()
+                try await inventoryPublication()
+                print("PASS native access recovery regressions")
+                exit(0)
+            }
             if CommandLine.arguments.contains("--state-directory-regression") {
                 try stateDirectoryMigration()
                 print("PASS native state-directory migration and interrupted recovery")
@@ -40,6 +58,10 @@ enum NativeSelfTest {
                 exit(0)
             }
             try stateDirectoryMigration()
+            try await developerCachePresentation()
+            try storageInventoryDecoding()
+            try await folderAccessRecovery()
+            try await inventoryPublication()
             try await accessFlow()
             try await foregroundSummarySurvivesRestart()
             try await forgottenRootInvalidatesScanPresentation()
@@ -57,6 +79,372 @@ enum NativeSelfTest {
             exit(0)
         }
         catch { fputs("FAIL native access flow: \(error)\n", stderr); exit(1) }
+    }
+
+    @MainActor private static var previewWindow: NSWindow?
+
+    /// A visible fixture uses the real model, scan pipeline and views while
+    /// keeping permissions, observations and cleanup inside disposable data.
+    @MainActor private static func accessPreview() async throws {
+        if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("chippytea-access-preview-\(UUID().uuidString)")
+        try fm.createDirectory(at: base, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        guard let physical = realpath(base.path, nil) else { throw EngineError.message("Cannot resolve preview fixture") }
+        let directory = URL(fileURLWithPath: String(cString: physical)); free(physical)
+        let home = directory.appendingPathComponent("Example Mac")
+        let state = directory.appendingPathComponent("State")
+        try fm.createDirectory(at: home, withIntermediateDirectories: false)
+        try fm.createDirectory(at: state, withIntermediateDirectories: false)
+        for (relative, count) in [(".npm/_cacache/example-package", 2_000_000),
+                                  (".cache/uv/example-package", 3_000_000),
+                                  (".rustup/toolchains/example-toolchain/lib", 4_000_000),
+                                  ("Library/Logs/example.log", 8_192)] {
+            let file = home.appendingPathComponent(relative)
+            try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 65, count: count).write(to: file)
+            try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-10 * 86_400)], ofItemAtPath: file.path)
+        }
+        guard let identity = DiskAccessAppIdentity.current() else { throw EngineError.message("Missing preview identity") }
+        try JSONEncoder().encode(identity).write(to: state.appendingPathComponent("disk-access-app.json"))
+        try JSONEncoder().encode("completed").write(to: state.appendingPathComponent("disk-access.json"))
+        let model = AppModel(directory: state, scanHome: home)
+        await model.start()
+        model.authorizeAndScan(path: home.path, kind: "home", replaceContained: true)
+        let deadline = Date().addingTimeInterval(15)
+        while model.busy || model.discoveryPresentation.isRequestPending || model.snapshot.scanning
+                || model.inventoryLoading || model.storageInventory == nil {
+            try require(Date() < deadline, "Preview scan did not complete: \(model.errorMessage ?? model.inventoryError ?? "no error")")
+            try await Task.sleep(for: .milliseconds(40))
+        }
+        model.destination = .discover
+        model.panelVisible = true
+        model.reduceMotion = true
+        let updates = UpdateController(model: model, enabled: false)
+        let view = NSHostingView(rootView: RootView(model: model, updates: updates))
+        let window = NSWindow(contentRect: NSRect(x: 150, y: 180, width: TeaTheme.panelWidth, height: model.panelHeight),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Chippytea Preview · disposable files"
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        previewWindow = window
+        NSApp.setActivationPolicy(.regular)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        print("Native preview ready: \(model.storageInventory?.rows.count ?? 0) measured locations; fixture \(home.path)")
+    }
+
+    @MainActor private static func developerCachePresentation() async throws {
+        let identity = EngineIdentity(device: 1, inode: 2, mode: 0o040755, size: 0, modifiedNs: 0, changedNs: 0)
+        let root = ScanRoot(id: "home", path: "/fixture", kind: "home", identity: identity)
+        let cache = Candidate(id: "npm-cache", rootId: root.id, path: "/fixture/.npm/_cacache",
+            title: "npm cache", kind: "devcache", logicalBytes: 500_000_000, allocatedBytes: 500_000_000,
+            fileCount: 1, modifiedNs: 30, explanation: "Verified disposable cache",
+            consequence: "npm will download packages again", eligiblePermanent: true, blockedReason: nil,
+            identity: identity, fingerprint: "contents", evidence: "ownership", suggestionEligible: true)
+        var presentationFixture = cache
+        presentationFixture.kind = "node"
+        try candidatePresentation(presentationFixture)
+        try require(cache.canDeletePermanently && cache.isDeveloper && cache.isCacheOrLog && cache.recommended,
+                    "Verified developer caches must be actionable in both Developer and Caches & logs")
+        var build = cache
+        build.id = "build"; build.kind = "cargo"; build.path = "/fixture/project/target"; build.title = "Build artifacts"
+        build.allocatedBytes = 100_000_000; build.modifiedNs = 20
+        var log = cache
+        log.id = "log"; log.kind = "log"; log.path = "/fixture/Library/Logs/example.log"
+        log.title = "example.log"; log.eligiblePermanent = false
+        log.allocatedBytes = 8_192; log.modifiedNs = 10
+        let toolchain = StorageInventoryReportDTO.Row(id: cache.id, title: "Rust toolchains", category: "Developer tools",
+            path: "/fixture/.rustup/toolchains", state: .complete, allocatedBytes: 300_000_000, logicalBytes: 300_000_000,
+            files: 1, directories: 1, detail: "Installed compilers", ownerFollowup: "Review installed toolchains",
+            provider: nil, cleanupAuthority: .reviewOnly)
+        let duplicate = StorageInventoryReportDTO.Row(id: "old-cache-observation", title: "npm package cache", category: "Developer tools",
+            path: "/fixture/.npm", state: .complete, allocatedBytes: 500_000_000, logicalBytes: 500_000_000,
+            files: 1, directories: 1, detail: "Legacy observation", ownerFollowup: "Review", provider: nil, cleanupAuthority: .reviewOnly)
+        let inventory = StorageInventoryReportDTO(rows: [toolchain, duplicate], issues: [], omittedIssues: 0,
+            examinedEntries: 4, elapsedMs: 1, complete: true)
+        func findings(_ filter: DiscoveryFilter = .all, _ query: String = "", _ sort: DiscoverySort = .suggested) -> [DiscoveryFinding] {
+            DiscoveryFinding.list(candidates: [cache, build, log], inventory: inventory, filter: filter, query: query, sort: sort)
+        }
+        try require(findings().map(\.id) == ["candidate:npm-cache", "candidate:build", "candidate:log", "managed:npm-cache"],
+                    "Unified findings must retain engine order, distinct identities and no duplicate aggregate cache row")
+        try require(findings(.all, "", .largest).map(\.path) == [cache.path, toolchain.path, build.path, log.path],
+                    "Largest first must interleave actionable caches and installed tool data in one list")
+        try require(findings(.all, "", .oldest).map(\.path) == [log.path, build.path, cache.path, toolchain.path],
+                    "Unknown modification times must follow known times")
+        try require(findings(.all, "", .name).map(\.path) == [log.path, cache.path, build.path, toolchain.path],
+                    "Name sorting must use the visible developer cache title")
+        try require(findings(.caches).map(\.path) == [cache.path, log.path]
+                    && findings(.developer).map(\.path) == [cache.path, build.path, toolchain.path]
+                    && findings(.personal).isEmpty && findings(.all, "npm").map(\.path) == [cache.path]
+                    && findings(.all, "package cache").isEmpty,
+                    "Unified search and filters must show real cache actions without reviving duplicate observations")
+        var unverified = cache
+        unverified.eligiblePermanent = false
+        try require(!unverified.canDeletePermanently, "A cache name alone cannot authorize permanent cleanup")
+        unverified.eligiblePermanent = true; unverified.blockedReason = "npm is running"
+        try require(!unverified.canReviewCleanup && !unverified.canDeletePermanently,
+                    "In-use caches must remain blocked in the native list")
+
+        unverified.allocatedBytes = 0; unverified.fileCount = 0; unverified.fingerprint = ""
+        try require(unverified.measuredAllocatedBytes == nil && DiscoveryFinding.candidate(unverified).allocatedBytes == nil,
+                    "An early blocked cache must show an unknown size rather than zero bytes")
+        let mixed = DiscoveryFinding.list(candidates: [unverified, build], inventory: nil, filter: .all, query: "", sort: .largest)
+        try require(mixed.map(\.path) == [build.path, unverified.path], "Unmeasured caches sort after measured findings")
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("chippytea-cache-presentation-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let model = AppModel(directory: directory)
+        await model.start()
+        model.snapshot = EngineSnapshot(roots: [root], candidates: [cache, build, log])
+        model.selection = [cache.id, build.id]
+        model.reviewSelection()
+        try require(model.showReview && model.reviewItems == [cache, build]
+                    && model.reviewItems.allSatisfy(\.canDeletePermanently)
+                    && CleanupPreview(items: model.reviewItems, wallet: Wallet(), permanently: true).estimatedCoins > 0,
+                    "Developer cache and build folder must share the same selection and permanent review")
+        model.selection.insert(log.id)
+        model.reviewSelection()
+        try require(model.reviewItems == [cache, build, log] && model.reviewItems.allSatisfy(\.canReviewCleanup)
+                    && !model.reviewItems.allSatisfy(\.canDeletePermanently),
+                    "A mixed cache/log selection must use the existing Trash-only review")
+        try require(model.snapshot.wallet == Wallet() && model.snapshot.history.isEmpty,
+                    "List rendering and review must never perform cleanup or grant credit")
+    }
+
+    private static func storageInventoryDecoding() throws {
+        let row: [String: Any] = ["id": "rust-toolchains", "title": "Rust toolchains", "category": "Developer tools",
+            "path": "/fixture/.rustup/toolchains", "state": "Complete", "allocated_bytes": 4096, "logical_bytes": 123,
+            "files": 1, "directories": 1, "detail": "Fixture", "owner_followup": "Review installed toolchains",
+            "cleanup_authority": "ReviewOnly"]
+        func data(_ rows: [[String: Any]]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: ["rows": rows, "issues": [], "omitted_issues": 0,
+                "examined_entries": 2, "elapsed_ms": 1, "complete": true])
+        }
+        let report = try StorageInventoryReportDTO.decode(data([row]))
+        let item = report.rows[0]
+        try require(item.matches(filter: .developer, query: "rust") && !item.matches(filter: .caches, query: "")
+                    && !item.matches(filter: .personal, query: "") && !item.matches(filter: .all, query: "absent"),
+                    "Inventory must participate in the visible category filters and search")
+        var dangerous = row; dangerous["cleanup_authority"] = "Permanent"
+        var rejected = false
+        do { _ = try StorageInventoryReportDTO.decode(data([dangerous])) } catch { rejected = true }
+        try require(rejected, "Inventory responses must reject cleanup authority")
+        rejected = false
+        do { _ = try StorageInventoryReportDTO.decode(data([row, row])) } catch { rejected = true }
+        try require(rejected, "Inventory responses must reject duplicate row identities")
+    }
+
+    @MainActor private static func folderAccessRecovery() async throws {
+        for scenario in ["replacement", "permissions", "legacy-home", "forget-warning", "forget-unrelated-error"] {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("chippytea-access-recovery-\(UUID().uuidString)")
+        try fm.createDirectory(at: base, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        guard let physical = realpath(base.path, nil) else { throw EngineError.message("Cannot resolve recovery fixture") }
+        let directory = URL(fileURLWithPath: String(cString: physical)); free(physical)
+        let folder = directory.appendingPathComponent("Projects")
+        let state = directory.appendingPathComponent("State")
+        try fm.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+        try fm.createDirectory(at: state, withIntermediateDirectories: false)
+        let sentinel = Data("Preserve both versions of the disposable folder".utf8)
+        try sentinel.write(to: folder.appendingPathComponent("original.txt"))
+        var initial: EngineClient? = try EngineClient(database: state.appendingPathComponent("library.sqlite"))
+        let root = try EngineClient.decode(ScanRoot.self,
+            await initial!.request(["action": "authorize", "path": folder.path,
+                                    "kind": scenario == "legacy-home" ? "folder" : "projects"]))
+        let bookmark = try folder.bookmarkData(includingResourceValuesForKeys: nil, relativeTo: nil)
+        try JSONEncoder().encode([folder.path: bookmark]).write(to: state.appendingPathComponent("bookmarks.json"))
+        if scenario == "legacy-home" {
+            try JSONEncoder().encode("completed").write(to: state.appendingPathComponent("disk-access.json"))
+            guard let identity = DiskAccessAppIdentity.current() else { throw EngineError.message("Missing test app identity") }
+            try JSONEncoder().encode(identity).write(to: state.appendingPathComponent("disk-access-app.json"))
+        }
+        initial = nil
+        let original = scenario == "permissions" ? folder : directory.appendingPathComponent("Original")
+        if scenario != "permissions" {
+            try fm.moveItem(at: folder, to: original)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: false)
+        }
+        try sentinel.write(to: folder.appendingPathComponent("replacement.txt"))
+        if scenario == "permissions" { try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path) }
+        let model = AppModel(directory: state, scanHome: scenario == "legacy-home" ? folder : directory.appendingPathComponent("UnusedHome"))
+        await model.start()
+        try require(model.snapshot.roots.map(\.id) == [root.id] && model.rootAccessIssues.map(\.rootId) == [root.id],
+                    "A replaced folder must stay visible with an actionable access issue")
+        try require(!model.snapshot.scanning, "A broken saved grant must not resume background scanning")
+        if scenario.hasPrefix("forget-") {
+            let unrelated = "An unrelated fixture operation failed"
+            if scenario == "forget-unrelated-error" { model.errorMessage = unrelated }
+            model.forgetRoot(root)
+            let deadline = Date().addingTimeInterval(10)
+            while model.busy || !model.snapshot.roots.isEmpty {
+                try require(Date() < deadline, "The broken folder was not forgotten")
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            try require(model.rootAccessIssues.isEmpty
+                        && model.errorMessage == (scenario == "forget-unrelated-error" ? unrelated : nil),
+                        "Forgetting the last broken folder must clear its warning and preserve unrelated errors")
+            try require(try Data(contentsOf: original.appendingPathComponent("original.txt")) == sentinel
+                        && Data(contentsOf: folder.appendingPathComponent("replacement.txt")) == sentinel,
+                        "Forgetting access must preserve both physical folders")
+            continue
+        }
+        model.openScanLocations()
+        try require(model.destination == .settings && model.settingsSection == "scan-locations",
+                    "Access recovery must open the scan-location controls")
+        if scenario == "replacement" {
+            model.authorizeAndScan(path: folder.path, kind: root.kind, reconnecting: root, selectedURL: original)
+            try require(!model.busy && model.snapshot.roots == [root] && model.errorMessage?.hasPrefix("Select ") == true,
+                        "Reconnection must reject a genuinely different selected folder")
+        }
+        let pickerPath = folder.path.hasPrefix("/private/var/") ? String(folder.path.dropFirst("/private".count)) : folder.path
+        let pickerURL = URL(fileURLWithPath: pickerPath, isDirectory: true)
+        try require(try AppModel.physicalFolderPath(pickerURL) == folder.path,
+                    "Picker aliases must resolve to the exact saved physical folder")
+        model.authorizeAndScan(path: pickerPath, kind: root.kind, reconnecting: root, selectedURL: pickerURL)
+        let deadline = Date().addingTimeInterval(10)
+        while model.busy || model.snapshot.scanning || model.snapshot.roots.first == root
+                || model.discoveryPresentation.isRequestPending || model.discoveryPresentation.isForeground {
+            try require(Date() < deadline, "Reconnected folder did not finish scanning: \(model.errorMessage ?? "no error")")
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try require(model.rootAccessIssues.isEmpty && model.snapshot.roots.count == 1,
+                    "Reconnection must replace the old grant and clear its access issue")
+        try require(model.snapshot.history.isEmpty && model.snapshot.wallet.pendingCoins == 0,
+                    "Reconnection cannot create cleanup history or chips")
+        try require(try Data(contentsOf: original.appendingPathComponent("original.txt")) == sentinel
+                    && Data(contentsOf: folder.appendingPathComponent("replacement.txt")) == sentinel,
+                    "Reconnection must preserve the old and replacement folder contents")
+        model.diskAccessPhase = .waiting
+        model.diskAccessStep = .enable
+        model.beginDiskAccessSetup(restart: true)
+        try require(model.showDiskAccess && model.diskAccessStep == .permission && model.diskAccessPhase == .intro,
+                    "Redo setup must return to the first step even after a previous waiting state")
+        model.dismissDiskAccess()
+        print("PASS native folder access recovery (\(scenario)): visible failed grant, explicit reconnect, preserved files and redo setup")
+        }
+    }
+
+    @MainActor private final class InventoryReadFixture {
+        var calls = 0
+        var returned = Set<Int>()
+        var held: [Int: CheckedContinuation<StorageInventoryReportDTO, Error>] = [:]
+
+        func read() async throws -> StorageInventoryReportDTO {
+            calls += 1
+            let call = calls
+            defer { returned.insert(call) }
+            return try await withCheckedThrowingContinuation { held[call] = $0 }
+        }
+
+        func finish(_ call: Int, with result: Result<StorageInventoryReportDTO, Error>) throws {
+            guard let continuation = held.removeValue(forKey: call) else {
+                throw EngineError.message("No matching disposable inventory read")
+            }
+            continuation.resume(with: result)
+        }
+
+        func release() {
+            let outstanding = held
+            held.removeAll()
+            for continuation in outstanding.values {
+                continuation.resume(throwing: EngineError.message("Disposable inventory fixture finished"))
+            }
+        }
+    }
+
+    @MainActor private static func inventoryPublication() async throws {
+        let fm = FileManager.default
+        func until(_ message: String, _ ready: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(10)
+            while !ready() {
+                try require(Date() < deadline, message)
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        func report(_ entries: Int) throws -> StorageInventoryReportDTO {
+            try StorageInventoryReportDTO.decode(JSONSerialization.data(withJSONObject: [
+                "rows": [], "issues": [], "omitted_issues": 0,
+                "examined_entries": entries, "elapsed_ms": 1, "complete": true,
+            ]))
+        }
+        for scenario in ["forget-success", "forget-error", "reconnect-success", "reconnect-error", "redo-success", "redo-error", "snapshot-loss"] {
+            let base = fm.temporaryDirectory.appendingPathComponent("chippytea-inventory-publication-\(UUID().uuidString)")
+            try fm.createDirectory(at: base, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let directory = URL(fileURLWithPath: try AppModel.physicalFolderPath(base), isDirectory: true)
+            let home = directory.appendingPathComponent("Home")
+            let state = directory.appendingPathComponent("State")
+            try fm.createDirectory(at: home, withIntermediateDirectories: false)
+            try fm.createDirectory(at: state, withIntermediateDirectories: false)
+            var initial: EngineClient? = try EngineClient(database: state.appendingPathComponent("library.sqlite"))
+            let root = try EngineClient.decode(ScanRoot.self, await initial!.request(["action": "authorize", "path": home.path, "kind": "home"]))
+            initial = nil
+            let bookmark = try home.bookmarkData(includingResourceValuesForKeys: nil, relativeTo: nil)
+            try JSONEncoder().encode([home.path: bookmark]).write(to: state.appendingPathComponent("bookmarks.json"))
+            try JSONEncoder().encode("completed").write(to: state.appendingPathComponent("disk-access.json"))
+            guard let identity = DiskAccessAppIdentity.current() else { throw EngineError.message("Missing inventory test app identity") }
+            try JSONEncoder().encode(identity).write(to: state.appendingPathComponent("disk-access-app.json"))
+            let inventory = InventoryReadFixture()
+            let reads = SnapshotReadFixture()
+            defer { inventory.release(); reads.release() }
+            let model = AppModel(directory: state, scanHome: home,
+                                 readStorageInventory: { _, _ in try await inventory.read() },
+                                 readSnapshot: { try await reads.read($0) })
+            await model.start()
+            try await until("The initial inventory or scan did not start and settle") {
+                inventory.held[1] != nil && !model.busy && !model.snapshot.scanning
+                    && !model.discoveryPresentation.isRequestPending && !model.discoveryPresentation.isForeground
+            }
+            if scenario == "snapshot-loss" {
+                try inventory.finish(1, with: .success(report(1)))
+                try await until("The initial inventory did not publish") { model.storageInventory != nil && !model.inventoryLoading }
+                _ = try await model.client!.request(["action": "forget", "id": root.id])
+                await model.reload()
+                try require(model.storageInventory == nil && !model.inventoryLoading && model.inventoryError == nil,
+                            "Applying a snapshot without Home must clear its published inventory")
+                continue
+            }
+            if scenario.hasPrefix("forget-") {
+                reads.holdCount = 1
+                model.forgetRoot(root)
+                try await until("The post-forget snapshot was not held") { !reads.held.isEmpty }
+                try require(model.snapshot.roots == [root] && model.storageInventory == nil && !model.inventoryLoading,
+                            "Forgetting must invalidate inventory before its new snapshot arrives")
+                model.refreshStorageInventory()
+                try require(inventory.calls == 1, "An old visible Home grant cannot start inventory while forgetting")
+            } else if scenario.hasPrefix("reconnect-") {
+                model.authorizeAndScan(path: home.path, kind: "home", reconnecting: root, selectedURL: home)
+                try require(!model.inventoryLoading && model.storageInventory == nil,
+                            "Same-identity reconnection must invalidate the previous inventory immediately")
+                try await until("Reconnection did not start fresh inventory") { inventory.held[2] != nil }
+            } else {
+                model.beginDiskAccessSetup(restart: true)
+                try require(!model.inventoryLoading && model.storageInventory == nil,
+                            "Redoing access setup must invalidate pending inventory")
+                model.refreshStorageInventory()
+                try require(inventory.calls == 1, "Inventory must stay paused while access setup is open")
+                model.dismissDiskAccess()
+                model.refreshStorageInventory()
+                try await until("Inventory did not resume after leaving setup") { inventory.held[2] != nil }
+            }
+            let oldResponse: Result<StorageInventoryReportDTO, Error> = scenario.hasSuffix("error")
+                ? .failure(EngineError.message("Stale inventory failure")) : .success(try report(1))
+            try inventory.finish(1, with: oldResponse)
+            try await until("The stale inventory response did not resume") { inventory.returned.contains(1) }
+            await Task.yield()
+            try require(model.storageInventory == nil && model.inventoryError == nil,
+                        "A stale inventory success or failure cannot publish after access changes")
+            if scenario.hasPrefix("forget-") {
+                guard let call = reads.held.keys.first else { throw EngineError.message("Missing held forget snapshot") }
+                try reads.finish(call, with: .success(try await model.client!.snapshot()))
+                try await until("Forgetting did not complete after releasing its snapshot") { !model.busy && model.snapshot.roots.isEmpty }
+            } else {
+                try require(model.inventoryLoading, "An older response cannot clear a newer inventory request's loading state")
+                try inventory.finish(2, with: .success(report(2)))
+                try await until("The current inventory did not publish") { model.storageInventory?.examinedEntries == 2 && !model.inventoryLoading }
+            }
+        }
+        print("PASS native inventory publication: late success/error rejected, current loading retained, forgotten Home cleared, same-identity reconnect and redo setup isolated")
     }
 
     @MainActor private static func stateDirectoryMigration() throws {
@@ -849,6 +1237,7 @@ enum NativeSelfTest {
             ("node", "/Projects/Plum/node_modules", "Plum dependencies", "Plum / node_modules"),
             ("cargo", "/Projects/service/target", "service build artifacts", "service / target"),
             ("venv", "/Projects/api/.venv", "api Python environment", "api / .venv"),
+            ("devcache", "/Users/test/.npm/_cacache", "npm cache", "npm cache"),
             ("cache", "/Library/Caches/com.example.Editor", "com.example.Editor cache", "com.example.Editor"),
             ("xcode", "/Library/Developer/Xcode/DerivedData/App-abc123", "App-abc123 Xcode data", "App-abc123"),
             ("archive", "/Downloads/Archive.zip", "Archive.zip", "Archive.zip"),
@@ -876,6 +1265,7 @@ enum NativeSelfTest {
         let categories: [(String, String, DiscoveryFilter, Bool)] = [
             ("node", "Dependencies", .developer, true), ("cargo", "Build artifacts", .developer, true),
             ("venv", "Python environment", .developer, true), ("webcache", "Build cache", .developer, true),
+            ("pythoncache", "Python bytecode cache", .developer, false),
             ("xcode", "Xcode build data", .developer, false), ("cache", "App cache", .caches, false),
             ("log", "App log", .caches, false), ("crashreport", "Crash report", .caches, false),
             ("installer", "Installer", .personal, false), ("archive", "Archive", .personal, false),

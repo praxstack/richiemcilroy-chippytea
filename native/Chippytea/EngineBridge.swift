@@ -157,6 +157,7 @@ final class EngineClient: @unchecked Sendable {
     private let queue = DispatchQueue(label: "app.chippytea.engine", qos: .utility)
     private let progressQueue = DispatchQueue(label: "app.chippytea.cleanup-progress", qos: .utility)
     private let managedReviewQueue = DispatchQueue(label: "app.chippytea.managed-review", qos: .utility)
+    private let inventoryQueue = DispatchQueue(label: "app.chippytea.storage-inventory", qos: .utility)
     private let managedReviewAdmission = NSLock()
     private var managedReviewRunning = false
     private var conditionalSnapshotDecoder = ConditionalSnapshotDecoder()
@@ -169,6 +170,16 @@ final class EngineClient: @unchecked Sendable {
     func request(_ request: [String: Any]) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             queue.async { do { continuation.resume(returning: try self.requestSync(request)) } catch { continuation.resume(throwing: error) } }
+        }
+    }
+    func storageInventory(rootID: String) async throws -> StorageInventoryReportDTO {
+        try await withCheckedThrowingContinuation { continuation in
+            inventoryQueue.async {
+                do {
+                    let data = try self.requestSync(["action": "storage_inventory", "root_id": rootID])
+                    continuation.resume(returning: try StorageInventoryReportDTO.decode(data))
+                } catch { continuation.resume(throwing: error) }
+            }
         }
     }
     /// One explicitly requested owner-tool review has an independent queue so
@@ -437,6 +448,12 @@ struct DiscoveryPresentation: Equatable {
     /// Screenshot staging freezes the setup sketches at one moment of their loop.
     var diskAccessSceneTime: Double?
     @Published private(set) var diskAccessNeedsReplacement = false
+    @Published private(set) var rootAccessIssues: [RootAccessIssue] = []
+    @Published private(set) var storageInventory: StorageInventoryReportDTO?
+    @Published private(set) var inventoryLoading = false
+    @Published private(set) var inventoryError: String?
+    @Published var settingsSection = "scan-locations"
+    @Published var managedProvider: ManagedProviderID = .homebrew
     @Published var reviewItems: [Candidate] = []
     @Published var busy = false
     @Published var errorMessage: String?
@@ -503,8 +520,14 @@ struct DiscoveryPresentation: Equatable {
     private let directory: URL
     private let scanHome: URL
     private let readSnapshot: (EngineClient) async throws -> EngineSnapshot
+    private let readStorageInventory: (EngineClient, String) async throws -> StorageInventoryReportDTO
     private var bookmarks: [String: Data] = [:]
-    private var accesses: [URL] = []
+    private var bookmarkIssues: [String: RootAccessIssue] = [:]
+    private var rootAccessRequestID: UInt64 = 0
+    private var appliedRootAccessRequestID: UInt64 = 0
+    private var rootAccessWarning: String?
+    private var inventoryGeneration: UInt64 = 0
+    private var accesses: [(path: String, url: URL)] = []
     private var watcher: FolderWatcher?
     private var pollTask: Task<Void, Never>?
     private(set) var pollDemandID: UInt64 = 0
@@ -548,12 +571,14 @@ struct DiscoveryPresentation: Equatable {
     private var diskAccessRevision = 0
 
     init(directory: URL? = nil, scanHome: URL? = nil,
+         readStorageInventory: @escaping (EngineClient, String) async throws -> StorageInventoryReportDTO = { try await $0.storageInventory(rootID: $1) },
          readSnapshot: @escaping (EngineClient) async throws -> EngineSnapshot = { try await $0.snapshot() }) {
         let testDirectory = ProcessInfo.processInfo.environment["CHIPPYTEA_DATA_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
         self.directory = directory ?? testDirectory
             ?? Self.stateDirectory(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
         self.scanHome = scanHome ?? FileManager.default.homeDirectoryForCurrentUser
         self.readSnapshot = readSnapshot
+        self.readStorageInventory = readStorageInventory
         backgroundActivityObservation = snapshotSubject.map(\.scanning).removeDuplicates()
             .sink { [weak self] scanning in self?.scanningActivityChanged(scanning) }
     }
@@ -822,7 +847,9 @@ struct DiscoveryPresentation: Equatable {
             await reload()
             for root in snapshot.roots {
                 guard let data = bookmarks[root.path] else {
-                    _ = try await client?.request(["action": "forget", "id": root.id]); continue
+                    bookmarkIssues[root.id] = RootAccessIssue(rootId: root.id, path: root.path,
+                        status: "reauthorization_required", message: "Reconnect this folder to restore its saved access.")
+                    continue
                 }
                 do {
                     var stale = false
@@ -835,11 +862,23 @@ struct DiscoveryPresentation: Equatable {
                         scoped = false
                         url = try URL(resolvingBookmarkData: data, options: [.withoutUI, .withoutMounting], relativeTo: nil, bookmarkDataIsStale: &stale)
                     }
-                    guard !stale, url.path == root.path else { throw EngineError.message("Choose \(root.name) again to renew folder access.") }
-                    if scoped { _ = url.startAccessingSecurityScopedResource(); accesses.append(url) }
-                } catch { _ = try await client?.request(["action": "forget", "id": root.id]); errorMessage = error.localizedDescription }
+                    guard try Self.physicalFolderPath(url) == root.path else { throw EngineError.message("Reconnect \(root.name) to confirm its location.") }
+                    if scoped { _ = url.startAccessingSecurityScopedResource(); accesses.append((root.path, url)) }
+                    // A stale bookmark may still resolve the same physical folder.
+                    // The engine's durable volume identity decides whether it is
+                    // still the authorized object before any scan can use it.
+                    if stale {
+                        bookmarks[root.path] = try url.bookmarkData(options: scoped ? [.withSecurityScope] : [],
+                            includingResourceValuesForKeys: nil, relativeTo: nil)
+                        try saveBookmarks()
+                    }
+                } catch {
+                    bookmarkIssues[root.id] = RootAccessIssue(rootId: root.id, path: root.path,
+                        status: "reauthorization_required", message: error.localizedDescription)
+                }
             }
             await reload()
+            await checkRootAccess()
             if completedAccessMatches && diskAccessRevision == accessRevisionAtStart {
                 let home = scanHome
                 let blocked = await Task.detached(priority: .utility) {
@@ -850,7 +889,8 @@ struct DiscoveryPresentation: Equatable {
                         // Older builds stored Home as an unrestricted folder.
                         // Narrow the same physical grant atomically before any
                         // watcher or pending scan can use its old media policy.
-                        if snapshot.roots.contains(where: { $0.path == homePath && $0.kind == "folder" }) {
+                        if let legacy = snapshot.roots.first(where: { $0.path == homePath && $0.kind == "folder" }),
+                           !rootAccessIssues.contains(where: { $0.rootId == legacy.id }) {
                             _ = try await client?.request(["action": "authorize", "path": homePath, "kind": "home", "replace_contained": true])
                             await reload()
                             guard snapshot.roots.contains(where: { $0.path == homePath && $0.kind == "home" }) else {
@@ -876,11 +916,13 @@ struct DiscoveryPresentation: Equatable {
                 }
             }
             if let data = try await client?.request(["action": "cursor"]), let value = try JSONSerialization.jsonObject(with: data) as? [String: UInt64] { cursor = value["cursor"] ?? 0 }
+            await checkRootAccess()
             restoringAccess = false
             var needsInitialScan = false
             if accessRecord != .waiting || !showDiskAccess {
                 restartWatcher()
-                if diskAccessRevision == accessRevisionAtStart && !snapshot.roots.isEmpty && !(homeAuthorized && !diskAccessConfigured) {
+                if diskAccessRevision == accessRevisionAtStart && !snapshot.roots.isEmpty
+                    && rootAccessIssues.isEmpty && !(homeAuthorized && !diskAccessConfigured) {
                     if cursor == 0 { needsInitialScan = true }
                     else { _ = try await client?.request(["action": "resume"]); poll() }
                 }
@@ -890,6 +932,7 @@ struct DiscoveryPresentation: Equatable {
             // operation must not acquire busy before our defer clears it.
             busy = false
             if needsInitialScan { refresh() }
+            else { refreshStorageInventory() }
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -908,6 +951,7 @@ struct DiscoveryPresentation: Equatable {
                 lastObservedSnapshotReadError = nil
             }
             reconcileDuplicateReport(with: current)
+            if inventoryRoot(in: current) != inventoryRoot(in: snapshot) { invalidateStorageInventory() }
             if current != snapshot { snapshot = current }
             var presentation = discoveryPresentation
             if let boundary = acceptedScanSnapshotBoundary, requestID > boundary {
@@ -927,7 +971,10 @@ struct DiscoveryPresentation: Equatable {
             if let expanded = expandedSuggestion, !current.candidates.contains(where: { $0.id == expanded }) { expandedSuggestion = nil }
             if !presentation.isRequestPending && current.error != lastObservedEngineError {
                 lastObservedEngineError = current.error
-                if let error = current.error, errorMessage != error { errorMessage = error }
+                if let error = current.error {
+                    if errorMessage != error { errorMessage = error }
+                    Task { [weak self] in await self?.checkRootAccess() }
+                }
             }
             if lastNotifiedPendingCoins != current.wallet.pendingCoins {
                 lastNotifiedPendingCoins = current.wallet.pendingCoins
@@ -1091,7 +1138,7 @@ struct DiscoveryPresentation: Equatable {
         let revision = watcherRevision
         // One event can resume the engine's entire durable queue, including a
         // Home scope left by an older build. Keep all watching gated with Scan.
-        guard !restoringAccess, !(homeAuthorized && !diskAccessConfigured) else { return }
+        guard !restoringAccess, rootAccessIssues.isEmpty, !(homeAuthorized && !diskAccessConfigured) else { return }
         if cursor == 0 { pendingCursor = max(pendingCursor, FSEventsGetCurrentEventId()) }
         let roots = snapshot.roots.filter { diskAccessConfigured || $0.path != homePath }
         guard !roots.isEmpty else { return }
@@ -1112,49 +1159,160 @@ struct DiscoveryPresentation: Equatable {
     func beginSystemDialog() { systemDialogDepth += 1; onSystemDialogDepthChange?(systemDialogDepth) }
     func endSystemDialog() { systemDialogDepth = max(0, systemDialogDepth - 1); onSystemDialogDepthChange?(systemDialogDepth) }
 
-    func chooseFolder(kind: String) {
-        guard !busy, !snapshot.scanning else { return }
+    func chooseFolder(kind: String, reconnecting root: ScanRoot? = nil) {
+        guard !busy, !snapshot.scanning, !hasCleanupWork, systemDialogDepth == 0 else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
-        panel.prompt = "Allow this folder"
-        panel.message = "chippytea looks only inside folders you choose. Nothing is selected for cleanup automatically."
-        if kind == "downloads" { panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first }
+        panel.prompt = root == nil ? "Allow this folder" : "Reconnect folder"
+        panel.message = root.map { "Select \($0.path) to reconnect it. Your Keep choices and cleanup history stay saved." }
+            ?? "Choose a folder to include in your scans. Nothing is selected for cleanup automatically."
+        if let root { panel.directoryURL = URL(fileURLWithPath: root.path, isDirectory: true) }
+        else if kind == "downloads" { panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first }
         beginSystemDialog()
         panel.begin { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer { self.endSystemDialog() }
-                guard result == .OK, let url = panel.url, let client = self.client else { return }
-                do {
-                    if url.path == self.homePath && !self.diskAccessConfigured { self.beginDiskAccessSetup(); return }
-                    let accessing = url.startAccessingSecurityScopedResource()
-                    let data = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
-                    try await self.removeUnconfirmedHomeGrant()
-                    let rootData = try await client.request(["action": "authorize", "path": url.path, "kind": url.path == self.homePath ? "home" : kind])
-                    let root = try EngineClient.decode(ScanRoot.self, rootData)
-                    self.bookmarks[root.path] = data
-                    do { try self.saveBookmarks() } catch { _ = try await client.request(["action": "forget", "id": root.id]); if accessing { url.stopAccessingSecurityScopedResource() }; throw error }
-                    self.accesses.append(url)
-                    await self.reload(); self.restartWatcher(); self.destination = .discover; self.refresh()
-                } catch { self.errorMessage = error.localizedDescription }
+                guard result == .OK, let url = panel.url, !self.busy, !self.hasCleanupWork else { return }
+                let path: String
+                do { path = try Self.physicalFolderPath(url) }
+                catch { self.errorMessage = error.localizedDescription; return }
+                if let root, path != root.path {
+                    self.errorMessage = "Select \(root.path) to reconnect it, or use Add folder to scan a different location."
+                    return
+                }
+                if path == self.homePath && !self.diskAccessConfigured { self.beginDiskAccessSetup(); return }
+                let existing = root ?? self.snapshot.roots.first { $0.path == path }
+                self.authorizeAndScan(path: path, kind: kind, reconnecting: existing, selectedURL: url)
             }
         }
     }
     private func saveBookmarks() throws { try JSONEncoder().encode(bookmarks).write(to: directory.appendingPathComponent("bookmarks.json"), options: .atomic) }
 
-    /// Preserve the system-supplied path; Rust validates each physical ancestor.
-    /// Foundation's path normalization can turn /private/var back into the /var link.
+    /// Pickers and bookmarks may spell /private/var as /var. Resolve that selected
+    /// location while its security scope is active, then let Rust validate every
+    /// physical ancestor and the grant identity. Keep the original URL for access.
+    static func physicalFolderPath(_ url: URL) throws -> String {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        guard let physical = realpath(url.path, nil) else {
+            throw EngineError.message("This folder could not be opened. Choose an available folder and try again.")
+        }
+        defer { free(physical) }
+        return String(cString: physical)
+    }
+
     var homePath: String { scanHome.path }
     var homeAuthorized: Bool { snapshot.roots.contains { $0.path == homePath } }
 
+    func openScanLocations() {
+        showReview = false
+        showDuplicates = false
+        errorMessage = nil
+        settingsSection = "scan-locations"
+        destination = .settings
+        Task { await checkRootAccess() }
+    }
+
+    func reconnectRoot(_ root: ScanRoot) {
+        guard snapshot.roots.contains(root) else { return }
+        chooseFolder(kind: root.kind, reconnecting: root)
+    }
+
+    func checkRootAccess() async {
+        guard let client else { return }
+        rootAccessRequestID &+= 1
+        let requestID = rootAccessRequestID
+        let roots = snapshot.roots
+        do {
+            let response = try await client.request(["action": "root_access"])
+            let checks = try EngineClient.decode([RootAccessIssue].self, response)
+            guard roots == snapshot.roots, requestID >= appliedRootAccessRequestID else { return }
+            appliedRootAccessRequestID = requestID
+            let known = Set(roots.map(\.id))
+            bookmarkIssues = bookmarkIssues.filter { known.contains($0.key) }
+            let issues = checks.compactMap { check -> RootAccessIssue? in
+                guard known.contains(check.rootId) else { return nil }
+                return bookmarkIssues[check.rootId] ?? (check.needsAttention ? check : nil)
+            }
+            if rootAccessIssues != issues {
+                rootAccessIssues = issues
+                restartWatcher()
+            }
+            if let issue = issues.first {
+                let name = URL(fileURLWithPath: issue.path).lastPathComponent
+                let warning = "Scan access needs attention for \(name). Reconnect the folder in Scan locations."
+                rootAccessWarning = warning
+                errorMessage = warning
+            } else {
+                if let rootAccessWarning, errorMessage == rootAccessWarning { errorMessage = nil }
+                rootAccessWarning = nil
+            }
+            if issues.contains(where: { $0.path == homePath }) { invalidateStorageInventory() }
+        } catch {
+            guard roots == snapshot.roots, requestID >= appliedRootAccessRequestID else { return }
+            appliedRootAccessRequestID = requestID
+            if !bookmarkIssues.isEmpty { rootAccessIssues = Array(bookmarkIssues.values).sorted { $0.path < $1.path } }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func inventoryRoot(in snapshot: EngineSnapshot) -> ScanRoot? {
+        snapshot.roots.first { $0.path == homePath && $0.kind == "home" }
+    }
+
+    private func invalidateStorageInventory() {
+        inventoryGeneration &+= 1
+        storageInventory = nil
+        inventoryError = nil
+        inventoryLoading = false
+    }
+
+    func refreshStorageInventory() {
+        guard diskAccessConfigured, !busy, !showDiskAccess, !inventoryLoading, !hasCleanupWork,
+              let root = inventoryRoot(in: snapshot),
+              !rootAccessIssues.contains(where: { $0.rootId == root.id }), let client else { return }
+        inventoryGeneration &+= 1
+        let generation = inventoryGeneration
+        inventoryLoading = true
+        inventoryError = nil
+        Task {
+            defer { if inventoryGeneration == generation { inventoryLoading = false } }
+            do {
+                let report = try await readStorageInventory(client, root.id)
+                guard inventoryGeneration == generation, inventoryRoot(in: snapshot) == root,
+                      diskAccessConfigured, !rootAccessIssues.contains(where: { $0.rootId == root.id }) else { return }
+                storageInventory = report
+            } catch {
+                guard inventoryGeneration == generation, inventoryRoot(in: snapshot) == root,
+                      diskAccessConfigured, !rootAccessIssues.contains(where: { $0.rootId == root.id }) else { return }
+                inventoryError = error.localizedDescription
+            }
+        }
+    }
+
+    func openStorageProvider(_ provider: ManagedProviderID) {
+        managedProvider = provider
+        settingsSection = "managed-storage"
+        destination = .settings
+        // Provider tools have their own explicit review controls in Settings.
+        // Inventory findings never authorize a prune or a cleanup command.
+    }
+
     func scanMyMac() {
-        if diskAccessConfigured { authorizeAndScan(path: homePath, replaceContained: true) }
+        if diskAccessConfigured {
+            if let root = snapshot.roots.first(where: { $0.path == homePath }),
+               rootAccessIssues.contains(where: { $0.rootId == root.id }) {
+                reconnectRoot(root)
+            } else { authorizeAndScan(path: homePath, replaceContained: true) }
+        }
         else { beginDiskAccessSetup() }
     }
 
-    func beginDiskAccessSetup() {
-        guard client != nil, !busy, !snapshot.scanning, !snapshot.cleaning else { return }
-        if diskAccessPhase != .waiting {
+    func beginDiskAccessSetup(restart: Bool = false) {
+        guard client != nil, !busy, !snapshot.scanning, !hasCleanupWork else { return }
+        invalidateStorageInventory()
+        if restart || diskAccessPhase != .waiting {
             diskAccessRevision &+= 1
             diskAccessTask?.cancel()
             diskAccessPhase = .intro
@@ -1206,9 +1364,10 @@ struct DiscoveryPresentation: Equatable {
     /// This revokes only scan authorization; user files, Keep and history are untouched.
     private func removeUnconfirmedHomeGrant() async throws {
         guard !diskAccessConfigured, let root = snapshot.roots.first(where: { $0.path == homePath }), let client else { return }
+        invalidateStorageInventory()
         _ = try await client.request(["action": "forget", "id": root.id])
         bookmarks.removeValue(forKey: root.path)
-        accesses.filter { $0.path == root.path }.forEach { $0.stopAccessingSecurityScopedResource() }
+        accesses.filter { $0.path == root.path }.forEach { $0.url.stopAccessingSecurityScopedResource() }
         accesses.removeAll { $0.path == root.path }
     }
 
@@ -1238,6 +1397,7 @@ struct DiscoveryPresentation: Equatable {
         diskAccessMessage = "Checking folder access…"
         // A previous successful setup is no longer evidence once the user is
         // checking changed permissions. Failed or cancelled checks stay gated.
+        invalidateStorageInventory()
         diskAccessConfigured = false
         restartWatcher()
         diskAccessTask = Task { [weak self] in
@@ -1264,7 +1424,9 @@ struct DiscoveryPresentation: Equatable {
                 self.diskAccessPhase = .intro
                 self.diskAccessMessage = nil
                 self.finishDiskAccessSystemDialog()
-                self.authorizeAndScan(path: self.homePath, replaceContained: true)
+                let existing = self.snapshot.roots.first { $0.path == self.homePath }
+                let repair = existing.flatMap { root in self.rootAccessIssues.contains { $0.rootId == root.id } ? root : nil }
+                self.authorizeAndScan(path: self.homePath, replaceContained: true, reconnecting: repair)
             } catch {
                 guard self.diskAccessRevision == revision else { return }
                 self.diskAccessPhase = .waiting
@@ -1275,29 +1437,45 @@ struct DiscoveryPresentation: Equatable {
     }
 
     /// The pickerless half of `chooseFolder`. Same engine action, same bookmark, same watcher.
-    func authorizeAndScan(path: String, kind: String = "folder", replaceContained: Bool = false) {
-        guard path.hasPrefix("/"), !busy, !snapshot.scanning, !snapshot.cleaning, let client else { return }
-        let url = URL(fileURLWithPath: path, isDirectory: true)
-        let scanKind = url.path == homePath ? "home" : kind
-        guard !snapshot.roots.contains(where: { $0.path == url.path && $0.kind == scanKind }) else { restartWatcher(); destination = .discover; refresh(); return }
+    func authorizeAndScan(path: String, kind: String = "folder", replaceContained: Bool = false,
+                          reconnecting existing: ScanRoot? = nil, selectedURL: URL? = nil) {
+        guard path.hasPrefix("/"), !busy, !snapshot.scanning, !hasCleanupWork, let client else { return }
+        let physicalPath: String
+        do { physicalPath = try selectedURL.map(Self.physicalFolderPath) ?? path }
+        catch { errorMessage = error.localizedDescription; return }
+        let url = selectedURL ?? URL(fileURLWithPath: physicalPath, isDirectory: true)
+        let scanKind = physicalPath == homePath ? "home" : kind
+        guard existing != nil || !snapshot.roots.contains(where: { $0.path == physicalPath && $0.kind == scanKind }) else {
+            restartWatcher(); destination = .discover; refresh(); return
+        }
+        if let existing, existing.path != physicalPath || !snapshot.roots.contains(existing) {
+            errorMessage = "Select \(existing.path) to reconnect it, or use Add folder to scan a different location."
+            return
+        }
+        if physicalPath == homePath || (!diskAccessConfigured && homeAuthorized) { invalidateStorageInventory() }
         busy = true
         Task {
             var authorized = false
+            let accessing = selectedURL != nil && url.startAccessingSecurityScopedResource()
+            defer { if accessing && !authorized { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try await Task.detached(priority: .utility) {
                     let scoped = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
                     return try scoped ?? url.bookmarkData(includingResourceValuesForKeys: nil, relativeTo: nil)
                 }.value
                 let previousBookmarks = bookmarks
-                bookmarks[url.path] = data
+                bookmarks[physicalPath] = data
                 // A restart after the engine commits a broader root must already have
                 // its bookmark. Extra bookmarks from the old scopes are harmless.
                 do { try saveBookmarks() }
                 catch { bookmarks = previousBookmarks; throw error }
                 let root: ScanRoot
                 do {
-                    if url.path != homePath { try await removeUnconfirmedHomeGrant() }
-                    root = try EngineClient.decode(ScanRoot.self, await client.request(["action": "authorize", "path": url.path, "kind": scanKind, "replace_contained": replaceContained]))
+                    if physicalPath != homePath { try await removeUnconfirmedHomeGrant() }
+                    var request: [String: Any] = ["action": existing == nil ? "authorize" : "reauthorize",
+                        "path": physicalPath, "kind": scanKind, "replace_contained": replaceContained]
+                    if let existing { request["id"] = existing.id }
+                    root = try EngineClient.decode(ScanRoot.self, await client.request(request))
                 } catch {
                     bookmarks = previousBookmarks
                     try? saveBookmarks()
@@ -1308,16 +1486,19 @@ struct DiscoveryPresentation: Equatable {
                     let retained = Set(snapshot.roots.map(\.path))
                     func superseded(_ path: String) -> Bool { path.hasPrefix(root.path + "/") && !retained.contains(path) }
                     bookmarks = bookmarks.filter { !superseded($0.key) }
-                    accesses.filter { superseded($0.path) }.forEach { $0.stopAccessingSecurityScopedResource() }
+                    accesses.filter { superseded($0.path) }.forEach { $0.url.stopAccessingSecurityScopedResource() }
                     accesses.removeAll { superseded($0.path) }
                     // The broader bookmark is already durable if pruning fails.
                     do { try saveBookmarks() } catch { errorMessage = error.localizedDescription }
                 }
-                await reload(); restartWatcher(); destination = .discover; authorized = true
+                if let existing { bookmarkIssues.removeValue(forKey: existing.id) }
+                if accessing { accesses.append((physicalPath, url)) }
+                errorMessage = nil
+                await reload(); await checkRootAccess(); restartWatcher(); destination = .discover; authorized = true
             } catch {
                 // A failed Home upgrade can leave the older folder policy in
                 // place. Do not let its watcher resume after confirmation.
-                if url.path == homePath { diskAccessConfigured = false }
+                if physicalPath == homePath { diskAccessConfigured = false }
                 errorMessage = error.localizedDescription
                 await reload(); restartWatcher()
             }
@@ -1364,6 +1545,8 @@ struct DiscoveryPresentation: Equatable {
     func refresh() {
         guard !busy, !discoveryPresentation.isRequestPending, let client else { return }
         if homeAuthorized && !diskAccessConfigured { beginDiskAccessSetup(); return }
+        if !rootAccessIssues.isEmpty { openScanLocations(); return }
+        refreshStorageInventory()
         discoveryPresentation.beginRequestedScan()
         Task {
             var accepted = false
@@ -1769,15 +1952,19 @@ struct DiscoveryPresentation: Equatable {
         }
     }
     func forgetRoot(_ root: ScanRoot) {
-        guard !busy, !snapshot.scanning else { return }
+        guard !busy, !snapshot.scanning, !hasCleanupWork else { return }
+        if root.path == homePath { invalidateStorageInventory() }
+        busy = true
         Task {
+            defer { busy = false }
             do {
                 _ = try await client?.request(["action": "forget", "id": root.id])
                 bookmarks.removeValue(forKey: root.path); try saveBookmarks()
-                accesses.filter { $0.path == root.path }.forEach { $0.stopAccessingSecurityScopedResource() }
+                accesses.filter { $0.path == root.path }.forEach { $0.url.stopAccessingSecurityScopedResource() }
                 accesses.removeAll { $0.path == root.path }
-                await reload(); restartWatcher()
+                bookmarkIssues.removeValue(forKey: root.id)
             } catch { errorMessage = error.localizedDescription }
+            await reload(); await checkRootAccess(); restartWatcher()
         }
     }
     private func perform(_ request: [String: Any]) {
